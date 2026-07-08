@@ -91,6 +91,11 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// 管理后台路由
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin', 'index.html'));
+});
+
 // ========== 工具 ==========
 function jsonOk(data, msg = 'ok') {
   return { code: 0, message: msg, data };
