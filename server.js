@@ -93,7 +93,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ========== Token 认证系统 ==========
+// ========== Token 认证系统（v2 新增） ==========
 const tokens = {};
 
 function generateToken() {
