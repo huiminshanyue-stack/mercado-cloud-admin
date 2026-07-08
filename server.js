@@ -59,6 +59,13 @@ async function initSchema() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key VARCHAR(100) PRIMARY KEY,
+      value TEXT DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
   console.log('[DB] ✅ 数据库表已就绪');
 }
 
@@ -273,17 +280,52 @@ app.delete('/api/ads/:id', async (req, res) => {
   }
 });
 
+// ========== 系统设置 API ==========
+
+app.get('/api/settings', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT key, value FROM settings');
+    const data = {};
+    rows.forEach(r => { data[r.key] = r.value; });
+    res.json(jsonOk(data));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
+});
+
+app.put('/api/settings', async (req, res) => {
+  const settings = req.body;
+  if (!settings || typeof settings !== 'object') return res.json(jsonFail('参数错误'));
+
+  try {
+    for (const [key, value] of Object.entries(settings)) {
+      await pool.query(
+        'INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()',
+        [key, value]
+      );
+    }
+    res.json(jsonOk(null, '设置已更新'));
+  } catch (e) {
+    console.error('[Settings] 更新失败:', e.message);
+    res.status(500).json(jsonFail('数据库错误'));
+  }
+});
+
 // ========== 同步接口 ==========
 app.get('/api/sync', async (req, res) => {
   try {
     const users = await pool.query('SELECT * FROM users ORDER BY id');
     const ads = await pool.query('SELECT * FROM ads ORDER BY id');
+    const settingsResult = await pool.query('SELECT key, value FROM settings');
+    const settings = {};
+    settingsResult.rows.forEach(r => { settings[r.key] = r.value; });
     res.json({
       code: 0,
       data: {
         version: Date.now(),
         users: users.rows,
-        ads: ads.rows
+        ads: ads.rows,
+        settings
       }
     });
   } catch (e) {

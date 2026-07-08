@@ -158,6 +158,30 @@
             </el-table-column>
           </el-table>
         </el-tab-pane>
+
+        <!-- ===== 系统设置 ===== -->
+        <el-tab-pane label="🎨 系统设置" name="settings">
+          <div class="toolbar">
+            <h3>登录页设置</h3>
+          </div>
+          <el-form label-width="120px" size="small" style="max-width: 600px;">
+            <el-form-item label="登录背景图片">
+              <el-input
+                v-model="settingsForm.loginBackground"
+                placeholder="输入图片URL，例如 https://example.com/bg.jpg"
+                clearable
+              />
+              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
+                留空则使用默认渐变背景。建议尺寸：1920x1080
+              </div>
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" size="small" @click="submitSettings" :loading="settingsLoading">
+                保存设置
+              </el-button>
+            </el-form-item>
+          </el-form>
+        </el-tab-pane>
       </el-tabs>
 
       <div class="footer-bar">
@@ -250,6 +274,10 @@
         const online = ref(true);
         const currentVersion = ref(0);
 
+        // 设置表单
+        const settingsForm = reactive({ loginBackground: '' });
+        const settingsLoading = ref(false);
+
         // 用户对话框状态
         const userDialog = reactive({
           visible: false, isEdit: false, loading: false,
@@ -313,9 +341,16 @@
           if (res?.code === 0) ads.value = res.data;
         }
 
+        async function fetchSettings() {
+          const res = await api('/api/settings');
+          if (res?.code === 0) {
+            settingsForm.loginBackground = res.data?.loginBackground || '';
+          }
+        }
+
         async function refreshAll() {
           loading.value = true;
-          await Promise.all([fetchUsers(), fetchAds()]);
+          await Promise.all([fetchUsers(), fetchAds(), fetchSettings()]);
 
           const health = await api('/api/health');
           if (health?.code === 0) {
@@ -323,6 +358,19 @@
             online.value = true;
           }
           loading.value = false;
+        }
+
+        async function submitSettings() {
+          settingsLoading.value = true;
+          const res = await api('/api/settings', 'PUT', {
+            loginBackground: settingsForm.loginBackground || ''
+          });
+          settingsLoading.value = false;
+          if (res?.code === 0) {
+            ElementPlus.ElMessage.success(res.message);
+          } else {
+            ElementPlus.ElMessage.error(res?.message || '保存失败');
+          }
         }
 
         // ===== 用户操作 =====
@@ -454,10 +502,11 @@
 
         return {
           activeTab, users, ads, loading, online, currentVersion,
+          settingsForm, settingsLoading,
           userDialog, adDialog, formatDate, isExpired, daysLeft,
           showAddUserDialog, showEditUserDialog, submitUser, deleteUser,
           showAddAdDialog, showEditAdDialog, submitAd, deleteAd,
-          refreshAll
+          refreshAll, submitSettings
         };
       }
     });
