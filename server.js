@@ -314,21 +314,32 @@ app.put('/api/settings', async (req, res) => {
 // ========== 同步接口 ==========
 app.get('/api/sync', async (req, res) => {
   try {
-    const users = await pool.query('SELECT * FROM users ORDER BY id');
-    const ads = await pool.query('SELECT * FROM ads ORDER BY id');
+    const usersResult = await pool.query('SELECT * FROM users ORDER BY id');
+    const adsResult = await pool.query('SELECT * FROM ads ORDER BY id');
     const settingsResult = await pool.query('SELECT key, value FROM settings');
     const settings = {};
     settingsResult.rows.forEach(r => { settings[r.key] = r.value; });
+
+    // PostgreSQL 返回列名是小写，需映射为 camelCase
+    const users = usersResult.rows.map(u => ({
+      id: u.id, username: u.username, password: u.password,
+      nickname: u.nickname, role: u.role,
+      validUntil: u.validuntil || null,
+      created_at: u.created_at
+    }));
+    const ads = adsResult.rows.map(a => ({
+      id: a.id, title: a.title, content: a.content,
+      imageUrl: a.imageurl || '', linkUrl: a.linkurl || '',
+      enabled: a.enabled, isPopup: a.ispopup,
+      created_at: a.created_at
+    }));
+
     res.json({
       code: 0,
-      data: {
-        version: Date.now(),
-        users: users.rows,
-        ads: ads.rows,
-        settings
-      }
+      data: { version: Date.now(), users, ads, settings }
     });
   } catch (e) {
+    console.error('[Sync] 错误:', e.message);
     res.status(500).json(jsonFail('数据库错误'));
   }
 });
