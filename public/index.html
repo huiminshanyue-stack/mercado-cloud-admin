@@ -189,6 +189,27 @@
                 顶部横幅广告自动切换时间，默认 5 秒
               </div>
             </el-form-item>
+            <div style="margin: 24px 0 16px; font-weight: 600; color: #303133;">客户端版本更新</div>
+            <el-form-item label="最新版本号">
+              <el-input
+                v-model="settingsForm.latestVersion"
+                placeholder="例如 3.1.0"
+                clearable
+              />
+              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
+                当这里填写的版本号大于客户端版本时，客户端会提示更新
+              </div>
+            </el-form-item>
+            <el-form-item label="下载地址">
+              <el-input
+                v-model="settingsForm.downloadUrl"
+                placeholder="例如 https://example.com/setup.exe"
+                clearable
+              />
+              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
+                用户点击"下载更新"后打开的下载链接
+              </div>
+            </el-form-item>
             <el-form-item>
               <el-button type="primary" size="small" @click="submitSettings" :loading="settingsLoading">
                 保存设置
@@ -292,7 +313,7 @@
         const currentVersion = ref(0);
 
         // 设置表单
-        const settingsForm = reactive({ loginBackground: '' });
+        const settingsForm = reactive({ loginBackground: '', bannerInterval: 5, latestVersion: '', downloadUrl: '' });
         const settingsLoading = ref(false);
 
         // 用户对话框状态
@@ -363,6 +384,8 @@
           if (res?.code === 0) {
             settingsForm.loginBackground = res.data?.loginBackground || '';
             settingsForm.bannerInterval = res.data?.bannerInterval ? parseInt(res.data.bannerInterval) : 5;
+            settingsForm.latestVersion = res.data?.latestVersion || '';
+            settingsForm.downloadUrl = res.data?.downloadUrl || '';
           }
         }
 
@@ -370,7 +393,9 @@
           settingsLoading.value = true;
           const payload = {
             loginBackground: settingsForm.loginBackground || '',
-            bannerInterval: String(settingsForm.bannerInterval || 5)
+            bannerInterval: String(settingsForm.bannerInterval || 5),
+            latestVersion: settingsForm.latestVersion || '',
+            downloadUrl: settingsForm.downloadUrl || ''
           };
           const res = await api('/api/settings', 'PUT', payload);
           settingsLoading.value = false;
