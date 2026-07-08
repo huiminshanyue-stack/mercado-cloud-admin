@@ -29,6 +29,7 @@ function loadData() {
         password: bcrypt.hashSync('admin123', SALT_ROUNDS),
         nickname: '管理员',
         role: 'admin',
+        validUntil: null,
         created_at: new Date().toISOString()
       }
     ],
@@ -84,13 +85,13 @@ function jsonFail(msg = 'error') {
 app.get('/api/users', (req, res) => {
   const list = data.users.map(u => ({
     id: u.id, username: u.username, nickname: u.nickname,
-    role: u.role, created_at: u.created_at
+    role: u.role, validUntil: u.validUntil || null, created_at: u.created_at
   }));
   res.json(jsonOk(list));
 });
 
 app.post('/api/users', (req, res) => {
-  const { username, password, nickname, role } = req.body;
+  const { username, password, nickname, role, validUntil } = req.body;
   if (!username || !password) return res.json(jsonFail('用户名和密码不能为空'));
 
   const exist = data.users.find(u => u.username === username);
@@ -103,6 +104,7 @@ app.post('/api/users', (req, res) => {
     password: hash,
     nickname: nickname || '',
     role: role || 'user',
+    validUntil: validUntil || null,
     created_at: new Date().toISOString()
   };
   data.users.push(newUser);
@@ -127,10 +129,11 @@ app.put('/api/users/:id', (req, res) => {
   const user = data.users.find(u => u.id === id);
   if (!user) return res.json(jsonFail('用户不存在'));
 
-  const { password, nickname, role } = req.body;
+  const { password, nickname, role, validUntil } = req.body;
   if (password) user.password = bcrypt.hashSync(password, SALT_ROUNDS);
   if (nickname !== undefined) user.nickname = nickname;
   if (role !== undefined) user.role = role;
+  if (validUntil !== undefined) user.validUntil = validUntil || null;
   bumpVersion();
   res.json(jsonOk(null, '用户已更新'));
 });

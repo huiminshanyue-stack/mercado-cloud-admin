@@ -42,6 +42,13 @@
     }
     .el-dialog { border-radius: 8px; }
     .empty-hint { color: #c0c4cc; font-size: 13px; }
+    .table-wrapper { width: 100%; overflow-x: auto; }
+    .table-wrapper .el-table { min-width: 900px; }
+    .expire-tag { font-size: 12px; padding: 2px 6px; border-radius: 4px; }
+    .expire-tag.unlimited { background: #f4f4f5; color: #909399; border: 1px solid #e9e9eb; }
+    .expire-tag.active { background: #f0f9eb; color: #67c23a; border: 1px solid #c2e7b0; }
+    .expire-tag.expired { background: #fef0f0; color: #f56c6c; border: 1px solid #fbc4c4; }
+    .expire-tag.near { background: #fdf6ec; color: #e6a23c; border: 1px solid #f5dab1; }
   </style>
 </head>
 <body>
@@ -77,27 +84,44 @@
               ＋ 添加用户
             </el-button>
           </div>
-          <el-table :data="users" stripe border size="small" empty-text="暂无用户">
-            <el-table-column prop="id" label="ID" width="60" />
-            <el-table-column prop="username" label="用户名" min-width="120" />
-            <el-table-column prop="nickname" label="昵称" min-width="120" />
-            <el-table-column label="角色" width="100">
-              <template #default="{ row }">
-                <span :class="row.role === 'admin' ? 'tag-admin' : 'tag-user'">
-                  {{ row.role === 'admin' ? '管理员' : '普通用户' }}
-                </span>
-              </template>
-            </el-table-column>
-            <el-table-column prop="created_at" label="创建时间" width="170" />
-            <el-table-column label="操作" width="180" fixed="right">
-              <template #default="{ row }">
-                <el-button type="warning" size="small" @click="showEditUserDialog(row)">修改</el-button>
-                <el-button type="danger" size="small" :disabled="row.id === 1" @click="deleteUser(row)">
-                  {{ row.id === 1 ? '不可删除' : '删除' }}
-                </el-button>
-              </template>
-            </el-table-column>
-          </el-table>
+          <div class="table-wrapper">
+            <el-table :data="users" stripe border size="small" empty-text="暂无用户">
+              <el-table-column prop="id" label="ID" width="60" />
+              <el-table-column prop="username" label="用户名" min-width="120" />
+              <el-table-column prop="nickname" label="昵称" min-width="120" />
+              <el-table-column label="角色" width="90">
+                <template #default="{ row }">
+                  <span :class="row.role === 'admin' ? 'tag-admin' : 'tag-user'">
+                    {{ row.role === 'admin' ? '管理员' : '普通用户' }}
+                  </span>
+                </template>
+              </el-table-column>
+              <el-table-column label="到期时间" width="140">
+                <template #default="{ row }">
+                  <span v-if="!row.validUntil" class="expire-tag unlimited">永久有效</span>
+                  <span v-else-if="isExpired(row.validUntil)" class="expire-tag expired">已到期</span>
+                  <span v-else-if="daysLeft(row.validUntil) <= 7" class="expire-tag near">{{ formatDate(row.validUntil) }}</span>
+                  <span v-else class="expire-tag active">{{ formatDate(row.validUntil) }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="剩余" width="90">
+                <template #default="{ row }">
+                  <span v-if="!row.validUntil">-</span>
+                  <span v-else-if="isExpired(row.validUntil)" class="expire-tag expired">已到期</span>
+                  <span v-else class="expire-tag active">{{ daysLeft(row.validUntil) }}天</span>
+                </template>
+              </el-table-column>
+              <el-table-column prop="created_at" label="创建时间" width="160" />
+              <el-table-column label="操作" width="170" fixed="right">
+                <template #default="{ row }">
+                  <el-button type="warning" size="small" @click="showEditUserDialog(row)">修改</el-button>
+                  <el-button type="danger" size="small" :disabled="row.id === 1" @click="deleteUser(row)">
+                    {{ row.id === 1 ? '不可删除' : '删除' }}
+                  </el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
         </el-tab-pane>
 
         <!-- ===== 广告管理 ===== -->
@@ -160,6 +184,17 @@
             <el-radio value="admin">管理员</el-radio>
           </el-radio-group>
         </el-form-item>
+        <el-form-item label="到期时间">
+          <el-date-picker
+            v-model="userDialog.form.validUntil"
+            type="date"
+            placeholder="选择到期日期（留空则永久有效）"
+            format="YYYY-MM-DD"
+            value-format="YYYY-MM-DD"
+            style="width: 100%;"
+            clearable
+          />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button size="small" @click="userDialog.visible = false">取消</el-button>
@@ -218,9 +253,34 @@
         // 用户对话框状态
         const userDialog = reactive({
           visible: false, isEdit: false, loading: false,
-          form: { username: '', password: '', nickname: '', role: 'user' },
+          form: { username: '', password: '', nickname: '', role: 'user', validUntil: '' },
           editId: null
         });
+
+        // 时间工具函数
+        function formatDate(iso) {
+          if (!iso) return '';
+          const d = new Date(iso);
+          if (isNaN(d.getTime())) return iso;
+          return d.toISOString().split('T')[0];
+        }
+
+        function isExpired(iso) {
+          if (!iso) return false;
+          const end = new Date(iso);
+          // 到期日当天的23:59:59过期
+          end.setHours(23, 59, 59, 999);
+          return Date.now() > end.getTime();
+        }
+
+        function daysLeft(iso) {
+          if (!iso) return -1;
+          const end = new Date(iso);
+          end.setHours(23, 59, 59, 999);
+          const diff = end.getTime() - Date.now();
+          if (diff <= 0) return 0;
+          return Math.ceil(diff / (1000 * 60 * 60 * 24));
+        }
 
         // 广告对话框状态
         const adDialog = reactive({
@@ -268,14 +328,17 @@
         // ===== 用户操作 =====
         function showAddUserDialog() {
           userDialog.isEdit = false;
-          userDialog.form = { username: '', password: '', nickname: '', role: 'user' };
+          userDialog.form = { username: '', password: '', nickname: '', role: 'user', validUntil: '' };
           userDialog.editId = null;
           userDialog.visible = true;
         }
 
         function showEditUserDialog(row) {
           userDialog.isEdit = true;
-          userDialog.form = { username: row.username, password: '', nickname: row.nickname, role: row.role };
+          userDialog.form = {
+            username: row.username, password: '', nickname: row.nickname,
+            role: row.role, validUntil: row.validUntil ? formatDate(row.validUntil) : ''
+          };
           userDialog.editId = row.id;
           userDialog.visible = true;
         }
@@ -391,7 +454,7 @@
 
         return {
           activeTab, users, ads, loading, online, currentVersion,
-          userDialog, adDialog,
+          userDialog, adDialog, formatDate, isExpired, daysLeft,
           showAddUserDialog, showEditUserDialog, submitUser, deleteUser,
           showAddAdDialog, showEditAdDialog, submitAd, deleteAd,
           refreshAll
