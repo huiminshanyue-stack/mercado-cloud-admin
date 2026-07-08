@@ -92,7 +92,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // 管理后台路由
-app.get('/admin', (req, res) => {
+app.get('/mgmt', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin', 'index.html'));
 });
 
