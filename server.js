@@ -93,8 +93,9 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ========== Token 认证系统（v2 新增） ==========
+// ========== Token 认证系统（单设备登录） ==========
 const tokens = {};
+const activeTokens = {};  // username -> 最新token，用于单设备登录踢下线
 
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
@@ -115,9 +116,19 @@ function getAuthUser(req) {
 }
 
 function requireAuth(req, res, next) {
-  const user = getAuthUser(req);
-  if (!user) return res.json({ code: 401, message: '未登录或登录已过期' });
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token || !tokens[token]) return res.json({ code: 401, message: '未登录或登录已过期' });
+
+  const user = tokens[token];
+  // 单设备检查：如果该用户有更新的token，则当前token被踢下线
+  if (activeTokens[user.username] && activeTokens[user.username] !== token) {
+    // 清除被踢的token
+    delete tokens[token];
+    return res.json({ code: 409, message: '您的账号已在其他设备登录，当前登录已失效' });
+  }
+
   req.authUser = user;
+  req.currentToken = token;
   next();
 }
 
@@ -279,6 +290,13 @@ app.post('/api/auth/login', async (req, res) => {
       loginTime: Date.now()
     };
 
+    // 单设备登录：清除该用户旧的 token，记录为最新的
+    if (activeTokens[user.username]) {
+      const oldToken = activeTokens[user.username];
+      delete tokens[oldToken];
+    }
+    activeTokens[user.username] = token;
+
     res.json({
       code: 0,
       data: {
@@ -308,7 +326,14 @@ app.get('/api/auth/verify', requireAuth, (req, res) => {
 // 退出登录
 app.post('/api/auth/logout', requireAuth, (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  if (token) delete tokens[token];
+  if (token) {
+    const user = tokens[token];
+    // 如果退出的是该用户的活跃token，清除记录
+    if (user && activeTokens[user.username] === token) {
+      delete activeTokens[user.username];
+    }
+    delete tokens[token];
+  }
   res.json({ code: 0, message: '已退出' });
 });
 
