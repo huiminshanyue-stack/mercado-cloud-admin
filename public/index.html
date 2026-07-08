@@ -150,6 +150,13 @@
                 </el-tag>
               </template>
             </el-table-column>
+            <el-table-column label="横幅" width="70">
+              <template #default="{ row }">
+                <el-tag :type="row.isBanner ? 'success' : 'info'" size="small">
+                  {{ row.isBanner ? '是' : '否' }}
+                </el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="操作" width="200" fixed="right">
               <template #default="{ row }">
                 <el-button type="warning" size="small" @click="showEditAdDialog(row)">编辑</el-button>
@@ -173,6 +180,13 @@
               />
               <div style="color: #909399; font-size: 12px; margin-top: 6px;">
                 留空则使用默认渐变背景。建议尺寸：1920x1080
+              </div>
+            </el-form-item>
+            <el-form-item label="横幅轮播间隔">
+              <el-input-number v-model="settingsForm.bannerInterval" :min="1" :max="60" :step="1" />
+              <span style="margin-left: 8px; color: #909399;">秒</span>
+              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
+                顶部横幅广告自动切换时间，默认 5 秒
               </div>
             </el-form-item>
             <el-form-item>
@@ -248,6 +262,9 @@
         </el-form-item>
         <el-form-item label="弹窗广告">
           <el-switch v-model="adDialog.form.isPopup" />
+        </el-form-item>
+        <el-form-item label="顶部横幅">
+          <el-switch v-model="adDialog.form.isBanner" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -345,6 +362,22 @@
           const res = await api('/api/settings');
           if (res?.code === 0) {
             settingsForm.loginBackground = res.data?.loginBackground || '';
+            settingsForm.bannerInterval = res.data?.bannerInterval ? parseInt(res.data.bannerInterval) : 5;
+          }
+        }
+
+        async function submitSettings() {
+          settingsLoading.value = true;
+          const payload = {
+            loginBackground: settingsForm.loginBackground || '',
+            bannerInterval: String(settingsForm.bannerInterval || 5)
+          };
+          const res = await api('/api/settings', 'PUT', payload);
+          settingsLoading.value = false;
+          if (res?.code === 0) {
+            ElementPlus.ElMessage.success('设置已保存');
+          } else {
+            ElementPlus.ElMessage.error(res?.message || '保存失败');
           }
         }
 
@@ -435,7 +468,7 @@
         // ===== 广告操作 =====
         function showAddAdDialog() {
           adDialog.isEdit = false;
-          adDialog.form = { title: '', content: '', imageUrl: '', linkUrl: '', enabled: true, isPopup: false };
+          adDialog.form = { title: '', content: '', imageUrl: '', linkUrl: '', enabled: true, isPopup: false, isBanner: false };
           adDialog.editId = null;
           adDialog.visible = true;
         }
@@ -445,7 +478,7 @@
           adDialog.form = {
             title: row.title, content: row.content || '',
             imageUrl: row.imageUrl || '', linkUrl: row.linkUrl || '',
-            enabled: !!row.enabled, isPopup: !!row.isPopup
+            enabled: !!row.enabled, isPopup: !!row.isPopup, isBanner: !!row.isBanner
           };
           adDialog.editId = row.id;
           adDialog.visible = true;

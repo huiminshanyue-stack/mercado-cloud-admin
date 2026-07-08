@@ -56,9 +56,14 @@ async function initSchema() {
       linkUrl TEXT DEFAULT '',
       enabled INTEGER DEFAULT 1,
       isPopup INTEGER DEFAULT 0,
+      isBanner INTEGER DEFAULT 0,
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // 兼容旧表：添加 isBanner 列
+  try {
+    await pool.query('ALTER TABLE ads ADD COLUMN IF NOT EXISTS isBanner INTEGER DEFAULT 0');
+  } catch (e) { console.log('[DB] isBanner 列已存在'); }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS settings (
       key VARCHAR(100) PRIMARY KEY,
@@ -218,7 +223,7 @@ app.get('/api/ads', async (req, res) => {
     const list = rows.map(a => ({
       id: a.id, title: a.title, content: a.content || '',
       imageUrl: a.imageurl || '', linkUrl: a.linkurl || '',
-      enabled: a.enabled, isPopup: a.ispopup,
+      enabled: a.enabled, isPopup: a.ispopup, isBanner: a.isbanner,
       created_at: a.created_at ? new Date(a.created_at).toISOString() : ''
     }));
     res.json(jsonOk(list));
@@ -228,13 +233,13 @@ app.get('/api/ads', async (req, res) => {
 });
 
 app.post('/api/ads', async (req, res) => {
-  const { title, content, imageUrl, linkUrl, enabled, isPopup } = req.body;
+  const { title, content, imageUrl, linkUrl, enabled, isPopup, isBanner } = req.body;
   if (!title) return res.json(jsonFail('广告标题不能为空'));
 
   try {
     const result = await pool.query(
-      'INSERT INTO ads (title, content, imageUrl, linkUrl, enabled, isPopup) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-      [title, content || '', imageUrl || '', linkUrl || '', enabled !== false ? 1 : 0, isPopup ? 1 : 0]
+      'INSERT INTO ads (title, content, imageUrl, linkUrl, enabled, isPopup, isBanner) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+      [title, content || '', imageUrl || '', linkUrl || '', enabled !== false ? 1 : 0, isPopup ? 1 : 0, isBanner ? 1 : 0]
     );
     res.json(jsonOk({ id: result.rows[0].id }, '广告添加成功'));
   } catch (e) {
@@ -244,7 +249,7 @@ app.post('/api/ads', async (req, res) => {
 
 app.put('/api/ads/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const { title, content, imageUrl, linkUrl, enabled, isPopup } = req.body;
+  const { title, content, imageUrl, linkUrl, enabled, isPopup, isBanner } = req.body;
 
   try {
     const updates = [];
@@ -257,6 +262,7 @@ app.put('/api/ads/:id', async (req, res) => {
     if (linkUrl !== undefined) { updates.push(`linkUrl = $${idx++}`); params.push(linkUrl); }
     if (enabled !== undefined) { updates.push(`enabled = $${idx++}`); params.push(enabled !== false ? 1 : 0); }
     if (isPopup !== undefined) { updates.push(`isPopup = $${idx++}`); params.push(isPopup ? 1 : 0); }
+    if (isBanner !== undefined) { updates.push(`isBanner = $${idx++}`); params.push(isBanner ? 1 : 0); }
 
     if (updates.length > 0) {
       params.push(id);
@@ -330,7 +336,7 @@ app.get('/api/sync', async (req, res) => {
     const ads = adsResult.rows.map(a => ({
       id: a.id, title: a.title, content: a.content,
       imageUrl: a.imageurl || '', linkUrl: a.linkurl || '',
-      enabled: a.enabled, isPopup: a.ispopup,
+      enabled: a.enabled, isPopup: a.ispopup, isBanner: a.isbanner,
       created_at: a.created_at
     }));
 
