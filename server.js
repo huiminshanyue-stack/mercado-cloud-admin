@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const axios = require('axios');
 const path = require('path');
 const { Pool } = require('pg');
 
@@ -90,6 +92,34 @@ async function seedAdmin() {
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ========== Token 认证系统 ==========
+const tokens = {};
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function isUserExpired(user) {
+  if (!user || !user.validuntil) return false;
+  const end = new Date(user.validuntil);
+  if (isNaN(end.getTime())) return false;
+  end.setHours(23, 59, 59, 999);
+  return Date.now() > end.getTime();
+}
+
+function getAuthUser(req) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token || !tokens[token]) return null;
+  return tokens[token];
+}
+
+function requireAuth(req, res, next) {
+  const user = getAuthUser(req);
+  if (!user) return res.json({ code: 401, message: '未登录或登录已过期' });
+  req.authUser = user;
+  next();
+}
 
 // 管理后台路由
 app.get('/mgmt', (req, res) => {
@@ -200,7 +230,7 @@ app.put('/api/users/:id', async (req, res) => {
   }
 });
 
-// 验证登录
+// 验证登录（兼容旧版同步）
 app.post('/api/verify-login', async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -218,6 +248,79 @@ app.post('/api/verify-login', async (req, res) => {
   } catch (e) {
     res.status(500).json(jsonFail('数据库错误'));
   }
+});
+
+// ========== 前端认证 API（前端 App.vue 调用） ==========
+
+// 登录：验证密码 + 创建 token
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.json(jsonFail('请输入用户名和密码'));
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (rows.length === 0) return res.json({ code: 401, message: '用户名或密码错误' });
+
+    const user = rows[0];
+    const valid = bcrypt.compareSync(password, user.password);
+    if (!valid) return res.json({ code: 401, message: '用户名或密码错误' });
+
+    // 检查账号是否到期
+    if (isUserExpired(user)) {
+      return res.json({ code: 403, message: '账号已到期，请联系管理员' });
+    }
+
+    const token = generateToken();
+    tokens[token] = {
+      username: user.username,
+      nickname: user.nickname,
+      role: user.role,
+      validUntil: user.validuntil || null,
+      loginTime: Date.now()
+    };
+
+    res.json({
+      code: 0,
+      data: {
+        token,
+        user: {
+          username: user.username,
+          nickname: user.nickname,
+          role: user.role,
+          validUntil: user.validuntil || null
+        }
+      }
+    });
+  } catch (e) {
+    console.error('[Auth] 登录失败:', e.message);
+    res.status(500).json({ code: 500, message: '服务器错误，请稍后重试' });
+  }
+});
+
+// 验证 token
+app.get('/api/auth/verify', requireAuth, (req, res) => {
+  res.json({
+    code: 0,
+    data: { user: req.authUser }
+  });
+});
+
+// 退出登录
+app.post('/api/auth/logout', requireAuth, (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (token) delete tokens[token];
+  res.json({ code: 0, message: '已退出' });
+});
+
+// 前端配置接口
+app.get('/api/config', (req, res) => {
+  res.json({
+    code: 0,
+    data: {
+      cloudUrl: 'https://mercado-cloud-admin-production.up.railway.app',
+      cloudConnected: true
+    }
+  });
 });
 
 // ========== 广告管理 API ==========
@@ -291,6 +394,36 @@ app.delete('/api/ads/:id', async (req, res) => {
   }
 });
 
+// ========== 前端广告 API（供 App.vue 调用） ==========
+
+// 获取启用的弹窗广告
+app.get('/api/ads/active', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM ads WHERE enabled = 1 AND isPopup = 1 ORDER BY id");
+    const list = rows.map(a => ({
+      id: a.id, title: a.title, content: a.content || '',
+      imageUrl: a.imageurl || '', linkUrl: a.linkurl || ''
+    }));
+    res.json({ code: 0, data: list });
+  } catch (e) {
+    res.status(500).json({ code: 500, message: '数据库错误' });
+  }
+});
+
+// 获取启用的横幅广告
+app.get('/api/ads/banner', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM ads WHERE enabled = 1 AND isBanner = 1 ORDER BY id");
+    const list = rows.map(a => ({
+      id: a.id, title: a.title,
+      imageUrl: a.imageurl || '', linkUrl: a.linkurl || ''
+    }));
+    res.json({ code: 0, data: list });
+  } catch (e) {
+    res.status(500).json({ code: 500, message: '数据库错误' });
+  }
+});
+
 // ========== 系统设置 API ==========
 
 app.get('/api/settings', async (req, res) => {
@@ -352,6 +485,63 @@ app.get('/api/sync', async (req, res) => {
   } catch (e) {
     console.error('[Sync] 错误:', e.message);
     res.status(500).json(jsonFail('数据库错误'));
+  }
+});
+
+// ========== 搜索代理（前端 App.vue 调用） ==========
+app.get('/api/search', async (req, res) => {
+  try {
+    const defaults = {
+      keyword: '', region: 'MLM', full: 'false',
+      shippedFrom: 'Envío desde China', crossBorder: 'true',
+      sort: 'totalSold', order: 'descend', page: '1', size: '20'
+    };
+    const params = { ...defaults, ...req.query };
+    params.page = String(params.page);
+    params.size = String(params.size);
+
+    const response = await axios.get('https://api.meikeduoshuju.com/api/v1/goods/search', {
+      params, timeout: 30000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    res.json(response.data);
+  } catch (error) {
+    console.error('[Search] 请求失败:', error.message);
+    if (error.response) {
+      res.status(error.response.status).json({ code: error.response.status, message: `上游接口错误: ${error.response.status}` });
+    } else if (error.request) {
+      res.status(504).json({ code: 504, message: '搜索接口超时或无响应' });
+    } else {
+      res.status(500).json({ code: 500, message: error.message });
+    }
+  }
+});
+
+// 品类列表代理
+app.get('/api/category/list', async (req, res) => {
+  try {
+    const params = { region: req.query.region || 'MLM' };
+    if (req.query.level) params.level = req.query.level;
+    if (req.query.parentCatId) params.parentCatId = req.query.parentCatId;
+
+    const response = await axios.get('https://api.meikeduoshuju.com/api/v1/category/list', {
+      params, timeout: 10000,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    res.json(response.data);
+  } catch (error) {
+    console.error('[Category] 请求失败:', error.message);
+    if (error.response) {
+      res.status(error.response.status).json({ code: error.response.status, message: `上游接口错误: ${error.response.status}` });
+    } else {
+      res.status(500).json({ code: 500, message: error.message });
+    }
   }
 });
 
