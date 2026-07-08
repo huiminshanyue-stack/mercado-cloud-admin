@@ -418,18 +418,6 @@
           loading.value = false;
         }
 
-        async function submitSettings() {
-          settingsLoading.value = true;
-          const res = await api('/api/settings', 'PUT', {
-            loginBackground: settingsForm.loginBackground || ''
-          });
-          settingsLoading.value = false;
-          if (res?.code === 0) {
-            ElementPlus.ElMessage.success(res.message);
-          } else {
-            ElementPlus.ElMessage.error(res?.message || '保存失败');
-          }
-        }
 
         // ===== 用户操作 =====
         function showAddUserDialog() {
