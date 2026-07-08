@@ -19,7 +19,11 @@ async function connectDB() {
     process.exit(1);
   }
 
-  pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    client_encoding: 'utf8'
+  });
 
   try {
     const client = await pool.connect();
