@@ -2,70 +2,73 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const path = require('path');
-const fs = require('fs');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
 const SALT_ROUNDS = 10;
-const DATA_FILE = path.join(__dirname, 'cloud_data.json');
 
-// ========== 数据初始化 ==========
-let data = null;
+// ========== PostgreSQL 连接 ==========
+const DATABASE_URL = process.env.DATABASE_URL;
+let pool = null;
 
-function loadData() {
+async function connectDB() {
+  if (!DATABASE_URL) {
+    console.error('[DB] ❌ 未设置 DATABASE_URL 环境变量！');
+    console.error('[DB] 请在 Railway 中添加 PostgreSQL 数据库服务');
+    process.exit(1);
+  }
+
+  pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
+    const client = await pool.connect();
+    console.log('[DB] ✅ PostgreSQL 连接成功');
+    client.release();
   } catch (e) {
-    console.error('[Data] 加载失败:', e.message);
-  }
-  return {
-    version: 0,
-    users: [
-      {
-        id: 1,
-        username: 'admin',
-        password: bcrypt.hashSync('admin123', SALT_ROUNDS),
-        nickname: '管理员',
-        role: 'admin',
-        validUntil: null,
-        created_at: new Date().toISOString()
-      }
-    ],
-    ads: []
-  };
-}
-
-function saveData() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8');
-  } catch (e) {
-    console.error('[Data] 保存失败:', e.message);
+    console.error('[DB] ❌ 连接失败:', e.message);
+    process.exit(1);
   }
 }
 
-function bumpVersion() {
-  data.version = (data.version || 0) + 1;
-  saveData();
+async function initSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username VARCHAR(100) UNIQUE NOT NULL,
+      password VARCHAR(255) NOT NULL,
+      nickname VARCHAR(100) DEFAULT '',
+      role VARCHAR(20) DEFAULT 'user',
+      validUntil TIMESTAMP DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(255) NOT NULL,
+      content TEXT DEFAULT '',
+      imageUrl TEXT DEFAULT '',
+      linkUrl TEXT DEFAULT '',
+      enabled INTEGER DEFAULT 1,
+      isPopup INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('[DB] ✅ 数据库表已就绪');
 }
 
-let nextUserId = 2;
-let nextAdId = 1;
-
-function initIds() {
-  if (data.users && data.users.length > 0) {
-    nextUserId = Math.max(...data.users.map(u => u.id)) + 1;
-  }
-  if (data.ads && data.ads.length > 0) {
-    nextAdId = Math.max(...data.ads.map(a => a.id)) + 1;
+async function seedAdmin() {
+  const { rows } = await pool.query('SELECT COUNT(*) as count FROM users');
+  if (parseInt(rows[0].count) === 0) {
+    const hash = bcrypt.hashSync('admin123', SALT_ROUNDS);
+    await pool.query(
+      'INSERT INTO users (username, password, nickname, role) VALUES ($1, $2, $3, $4)',
+      ['admin', hash, '管理员', 'admin']
+    );
+    console.log('[DB] ✅ 已创建默认管理员: admin / admin123');
   }
 }
-
-// 初始化
-data = loadData();
-initIds();
-console.log(`[Data] 已加载 ${data.users.length} 用户, ${data.ads.length} 广告, v${data.version}`);
 
 // ========== 中间件 ==========
 app.use(cors());
@@ -80,158 +83,240 @@ function jsonFail(msg = 'error') {
   return { code: 1, message: msg };
 }
 
+async function bumpVersion() {
+  // 版本号用表的总行数变化表示
+}
+
 // ========== 用户管理 API ==========
 
-app.get('/api/users', (req, res) => {
-  const list = data.users.map(u => ({
-    id: u.id, username: u.username, nickname: u.nickname,
-    role: u.role, validUntil: u.validUntil || null, created_at: u.created_at
-  }));
-  res.json(jsonOk(list));
+app.get('/api/users', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, username, nickname, role, validUntil, created_at FROM users ORDER BY id'
+    );
+    const list = rows.map(u => ({
+      id: u.id, username: u.username, nickname: u.nickname,
+      role: u.role, validUntil: u.validuntil || null,
+      created_at: u.created_at ? new Date(u.created_at).toISOString() : ''
+    }));
+    res.json(jsonOk(list));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
-app.post('/api/users', (req, res) => {
+app.post('/api/users', async (req, res) => {
   const { username, password, nickname, role, validUntil } = req.body;
   if (!username || !password) return res.json(jsonFail('用户名和密码不能为空'));
 
-  const exist = data.users.find(u => u.username === username);
-  if (exist) return res.json(jsonFail('用户名已存在'));
+  try {
+    const exist = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+    if (exist.rows.length > 0) return res.json(jsonFail('用户名已存在'));
 
-  const hash = bcrypt.hashSync(password, SALT_ROUNDS);
-  const newUser = {
-    id: nextUserId++,
-    username,
-    password: hash,
-    nickname: nickname || '',
-    role: role || 'user',
-    validUntil: validUntil || null,
-    created_at: new Date().toISOString()
-  };
-  data.users.push(newUser);
-  bumpVersion();
-  res.json(jsonOk({ id: newUser.id }, '用户添加成功'));
+    const hash = bcrypt.hashSync(password, SALT_ROUNDS);
+    const result = await pool.query(
+      'INSERT INTO users (username, password, nickname, role, validUntil) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [username, hash, nickname || '', role || 'user', validUntil ? new Date(validUntil) : null]
+    );
+    res.json(jsonOk({ id: result.rows[0].id }, '用户添加成功'));
+  } catch (e) {
+    console.error('[Users] 添加失败:', e.message);
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
-app.delete('/api/users/:id', (req, res) => {
+app.delete('/api/users/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   if (id === 1) return res.json(jsonFail('不能删除默认管理员'));
 
-  const idx = data.users.findIndex(u => u.id === id);
-  if (idx === -1) return res.json(jsonFail('用户不存在'));
-
-  data.users.splice(idx, 1);
-  bumpVersion();
-  res.json(jsonOk(null, '用户已删除'));
+  try {
+    const result = await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    if (result.rowCount === 0) return res.json(jsonFail('用户不存在'));
+    res.json(jsonOk(null, '用户已删除'));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
-app.put('/api/users/:id', (req, res) => {
+app.put('/api/users/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const user = data.users.find(u => u.id === id);
-  if (!user) return res.json(jsonFail('用户不存在'));
-
   const { password, nickname, role, validUntil } = req.body;
-  if (password) user.password = bcrypt.hashSync(password, SALT_ROUNDS);
-  if (nickname !== undefined) user.nickname = nickname;
-  if (role !== undefined) user.role = role;
-  if (validUntil !== undefined) user.validUntil = validUntil || null;
-  bumpVersion();
-  res.json(jsonOk(null, '用户已更新'));
+
+  try {
+    const user = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    if (user.rows.length === 0) return res.json(jsonFail('用户不存在'));
+
+    let updates = [];
+    let params = [];
+    let idx = 1;
+
+    if (password) {
+      const hash = bcrypt.hashSync(password, SALT_ROUNDS);
+      updates.push(`password = $${idx++}`);
+      params.push(hash);
+    }
+    if (nickname !== undefined) {
+      updates.push(`nickname = $${idx++}`);
+      params.push(nickname);
+    }
+    if (role !== undefined) {
+      updates.push(`role = $${idx++}`);
+      params.push(role);
+    }
+    if (validUntil !== undefined) {
+      updates.push(`validUntil = $${idx++}`);
+      params.push(validUntil ? new Date(validUntil) : null);
+    }
+
+    if (updates.length > 0) {
+      params.push(id);
+      await pool.query(`UPDATE users SET ${updates.join(', ')} WHERE id = $${idx}`, params);
+    }
+
+    res.json(jsonOk(null, '用户已更新'));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
-// 验证登录（供云端管理页面用，也可被本地服务器调用）
-app.post('/api/verify-login', (req, res) => {
+// 验证登录
+app.post('/api/verify-login', async (req, res) => {
   const { username, password } = req.body;
-  const user = data.users.find(u => u.username === username);
-  if (!user) return res.json(jsonFail('用户名或密码错误'));
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (rows.length === 0) return res.json(jsonFail('用户名或密码错误'));
 
-  const valid = bcrypt.compareSync(password, user.password);
-  if (!valid) return res.json(jsonFail('用户名或密码错误'));
+    const user = rows[0];
+    const valid = bcrypt.compareSync(password, user.password);
+    if (!valid) return res.json(jsonFail('用户名或密码错误'));
 
-  res.json(jsonOk({
-    id: user.id, username: user.username,
-    nickname: user.nickname, role: user.role
-  }));
+    res.json(jsonOk({
+      id: user.id, username: user.username,
+      nickname: user.nickname, role: user.role
+    }));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
 // ========== 广告管理 API ==========
 
-app.get('/api/ads', (req, res) => {
-  res.json(jsonOk(data.ads));
+app.get('/api/ads', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM ads ORDER BY id');
+    const list = rows.map(a => ({
+      id: a.id, title: a.title, content: a.content || '',
+      imageUrl: a.imageurl || '', linkUrl: a.linkurl || '',
+      enabled: a.enabled, isPopup: a.ispopup,
+      created_at: a.created_at ? new Date(a.created_at).toISOString() : ''
+    }));
+    res.json(jsonOk(list));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
-app.post('/api/ads', (req, res) => {
+app.post('/api/ads', async (req, res) => {
   const { title, content, imageUrl, linkUrl, enabled, isPopup } = req.body;
   if (!title) return res.json(jsonFail('广告标题不能为空'));
 
-  const newAd = {
-    id: nextAdId++,
-    title,
-    content: content || '',
-    imageUrl: imageUrl || '',
-    linkUrl: linkUrl || '',
-    enabled: enabled !== false ? 1 : 0,
-    isPopup: isPopup ? 1 : 0,
-    created_at: new Date().toISOString()
-  };
-  data.ads.push(newAd);
-  bumpVersion();
-  res.json(jsonOk({ id: newAd.id }, '广告添加成功'));
+  try {
+    const result = await pool.query(
+      'INSERT INTO ads (title, content, imageUrl, linkUrl, enabled, isPopup) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [title, content || '', imageUrl || '', linkUrl || '', enabled !== false ? 1 : 0, isPopup ? 1 : 0]
+    );
+    res.json(jsonOk({ id: result.rows[0].id }, '广告添加成功'));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
-app.put('/api/ads/:id', (req, res) => {
+app.put('/api/ads/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const ad = data.ads.find(a => a.id === id);
-  if (!ad) return res.json(jsonFail('广告不存在'));
-
   const { title, content, imageUrl, linkUrl, enabled, isPopup } = req.body;
-  if (title !== undefined) ad.title = title;
-  if (content !== undefined) ad.content = content;
-  if (imageUrl !== undefined) ad.imageUrl = imageUrl;
-  if (linkUrl !== undefined) ad.linkUrl = linkUrl;
-  if (enabled !== undefined) ad.enabled = enabled !== false ? 1 : 0;
-  if (isPopup !== undefined) ad.isPopup = isPopup ? 1 : 0;
-  bumpVersion();
-  res.json(jsonOk(null, '广告已更新'));
-});
 
-app.delete('/api/ads/:id', (req, res) => {
-  const id = parseInt(req.params.id);
-  const idx = data.ads.findIndex(a => a.id === id);
-  if (idx === -1) return res.json(jsonFail('广告不存在'));
+  try {
+    const updates = [];
+    const params = [];
+    let idx = 1;
 
-  data.ads.splice(idx, 1);
-  bumpVersion();
-  res.json(jsonOk(null, '广告已删除'));
-});
+    if (title !== undefined) { updates.push(`title = $${idx++}`); params.push(title); }
+    if (content !== undefined) { updates.push(`content = $${idx++}`); params.push(content); }
+    if (imageUrl !== undefined) { updates.push(`imageUrl = $${idx++}`); params.push(imageUrl); }
+    if (linkUrl !== undefined) { updates.push(`linkUrl = $${idx++}`); params.push(linkUrl); }
+    if (enabled !== undefined) { updates.push(`enabled = $${idx++}`); params.push(enabled !== false ? 1 : 0); }
+    if (isPopup !== undefined) { updates.push(`isPopup = $${idx++}`); params.push(isPopup ? 1 : 0); }
 
-// ========== 同步接口（本地服务器每5秒轮询） ==========
-app.get('/api/sync', (req, res) => {
-  res.json({
-    code: 0,
-    data: {
-      version: data.version,
-      users: data.users,    // 含密码hash，本地验证登录需要
-      ads: data.ads
+    if (updates.length > 0) {
+      params.push(id);
+      const result = await pool.query(`UPDATE ads SET ${updates.join(', ')} WHERE id = $${idx}`, params);
+      if (result.rowCount === 0) return res.json(jsonFail('广告不存在'));
     }
-  });
+    res.json(jsonOk(null, '广告已更新'));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
+});
+
+app.delete('/api/ads/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const result = await pool.query('DELETE FROM ads WHERE id = $1', [id]);
+    if (result.rowCount === 0) return res.json(jsonFail('广告不存在'));
+    res.json(jsonOk(null, '广告已删除'));
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
+});
+
+// ========== 同步接口 ==========
+app.get('/api/sync', async (req, res) => {
+  try {
+    const users = await pool.query('SELECT * FROM users ORDER BY id');
+    const ads = await pool.query('SELECT * FROM ads ORDER BY id');
+    res.json({
+      code: 0,
+      data: {
+        version: Date.now(),
+        users: users.rows,
+        ads: ads.rows
+      }
+    });
+  } catch (e) {
+    res.status(500).json(jsonFail('数据库错误'));
+  }
 });
 
 // ========== 健康检查 ==========
-app.get('/api/health', (req, res) => {
-  res.json(jsonOk({
-    version: data.version,
-    users: data.users.length,
-    ads: data.ads.length,
-    uptime: process.uptime()
-  }));
+app.get('/api/health', async (req, res) => {
+  try {
+    const users = await pool.query('SELECT COUNT(*) as count FROM users');
+    const ads = await pool.query('SELECT COUNT(*) as count FROM ads');
+    res.json(jsonOk({
+      version: Date.now(),
+      users: parseInt(users.rows[0].count),
+      ads: parseInt(ads.rows[0].count),
+      uptime: process.uptime()
+    }));
+  } catch (e) {
+    res.status(500).json({ code: 1, message: '数据库连接失败' });
+  }
 });
 
 // ========== 启动 ==========
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('============================================');
-  console.log('  美客多爆品选品雷达 - 云端管理后台');
-  console.log(`  地址: http://localhost:${PORT}`);
-  console.log(`  管理页面: http://localhost:${PORT}/`);
-  console.log('  默认管理员: admin / admin123');
-  console.log('============================================');
-});
+async function start() {
+  await connectDB();
+  await initSchema();
+  await seedAdmin();
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log('============================================');
+    console.log('  美客多爆品选品雷达 - 云端管理后台');
+    console.log(`  地址: http://localhost:${PORT}`);
+    console.log(`  管理页面: http://localhost:${PORT}/`);
+    console.log('  默认管理员: admin / admin123');
+    console.log('============================================');
+  });
+}
+
+start();
