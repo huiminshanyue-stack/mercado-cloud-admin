@@ -102,8 +102,10 @@ function generateToken() {
 }
 
 function isUserExpired(user) {
-  if (!user || !user.validuntil) return false;
-  const end = new Date(user.validuntil);
+  if (!user) return false;
+  const validUntil = user.validuntil || user.validUntil;
+  if (!validUntil) return false;
+  const end = new Date(validUntil);
   if (isNaN(end.getTime())) return false;
   end.setHours(23, 59, 59, 999);
   return Date.now() > end.getTime();
