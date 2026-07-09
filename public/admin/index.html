@@ -170,9 +170,19 @@
         <!-- ===== 系统设置 ===== -->
         <el-tab-pane label="🎨 系统设置" name="settings">
           <div class="toolbar">
-            <h3>登录页设置</h3>
+            <h3>基础设置</h3>
           </div>
           <el-form label-width="120px" size="small" style="max-width: 600px;">
+            <el-form-item label="软件标题">
+              <el-input
+                v-model="settingsForm.appTitle"
+                placeholder="例如 美客多选品助手——内测中"
+                clearable
+              />
+              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
+                设置后用户软件标题和窗口标题将同步更新
+              </div>
+            </el-form-item>
             <el-form-item label="登录背景图片">
               <el-input
                 v-model="settingsForm.loginBackground"
@@ -314,7 +324,7 @@
         const currentVersion = ref(0);
 
         // 设置表单
-        const settingsForm = reactive({ loginBackground: '', bannerInterval: 5, latestVersion: '', downloadUrl: '' });
+        const settingsForm = reactive({ appTitle: '', loginBackground: '', bannerInterval: 5, latestVersion: '', downloadUrl: '' });
         const settingsLoading = ref(false);
 
         // 用户对话框状态
@@ -383,6 +393,7 @@
         async function fetchSettings() {
           const res = await api('/api/settings');
           if (res?.code === 0) {
+            settingsForm.appTitle = res.data?.appTitle || '';
             settingsForm.loginBackground = res.data?.loginBackground || '';
             settingsForm.bannerInterval = res.data?.bannerInterval ? parseInt(res.data.bannerInterval) : 5;
             settingsForm.latestVersion = res.data?.latestVersion || '';
@@ -393,6 +404,7 @@
         async function submitSettings() {
           settingsLoading.value = true;
           const payload = {
+            appTitle: settingsForm.appTitle || '',
             loginBackground: settingsForm.loginBackground || '',
             bannerInterval: String(settingsForm.bannerInterval || 5),
             latestVersion: settingsForm.latestVersion || '',
