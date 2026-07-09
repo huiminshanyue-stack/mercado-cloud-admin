@@ -127,6 +127,13 @@ function requireAuth(req, res, next) {
     return res.json({ code: 409, message: '您的账号已在其他设备登录，当前登录已失效' });
   }
 
+  // 检查账号是否到期（token中保存的validUntil）
+  if (isUserExpired(user)) {
+    delete tokens[token];
+    delete activeTokens[user.username];
+    return res.json({ code: 403, message: '账号已到期，请联系管理员' });
+  }
+
   req.authUser = user;
   req.currentToken = token;
   next();
