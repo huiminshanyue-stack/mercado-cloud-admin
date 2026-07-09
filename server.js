@@ -570,6 +570,34 @@ app.get('/api/category/list', async (req, res) => {
   }
 });
 
+// ========== 汇率转换 API ==========
+// 缓存汇率，默认 1 小时刷新一次
+let exchangeRateCache = { rate: null, base: null, timestamp: 0 };
+const EXCHANGE_RATE_TTL = 60 * 60 * 1000; // 1小时
+
+app.get('/api/exchange-rate', async (req, res) => {
+  const base = req.query.base || 'MXN';
+  const target = req.query.target || 'USD';
+
+  // 检查缓存
+  const now = Date.now();
+  if (exchangeRateCache.rate && exchangeRateCache.base === base && exchangeRateCache.target === target && (now - exchangeRateCache.timestamp) < EXCHANGE_RATE_TTL) {
+    return res.json({ code: 0, data: { base, target, rate: exchangeRateCache.rate } });
+  }
+
+  try {
+    const response = await axios.get(`https://api.exchangerate-api.com/v4/latest/${base}`, { timeout: 10000 });
+    const rate = response.data?.rates?.[target];
+    if (!rate) return res.status(500).json({ code: 1, message: '获取汇率失败' });
+
+    exchangeRateCache = { rate, base, target, timestamp: now };
+    res.json({ code: 0, data: { base, target, rate } });
+  } catch (error) {
+    console.error('[ExchangeRate] 获取失败:', error.message);
+    res.status(500).json({ code: 1, message: '汇率服务暂时不可用' });
+  }
+});
+
 // ========== 健康检查 ==========
 app.get('/api/health', async (req, res) => {
   try {

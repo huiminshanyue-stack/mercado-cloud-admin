@@ -183,6 +183,15 @@
                 设置后用户软件标题和窗口标题将同步更新
               </div>
             </el-form-item>
+            <el-form-item label="价格显示货币">
+              <el-radio-group v-model="settingsForm.priceCurrency">
+                <el-radio label="local">当地货币（如 MXN）</el-radio>
+                <el-radio label="usd">美元（USD）</el-radio>
+              </el-radio-group>
+              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
+                选择美元后，客户端会自动按实时汇率把当地货币转换为 USD 显示
+              </div>
+            </el-form-item>
             <el-form-item label="登录背景图片">
               <el-input
                 v-model="settingsForm.loginBackground"
@@ -324,7 +333,7 @@
         const currentVersion = ref(0);
 
         // 设置表单
-        const settingsForm = reactive({ appTitle: '', loginBackground: '', bannerInterval: 5, latestVersion: '', downloadUrl: '' });
+        const settingsForm = reactive({ appTitle: '', priceCurrency: 'local', loginBackground: '', bannerInterval: 5, latestVersion: '', downloadUrl: '' });
         const settingsLoading = ref(false);
 
         // 用户对话框状态
@@ -394,6 +403,7 @@
           const res = await api('/api/settings');
           if (res?.code === 0) {
             settingsForm.appTitle = res.data?.appTitle || '';
+            settingsForm.priceCurrency = res.data?.priceCurrency || 'local';
             settingsForm.loginBackground = res.data?.loginBackground || '';
             settingsForm.bannerInterval = res.data?.bannerInterval ? parseInt(res.data.bannerInterval) : 5;
             settingsForm.latestVersion = res.data?.latestVersion || '';
@@ -405,6 +415,7 @@
           settingsLoading.value = true;
           const payload = {
             appTitle: settingsForm.appTitle || '',
+            priceCurrency: settingsForm.priceCurrency || 'local',
             loginBackground: settingsForm.loginBackground || '',
             bannerInterval: String(settingsForm.bannerInterval || 5),
             latestVersion: settingsForm.latestVersion || '',
