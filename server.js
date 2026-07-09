@@ -107,8 +107,12 @@ function isUserExpired(user) {
   if (!validUntil) return false;
   const end = new Date(validUntil);
   if (isNaN(end.getTime())) return false;
-  end.setHours(23, 59, 59, 999);
-  return Date.now() > end.getTime();
+  // validUntil 在数据库中存储为 UTC 日期（如 2026-07-09T00:00:00.000Z）
+  // 管理员在 GMT+8 时区操作，期望用户用到当天结束（北京时区）
+  // 北京 7月9日 23:59:59 = UTC 7月9日 15:59:59
+  // 所以从 UTC 午夜加 15小时59分59秒即为北京时区的当天结束
+  const expireTime = end.getTime() + 15 * 3600 * 1000 + 59 * 60 * 1000 + 59 * 1000 + 999;
+  return Date.now() > expireTime;
 }
 
 function getAuthUser(req) {
