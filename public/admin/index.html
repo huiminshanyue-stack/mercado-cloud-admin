@@ -1,588 +1,733 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="build-version" content="3.0.1">
-  <title>美客多 - 云端管理后台</title>
-  <link rel="stylesheet" href="https://unpkg.com/element-plus/theme-chalk/index.css">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', sans-serif; background: #f5f7fa; }
-    .app-header {
-      background: linear-gradient(135deg, #409EFF, #337ecc);
-      color: white; padding: 20px 30px;
-      display: flex; align-items: center; justify-content: space-between;
-      box-shadow: 0 2px 8px rgba(0,0,0,.1);
-    }
-    .app-header h1 { font-size: 22px; font-weight: 600; }
-    .app-header .sub { font-size: 13px; opacity: .8; margin-top: 4px; }
-    .app-container { max-width: 1200px; margin: 20px auto; padding: 0 20px; }
-    .el-tabs { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
-    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    .toolbar h3 { font-size: 16px; color: #303133; }
-    .el-table th { background: #f0f5ff !important; color: #409EFF; }
-    .tag-admin { background: #fef0f0; color: #f56c6c; border: 1px solid #fbc4c4; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
-    .tag-user { background: #f0f9eb; color: #67c23a; border: 1px solid #c2e7b0; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
-    .sync-bar {
-      background: #fff; border-radius: 8px; padding: 12px 20px; margin-bottom: 16px;
-      display: flex; align-items: center; justify-content: space-between;
-      box-shadow: 0 1px 4px rgba(0,0,0,.06);
-    }
-    .sync-bar .info { display: flex; align-items: center; gap: 16px; font-size: 13px; color: #909399; }
-    .sync-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-    .sync-dot.online { background: #67c23a; }
-    .sync-dot.offline { background: #f56c6c; }
-    .footer-bar {
-      text-align: center; color: #c0c4cc; font-size: 12px;
-      margin-top: 30px; padding: 20px;
-    }
-    @media (max-width: 768px) {
-      .app-container { padding: 0 10px; }
-      .el-tabs { padding: 12px; }
-    }
-    .el-dialog { border-radius: 8px; }
-    .empty-hint { color: #c0c4cc; font-size: 13px; }
-    .table-wrapper { width: 100%; overflow-x: auto; }
-    .table-wrapper .el-table { min-width: 900px; }
-    .expire-tag { font-size: 12px; padding: 2px 6px; border-radius: 4px; }
-    .expire-tag.unlimited { background: #f4f4f5; color: #909399; border: 1px solid #e9e9eb; }
-    .expire-tag.active { background: #f0f9eb; color: #67c23a; border: 1px solid #c2e7b0; }
-    .expire-tag.expired { background: #fef0f0; color: #f56c6c; border: 1px solid #fbc4c4; }
-    .expire-tag.near { background: #fdf6ec; color: #e6a23c; border: 1px solid #f5dab1; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>美客多云管理后台</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333;min-height:100vh}
+/* Login */
+.login-page{display:flex;align-items:center;justify-content:center;min-height:100vh;background:linear-gradient(135deg,#1a73e8,#0d47a1)}
+.login-box{background:#fff;padding:40px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.15);width:380px}
+.login-box h2{text-align:center;margin-bottom:8px;color:#1a73e8;font-size:22px}
+.login-box p{text-align:center;color:#888;font-size:13px;margin-bottom:24px}
+.login-box input{width:100%;padding:10px 14px;border:1px solid #d9d9d9;border-radius:6px;font-size:14px;margin-bottom:14px;outline:none;transition:border-color .2s}
+.login-box input:focus{border-color:#1a73e8}
+.login-box .btn{width:100%;padding:10px;background:#1a73e8;color:#fff;border:none;border-radius:6px;font-size:15px;cursor:pointer}
+.login-box .btn:hover{background:#1557b0}
+.login-box .btn:disabled{opacity:.6;cursor:not-allowed}
+.login-box .err{color:#e53935;font-size:13px;margin-top:8px;text-align:center}
+.login-box .hint{text-align:center;color:#999;font-size:12px;margin-top:12px}
+/* Layout */
+.admin-layout{display:flex;min-height:100vh}
+.sidebar{width:200px;background:#001529;color:#fff;flex-shrink:0;display:flex;flex-direction:column}
+.sidebar h3{padding:18px 16px;font-size:15px;border-bottom:1px solid rgba(255,255,255,.1)}
+.sidebar .nav{padding:8px 0;flex:1}
+.sidebar .nav-item{padding:10px 20px;cursor:pointer;font-size:13px;color:rgba(255,255,255,.7);transition:all .2s;display:flex;align-items:center;gap:8px}
+.sidebar .nav-item:hover{color:#fff;background:rgba(255,255,255,.06)}
+.sidebar .nav-item.active{color:#fff;background:#1890ff}
+.sidebar .logout-btn{padding:12px 20px;border-top:1px solid rgba(255,255,255,.1);cursor:pointer;font-size:13px;color:rgba(255,255,255,.7);display:flex;align-items:center;gap:8px}
+.sidebar .logout-btn:hover{color:#ff4d4f}
+.main-area{flex:1;overflow-y:auto;padding:24px;background:#f0f2f5}
+.main-area h2{font-size:20px;margin-bottom:20px}
+/* Components */
+.card{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.stat-card{background:#fff;border-radius:8px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.08);text-align:center}
+.stat-card .num{font-size:28px;font-weight:700;color:#1a73e8}
+.stat-card .lbl{font-size:12px;color:#888;margin-top:4px}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #f0f0f0;white-space:nowrap}
+th{background:#fafafa;font-weight:600;color:#555;position:sticky;top:0;z-index:1}
+tr:hover td{background:#f5f7fa}
+.btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;border:none;border-radius:4px;font-size:12px;cursor:pointer;transition:all .2s}
+.btn-primary{background:#1a73e8;color:#fff}
+.btn-primary:hover{background:#1557b0}
+.btn-success{background:#52c41a;color:#fff}
+.btn-success:hover{background:#49a817}
+.btn-danger{background:#ff4d4f;color:#fff}
+.btn-danger:hover{background:#d9363e}
+.btn-warning{background:#faad14;color:#fff}
+.btn-warning:hover{background:#d99a0e}
+.btn-sm{padding:4px 10px;font-size:11px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.mr-2{margin-right:8px}
+.mt-2{margin-top:12px}
+.mb-2{margin-bottom:12px}
+.flex{display:flex;align-items:center;gap:8px}
+.flex-wrap{flex-wrap:wrap}
+.gap-2{gap:8px}
+.text-right{text-align:right}
+/* Modal */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.45);z-index:1000;display:flex;align-items:center;justify-content:center}
+.modal{background:#fff;border-radius:8px;width:520px;max-width:90vw;max-height:80vh;overflow-y:auto;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,.15)}
+.modal h3{font-size:16px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #f0f0f0}
+.modal .field{margin-bottom:12px}
+.modal label{display:block;font-size:12px;color:#888;margin-bottom:4px}
+.modal input,.modal select,.modal textarea{width:100%;padding:8px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none}
+.modal input:focus,.modal select:focus,.modal textarea:focus{border-color:#1a73e8}
+.modal .btns{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid #f0f0f0}
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:6px;color:#fff;font-size:13px;z-index:2000;animation:fadeIn .3s;box-shadow:0 4px 12px rgba(0,0,0,.15)}
+.toast.success{background:#52c41a}
+.toast.error{background:#ff4d4f}
+.toast.info{background:#1890ff}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+/* Tags */
+.tag{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:500}
+.tag-green{background:#f6ffed;color:#52c41a;border:1px solid #b7eb8f}
+.tag-red{background:#fff2f0;color:#ff4d4f;border:1px solid #ffccc7}
+.tag-blue{background:#e6f7ff;color:#1890ff;border:1px solid #91d5ff}
+.tag-admin{background:#fff7e6;color:#fa8c16;border:1px solid #ffd591}
+.tag-warning{background:#fffbe6;color:#d48806;border:1px solid #ffe58f}
+/* Search */
+.search-bar{display:flex;gap:8px;margin-bottom:12px}
+.search-bar input{flex:1;padding:8px 12px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none}
+.search-bar input:focus{border-color:#1a73e8}
+.pagination{display:flex;justify-content:center;align-items:center;gap:8px;margin-top:12px;font-size:13px}
+.pagination button{padding:4px 12px;border:1px solid #d9d9d9;background:#fff;border-radius:4px;cursor:pointer}
+.pagination button:hover{background:#f5f5f5}
+.pagination button:disabled{opacity:.4;cursor:not-allowed}
+.pagination span{color:#888}
+/* Tab */
+.tabs{display:flex;gap:0;border-bottom:2px solid #e8e8e8;margin-bottom:20px}
+.tab{padding:10px 20px;cursor:pointer;font-size:13px;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s}
+.tab:hover{color:#1a73e8}
+.tab.active{color:#1a73e8;border-bottom-color:#1a73e8;font-weight:600}
+/* Responsive */
+@media(max-width:768px){.sidebar{width:160px}.main-area{padding:16px}}
+</style>
 </head>
 <body>
-  <div id="app">
-    <div class="app-header">
-      <div>
-        <h1>📡 美客多爆品选品雷达</h1>
-        <div class="sub">云端管理后台 — 随时随地管理用户和广告</div>
-      </div>
-    </div>
+<div id="app"></div>
+<script>
+// ========== State ==========
+const BASE = ''
+const TOKEN_KEY = 'mgmt_token'
+let state = { page: 'login', token: '', user: null, health: null, users: [], ads: [], settings: {}, hotProducts: [], hotKeywords: [], pageData: { users: 1, ads: 1, products: 1, keywords: 1 } }
+const PAGE_SIZE = 15
 
-    <div class="app-container">
-      <div class="sync-bar">
-        <div class="info">
-          <span><span class="sync-dot" :class="online ? 'online' : 'offline'"></span> 服务状态</span>
-          <span>📋 用户数: {{ users.length }}</span>
-          <span>📢 广告数: {{ ads.length }}</span>
-          <span>🔢 数据版本: v{{ currentVersion }}</span>
+// ========== API ==========
+async function api(method, url, body) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (state.token) headers['Authorization'] = 'Bearer ' + state.token
+  const opts = { method, headers }
+  if (body) opts.body = JSON.stringify(body)
+  const res = await fetch(BASE + url, opts)
+  const data = await res.json()
+  if (data.code === 401 || data.code === 403) { state.token = ''; localStorage.removeItem(TOKEN_KEY); render() }
+  return data
+}
+function get(url) { return api('GET', url) }
+function post(url, body) { return api('POST', url, body) }
+function put(url, body) { return api('PUT', url, body) }
+function del(url) { return api('DELETE', url) }
+
+// ========== Toast ==========
+function toast(msg, type = 'success') {
+  const el = document.createElement('div')
+  el.className = 'toast ' + type
+  el.textContent = msg
+  document.body.appendChild(el)
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300) }, 2500)
+}
+
+// ========== Modal ==========
+function showModal(html) {
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `<div class="modal">${html}</div>`
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove() })
+  document.body.appendChild(overlay)
+  return overlay.querySelector('.modal')
+}
+
+// ========== Data loading ==========
+async function loadHealth() { state.health = (await get('/api/health')).data }
+async function loadUsers() { state.users = (await get('/api/admin/users')).data || [] }
+async function loadAds() { state.ads = (await get('/api/admin/ads')).data || [] }
+async function loadSettings() { state.settings = (await get('/api/admin/settings')).data || {} }
+async function loadHotProducts() { state.hotProducts = (await get('/api/admin/dashboard/hot-products')).data || [] }
+async function loadHotKeywords() { state.hotKeywords = (await get('/api/admin/dashboard/hot-keywords')).data || [] }
+
+// ========== Router ==========
+function navigateTo(page) { state.page = page; render() }
+
+// ========== Pagination ==========
+function paginate(list, page) {
+  const start = (page - 1) * PAGE_SIZE
+  return { items: list.slice(start, start + PAGE_SIZE), total: list.length, pages: Math.ceil(list.length / PAGE_SIZE) || 1 }
+}
+
+// ========== Render ==========
+function render() {
+  if (state.page === 'login') return renderLogin()
+  if (!state.token) return renderLogin()
+  document.getElementById('app').innerHTML = `
+    <div class="admin-layout">
+      <div class="sidebar">
+        <h3>🔧 管理后台</h3>
+        <div class="nav">
+          ${[
+            ['overview','📊 数据概览'],
+            ['users','👥 用户管理'],
+            ['ads','📢 广告管理'],
+            ['settings','⚙️ 系统设置'],
+            ['products','🏆 畅销商品榜'],
+            ['keywords','🔑 热搜词榜']
+          ].map(([k,v]) => `<div class="nav-item${state.page===k?' active':''}" onclick="navigateTo('${k}')">${v}</div>`).join('')}
         </div>
-        <div>
-          <el-button size="small" @click="refreshAll" :loading="loading">
-            🔄 刷新数据
-          </el-button>
-        </div>
+        <div class="logout-btn" onclick="handleLogout()">🚪 退出登录</div>
       </div>
+      <div class="main-area">${renderPage()}</div>
+    </div>`
+}
 
-      <el-tabs v-model="activeTab">
-        <!-- ===== 用户管理 ===== -->
-        <el-tab-pane label="👥 用户管理" name="users">
-          <div class="toolbar">
-            <h3>用户列表 ({{ users.length }})</h3>
-            <el-button type="primary" size="small" @click="showAddUserDialog">
-              ＋ 添加用户
-            </el-button>
-          </div>
-          <div class="table-wrapper">
-            <el-table :data="users" stripe border size="small" empty-text="暂无用户">
-              <el-table-column prop="id" label="ID" width="60" />
-              <el-table-column prop="username" label="用户名" min-width="120" />
-              <el-table-column prop="nickname" label="昵称" min-width="120" />
-              <el-table-column label="角色" width="90">
-                <template #default="{ row }">
-                  <span :class="row.role === 'admin' ? 'tag-admin' : 'tag-user'">
-                    {{ row.role === 'admin' ? '管理员' : '普通用户' }}
-                  </span>
-                </template>
-              </el-table-column>
-              <el-table-column label="到期时间" width="140">
-                <template #default="{ row }">
-                  <span v-if="!row.validUntil" class="expire-tag unlimited">永久有效</span>
-                  <span v-else-if="isExpired(row.validUntil)" class="expire-tag expired">已到期</span>
-                  <span v-else-if="daysLeft(row.validUntil) <= 7" class="expire-tag near">{{ formatDate(row.validUntil) }}</span>
-                  <span v-else class="expire-tag active">{{ formatDate(row.validUntil) }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="剩余" width="90">
-                <template #default="{ row }">
-                  <span v-if="!row.validUntil">-</span>
-                  <span v-else-if="isExpired(row.validUntil)" class="expire-tag expired">已到期</span>
-                  <span v-else class="expire-tag active">{{ daysLeft(row.validUntil) }}天</span>
-                </template>
-              </el-table-column>
-              <el-table-column prop="created_at" label="创建时间" width="160" />
-              <el-table-column label="操作" width="170" fixed="right">
-                <template #default="{ row }">
-                  <el-button type="warning" size="small" @click="showEditUserDialog(row)">修改</el-button>
-                  <el-button type="danger" size="small" :disabled="row.id === 1" @click="deleteUser(row)">
-                    {{ row.id === 1 ? '不可删除' : '删除' }}
-                  </el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-          </div>
-        </el-tab-pane>
+function renderPage() {
+  switch (state.page) {
+    case 'overview': return renderOverview()
+    case 'users': return renderUsers()
+    case 'ads': return renderAds()
+    case 'settings': return renderSettings()
+    case 'products': return renderHotProducts()
+    case 'keywords': return renderHotKeywords()
+    default: return '<h2>404</h2>'
+  }
+}
 
-        <!-- ===== 广告管理 ===== -->
-        <el-tab-pane label="📢 广告管理" name="ads">
-          <div class="toolbar">
-            <h3>广告列表 ({{ ads.length }})</h3>
-            <el-button type="primary" size="small" @click="showAddAdDialog">
-              ＋ 添加广告
-            </el-button>
-          </div>
-          <el-table :data="ads" stripe border size="small" empty-text="暂无广告">
-            <el-table-column prop="id" label="ID" width="60" />
-            <el-table-column prop="title" label="标题" min-width="140" />
-            <el-table-column prop="content" label="内容" min-width="160" show-overflow-tooltip />
-            <el-table-column label="启用" width="70">
-              <template #default="{ row }">
-                <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
-                  {{ row.enabled ? '是' : '否' }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="弹窗" width="70">
-              <template #default="{ row }">
-                <el-tag :type="row.isPopup ? 'warning' : 'info'" size="small">
-                  {{ row.isPopup ? '是' : '否' }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="横幅" width="70">
-              <template #default="{ row }">
-                <el-tag :type="row.isBanner ? 'success' : 'info'" size="small">
-                  {{ row.isBanner ? '是' : '否' }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="操作" width="200" fixed="right">
-              <template #default="{ row }">
-                <el-button type="warning" size="small" @click="showEditAdDialog(row)">编辑</el-button>
-                <el-button type="danger" size="small" @click="deleteAd(row)">删除</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </el-tab-pane>
-
-        <!-- ===== 系统设置 ===== -->
-        <el-tab-pane label="🎨 系统设置" name="settings">
-          <div class="toolbar">
-            <h3>基础设置</h3>
-          </div>
-          <el-form label-width="120px" size="small" style="max-width: 600px;">
-            <el-form-item label="软件标题">
-              <el-input
-                v-model="settingsForm.appTitle"
-                placeholder="例如 美客多选品助手——内测中"
-                clearable
-              />
-              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
-                设置后用户软件标题和窗口标题将同步更新
-              </div>
-            </el-form-item>
-            <el-form-item label="价格显示货币">
-              <el-radio-group v-model="settingsForm.priceCurrency">
-                <el-radio label="local">当地货币（如 MXN）</el-radio>
-                <el-radio label="usd">美元（USD）</el-radio>
-              </el-radio-group>
-              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
-                选择美元后，客户端会自动按实时汇率把当地货币转换为 USD 显示
-              </div>
-            </el-form-item>
-            <el-form-item label="登录背景图片">
-              <el-input
-                v-model="settingsForm.loginBackground"
-                placeholder="输入图片URL，例如 https://example.com/bg.jpg"
-                clearable
-              />
-              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
-                留空则使用默认渐变背景。建议尺寸：1920x1080
-              </div>
-            </el-form-item>
-            <el-form-item label="横幅轮播间隔">
-              <el-input-number v-model="settingsForm.bannerInterval" :min="1" :max="60" :step="1" />
-              <span style="margin-left: 8px; color: #909399;">秒</span>
-              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
-                顶部横幅广告自动切换时间，默认 5 秒
-              </div>
-            </el-form-item>
-            <div style="margin: 24px 0 16px; font-weight: 600; color: #303133;">客户端版本更新</div>
-            <el-form-item label="最新版本号">
-              <el-input
-                v-model="settingsForm.latestVersion"
-                placeholder="例如 3.1.0"
-                clearable
-              />
-              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
-                当这里填写的版本号大于客户端版本时，客户端会提示更新
-              </div>
-            </el-form-item>
-            <el-form-item label="下载地址">
-              <el-input
-                v-model="settingsForm.downloadUrl"
-                placeholder="例如 https://example.com/setup.exe"
-                clearable
-              />
-              <div style="color: #909399; font-size: 12px; margin-top: 6px;">
-                用户点击"下载更新"后打开的下载链接
-              </div>
-            </el-form-item>
-            <el-form-item>
-              <el-button type="primary" size="small" @click="submitSettings" :loading="settingsLoading">
-                保存设置
-              </el-button>
-            </el-form-item>
-          </el-form>
-        </el-tab-pane>
-      </el-tabs>
-
-      <div class="footer-bar">
-        美客多爆品选品雷达 · 云端管理后台 v1.0 · 修改后实时同步到本地
+// ========== Login ==========
+function renderLogin() {
+  document.getElementById('app').innerHTML = `
+    <div class="login-page">
+      <div class="login-box">
+        <h2>美客多云管理后台</h2>
+        <p>Mercado Libre Admin Panel</p>
+        <input type="text" id="loginUser" placeholder="用户名" autocomplete="username">
+        <input type="password" id="loginPass" placeholder="密码" autocomplete="current-password">
+        <button class="btn" id="loginBtn" onclick="handleLogin()">登 录</button>
+        <div class="err" id="loginErr"></div>
+        <div class="hint">admin 账号默认密码: admin123</div>
       </div>
+    </div>`
+  document.getElementById('loginUser').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('loginPass').focus() })
+  document.getElementById('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') handleLogin() })
+}
+async function handleLogin() {
+  const u = document.getElementById('loginUser').value.trim()
+  const p = document.getElementById('loginPass').value
+  const btn = document.getElementById('loginBtn')
+  const err = document.getElementById('loginErr')
+  if (!u || !p) { err.textContent = '请输入用户名和密码'; return }
+  btn.disabled = true; btn.textContent = '登录中...'
+  const res = await post('/api/auth/login', { username: u, password: p })
+  btn.disabled = false; btn.textContent = '登 录'
+  if (res.code === 0) {
+    state.token = res.data.token
+    state.user = res.data.user
+    localStorage.setItem(TOKEN_KEY, state.token)
+    state.page = 'overview'
+    await loadHealth(); await loadUsers(); await loadAds(); await loadSettings()
+    await loadHotProducts(); await loadHotKeywords()
+    render()
+    toast('登录成功')
+  } else {
+    err.textContent = res.message || '登录失败'
+  }
+}
+async function handleLogout() {
+  await post('/api/auth/logout')
+  state.token = ''
+  state.user = null
+  localStorage.removeItem(TOKEN_KEY)
+  render()
+}
+
+// ========== Overview ==========
+function renderOverview() {
+  const h = state.health || {}
+  const usersCount = state.users.length
+  const adsCount = state.ads.length
+  const productsCount = state.hotProducts.length
+  const kwCount = state.hotKeywords.length
+  const uptime = h.uptime ? Math.floor(h.uptime) + 's' : '-'
+  const ver = h.version ? new Date(h.version).toLocaleString() : '-'
+  return `
+    <h2>📊 数据概览</h2>
+    <div class="stats-grid">
+      <div class="stat-card"><div class="num">${usersCount}</div><div class="lbl">注册用户</div></div>
+      <div class="stat-card"><div class="num">${adsCount}</div><div class="lbl">广告数量</div></div>
+      <div class="stat-card"><div class="num">${productsCount}</div><div class="lbl">畅销商品</div></div>
+      <div class="stat-card"><div class="num">${kwCount}</div><div class="lbl">热搜词</div></div>
+      <div class="stat-card"><div class="num" style="font-size:16px">${ver}</div><div class="lbl">版本时间</div></div>
+      <div class="stat-card"><div class="num" style="font-size:16px">${uptime}</div><div class="lbl">运行时长</div></div>
     </div>
+    <div class="card">
+      <h3 style="font-size:14px;margin-bottom:12px">ℹ️ 系统信息</h3>
+      <table>
+        <tr><td style="width:100px;color:#888">后台地址</td><td><a href="/mgmt" target="_blank">/mgmt</a></td></tr>
+        <tr><td style="color:#888">API 状态</td><td><span class="tag tag-green">正常</span></td></tr>
+        <tr><td style="color:#888">当前用户</td><td>${state.user?.nickname || state.user?.username || '-'}（${state.user?.role||'-'}）</td></tr>
+        <tr><td style="color:#888">快捷链接</td><td>
+          <a href="${BASE}" target="_blank" class="btn btn-sm btn-primary">打开主站</a>
+        </td></tr>
+      </table>
+    </div>`
+}
 
-    <!-- ===== 添加/修改用户对话框 ===== -->
-    <el-dialog v-model="userDialog.visible" :title="userDialog.isEdit ? '修改用户' : '添加用户'" width="420px">
-      <el-form label-width="80px" size="small">
-        <el-form-item label="用户名" required>
-          <el-input v-model="userDialog.form.username" :disabled="userDialog.isEdit" placeholder="登录用" />
-        </el-form-item>
-        <el-form-item label="密码" :required="!userDialog.isEdit">
-          <el-input v-model="userDialog.form.password" type="password" show-password
-            :placeholder="userDialog.isEdit ? '留空则不修改' : '必填'" />
-        </el-form-item>
-        <el-form-item label="昵称">
-          <el-input v-model="userDialog.form.nickname" placeholder="显示名称" />
-        </el-form-item>
-        <el-form-item label="角色">
-          <el-radio-group v-model="userDialog.form.role">
-            <el-radio value="user">普通用户</el-radio>
-            <el-radio value="admin">管理员</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item label="到期时间">
-          <el-date-picker
-            v-model="userDialog.form.validUntil"
-            type="date"
-            placeholder="选择到期日期（留空则永久有效）"
-            format="YYYY-MM-DD"
-            value-format="YYYY-MM-DD"
-            style="width: 100%;"
-            clearable
-          />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button size="small" @click="userDialog.visible = false">取消</el-button>
-        <el-button type="primary" size="small" @click="submitUser" :loading="userDialog.loading">
-          确认
-        </el-button>
-      </template>
-    </el-dialog>
+// ========== Users ==========
+function renderUsers() {
+  const pg = paginate(state.users, state.pageData.users)
+  let html = `
+    <h2>👥 用户管理</h2>
+    <div class="flex mb-2">
+      <button class="btn btn-primary" onclick="showUserModal()">+ 添加用户</button>
+      <span style="color:#888;font-size:12px">共 ${pg.total} 个用户</span>
+    </div>
+    <div class="card"><div class="table-wrap">
+    <table>
+      <tr><th>ID</th><th>用户名</th><th>昵称</th><th>角色</th><th>有效期</th><th>创建时间</th><th>创建人</th><th>操作</th></tr>
+      ${pg.items.map(u => `
+        <tr>
+          <td>${u.id}</td>
+          <td>${u.username}</td>
+          <td>${u.nickname || '-'}</td>
+          <td>${u.role === 'admin' ? '<span class="tag tag-admin">管理员</span>' : u.role === 'agent' ? '<span class="tag tag-warning">代理</span>' : '<span class="tag tag-blue">用户</span>'}</td>
+          <td>${u.validUntil ? new Date(u.validUntil).toLocaleString() : '<span style="color:#999">永久</span>'}</td>
+          <td>${u.created_at ? new Date(u.created_at).toLocaleString() : '-'}</td>
+          <td>${u.createdBy || '-'}</td>
+          <td>${u.username === 'admin' ? `<button class="btn btn-sm btn-primary mr-2" onclick="showUserEditModal('${u.username}')">编辑</button><span style="color:#999">—</span>` : `<button class="btn btn-sm btn-primary mr-2" onclick="showUserEditModal('${u.username}')">编辑</button><button class="btn btn-sm btn-danger" onclick="deleteUser('${u.username}')">删除</button>`}</td>
+        </tr>`).join('')}
+    </table>
+    </div>${renderPagination('users', pg)}</div>`
+  return html
+}
+function showUserModal() {
+  const modal = showModal(`
+    <h3>添加用户</h3>
+    <div class="field"><label>用户名 *</label><input type="text" id="mUser" placeholder="登录名"></div>
+    <div class="field"><label>密码 *</label><input type="password" id="mPass" placeholder="登录密码"></div>
+    <div class="field"><label>昵称</label><input type="text" id="mNick" placeholder="显示名称"></div>
+    <div class="field"><label>角色</label><select id="mRole"><option value="user">普通用户</option><option value="agent">代理</option><option value="admin">管理员</option></select></div>
+    <div class="field"><label>有效期至（留空=永久）</label><input type="datetime-local" id="mValid"></div>
+    <div class="btns">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">取消</button>
+      <button class="btn btn-primary" onclick="doAddUser()">确定添加</button>
+    </div>`)
+  modal.querySelector('input').focus()
+}
+async function doAddUser() {
+  const overlay = document.querySelector('.modal-overlay')
+  const username = document.getElementById('mUser').value.trim()
+  const password = document.getElementById('mPass').value
+  if (!username || !password) { toast('用户名和密码不能为空', 'error'); return }
+  const res = await post('/api/admin/users', {
+    username, password,
+    nickname: document.getElementById('mNick').value.trim() || '',
+    role: document.getElementById('mRole').value,
+    validUntil: document.getElementById('mValid').value || null
+  })
+  if (res.code === 0) {
+    toast('添加成功'); overlay.remove()
+    await loadUsers(); render()
+  } else { toast(res.message, 'error') }
+}
+async function deleteUser(username) {
+  if (!confirm(`确定删除用户「${username}」？`)) return
+  const res = await del('/api/admin/users/' + username)
+  if (res.code === 0) { toast('已删除'); await loadUsers(); render() }
+  else { toast(res.message, 'error') }
+}
+function showUserEditModal(username) {
+  const u = state.users.find(x => x.username === username)
+  if (!u) { toast('用户不存在', 'error'); return }
+  const validVal = u.validUntil ? new Date(u.validUntil).toISOString().slice(0, 16) : ''
+  const modal = showModal(`
+    <h3>编辑用户 - ${username}</h3>
+    <div class="field"><label>用户名</label><input type="text" value="${username}" readonly style="background:#f5f5f5"></div>
+    <div class="field"><label>新密码（留空不修改）</label><input type="password" id="mEditPass" placeholder="留空则保持原密码"></div>
+    <div class="field"><label>昵称</label><input type="text" id="mEditNick" value="${(u.nickname||'').replace(/"/g,'&quot;')}"></div>
+    <div class="field"><label>角色</label><select id="mEditRole"><option value="user" ${u.role==='user'?'selected':''}>普通用户</option><option value="agent" ${u.role==='agent'?'selected':''}>代理</option><option value="admin" ${u.role==='admin'?'selected':''}>管理员</option></select></div>
+    <div class="field"><label>有效期至（留空=永久）</label><input type="datetime-local" id="mEditValid" value="${validVal}"></div>
+    <div class="btns">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">取消</button>
+      <button class="btn btn-primary" onclick="doEditUser('${username}')">保存修改</button>
+    </div>`)
+}
+async function doEditUser(username) {
+  const overlay = document.querySelector('.modal-overlay')
+  const body = {
+    nickname: document.getElementById('mEditNick').value.trim(),
+    role: document.getElementById('mEditRole').value,
+    validUntil: document.getElementById('mEditValid').value || null
+  }
+  const pass = document.getElementById('mEditPass').value
+  if (pass) body.password = pass
+  const res = await put('/api/admin/users/' + username, body)
+  if (res.code === 0) { toast('已更新'); overlay.remove(); await loadUsers(); render() }
+  else { toast(res.message, 'error') }
+}
 
-    <!-- ===== 添加/修改广告对话框 ===== -->
-    <el-dialog v-model="adDialog.visible" :title="adDialog.isEdit ? '编辑广告' : '添加广告'" width="480px">
-      <el-form label-width="80px" size="small">
-        <el-form-item label="标题" required>
-          <el-input v-model="adDialog.form.title" placeholder="广告标题" />
-        </el-form-item>
-        <el-form-item label="内容">
-          <el-input v-model="adDialog.form.content" type="textarea" :rows="3" placeholder="广告内容文字" />
-        </el-form-item>
-        <el-form-item label="图片链接">
-          <el-input v-model="adDialog.form.imageUrl" placeholder="https://..." />
-        </el-form-item>
-        <el-form-item label="跳转链接">
-          <el-input v-model="adDialog.form.linkUrl" placeholder="点击广告跳转的网址" />
-        </el-form-item>
-        <el-form-item label="启用">
-          <el-switch v-model="adDialog.form.enabled" />
-        </el-form-item>
-        <el-form-item label="弹窗广告">
-          <el-switch v-model="adDialog.form.isPopup" />
-        </el-form-item>
-        <el-form-item label="顶部横幅">
-          <el-switch v-model="adDialog.form.isBanner" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button size="small" @click="adDialog.visible = false">取消</el-button>
-        <el-button type="primary" size="small" @click="submitAd" :loading="adDialog.loading">
-          确认
-        </el-button>
-      </template>
-    </el-dialog>
-  </div>
+// ========== Ads ==========
+function renderAds() {
+  const pg = paginate(state.ads, state.pageData.ads)
+  let html = `
+    <h2>📢 广告管理</h2>
+    <div class="flex mb-2">
+      <button class="btn btn-primary" onclick="showAdModal()">+ 添加广告</button>
+      <span style="color:#888;font-size:12px">共 ${pg.total} 条广告</span>
+    </div>
+    <div class="card"><div class="table-wrap">
+    <table>
+      <tr><th>ID</th><th>标题</th><th>内容</th><th>图片</th><th>链接</th><th>弹窗</th><th>横幅</th><th>状态</th><th>操作</th></tr>
+      ${pg.items.map(a => `
+        <tr>
+          <td>${a.id}</td>
+          <td>${a.title}</td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${a.content || '-'}</td>
+          <td>${a.imageUrl ? '<a href="' + a.imageUrl + '" target="_blank" style="color:#1a73e8">查看</a>' : '-'}</td>
+          <td>${a.linkUrl ? '<a href="' + a.linkUrl + '" target="_blank" style="color:#1a73e8">打开</a>' : '-'}</td>
+          <td>${a.popup ? '<span class="tag tag-green">是</span>' : '<span class="tag tag-red">否</span>'}</td>
+          <td>${a.banner ? '<span class="tag tag-green">是</span>' : '<span class="tag tag-red">否</span>'}</td>
+          <td>${a.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-red">禁用</span>'}</td>
+          <td><button class="btn btn-sm btn-primary mr-2" onclick="showAdEditModal(${a.id})">编辑</button><button class="btn btn-sm btn-danger" onclick="deleteAd(${a.id})">删除</button></td>
+        </tr>`).join('')}
+    </table>
+    </div>${renderPagination('ads', pg)}</div>`
+  return html
+}
+function showAdModal(editData) {
+  const d = editData || {}
+  const modal = showModal(`
+    <h3>${d.id ? '编辑广告' : '添加广告'}</h3>
+    <div class="field"><label>标题 *</label><input type="text" id="mAdTitle" value="${(d.title||'').replace(/"/g,'&quot;')}"></div>
+    <div class="field"><label>内容</label><textarea id="mAdContent" rows="3">${(d.content||'').replace(/"/g,'&quot;')}</textarea></div>
+    <div class="field"><label>图片链接</label><input type="url" id="mAdImg" value="${(d.imageUrl||'').replace(/"/g,'&quot;')}" placeholder="https://..."></div>
+    <div class="field"><label>跳转链接</label><input type="url" id="mAdLink" value="${(d.linkUrl||'').replace(/"/g,'&quot;')}" placeholder="https://..."></div>
+    <div class="field flex"><label style="min-width:60px">弹窗广告</label><label style="font-weight:400"><input type="checkbox" id="mAdPopup" ${d.popup?'checked':''}> 启用</label></div>
+    <div class="field flex"><label style="min-width:60px">横幅广告</label><label style="font-weight:400"><input type="checkbox" id="mAdBanner" ${d.banner?'checked':''}> 启用</label></div>
+    <div class="field flex"><label style="min-width:60px">启用状态</label><label style="font-weight:400"><input type="checkbox" id="mAdEnabled" ${d.enabled!==false?'checked':''}> 启用</label></div>
+    <div class="btns">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">取消</button>
+      <button class="btn btn-primary" onclick="${d.id ? `doEditAd(${d.id})` : 'doAddAd()'}">${d.id ? '保存' : '添加'}</button>
+    </div>`)
+}
+function showAdEditModal(id) {
+  const ad = state.ads.find(a => a.id === id)
+  if (ad) showAdModal(ad)
+}
+async function doAddAd() {
+  const overlay = document.querySelector('.modal-overlay')
+  const title = document.getElementById('mAdTitle').value.trim()
+  if (!title) { toast('标题不能为空', 'error'); return }
+  const res = await post('/api/admin/ads', {
+    title, content: document.getElementById('mAdContent').value,
+    imageUrl: document.getElementById('mAdImg').value,
+    linkUrl: document.getElementById('mAdLink').value,
+    enabled: document.getElementById('mAdEnabled').checked,
+    popup: document.getElementById('mAdPopup').checked
+  })
+  if (res.code === 0) { toast('添加成功'); overlay.remove(); await loadAds(); render() }
+  else { toast(res.message, 'error') }
+}
+async function doEditAd(id) {
+  const overlay = document.querySelector('.modal-overlay')
+  const title = document.getElementById('mAdTitle').value.trim()
+  if (!title) { toast('标题不能为空', 'error'); return }
+  const res = await put('/api/admin/ads/' + id, {
+    title, content: document.getElementById('mAdContent').value,
+    imageUrl: document.getElementById('mAdImg').value,
+    linkUrl: document.getElementById('mAdLink').value,
+    enabled: document.getElementById('mAdEnabled').checked,
+    popup: document.getElementById('mAdPopup').checked
+  })
+  if (res.code === 0) { toast('已更新'); overlay.remove(); await loadAds(); render() }
+  else { toast(res.message, 'error') }
+}
+async function deleteAd(id) {
+  if (!confirm('确定删除此广告？')) return
+  const res = await del('/api/admin/ads/' + id)
+  if (res.code === 0) { toast('已删除'); await loadAds(); render() }
+  else { toast(res.message, 'error') }
+}
 
-  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-  <script src="https://unpkg.com/element-plus"></script>
-  <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
-  <script>
-    const { createApp, ref, reactive, onMounted } = Vue;
+// ========== Settings ==========
+function renderSettings() {
+  const s = state.settings || {}
+  let html = `
+    <h2>⚙️ 系统设置</h2>
+    <div class="card">
+      <div style="margin-bottom:12px;color:#888;font-size:13px">键值对设置，修改后即时生效</div>
+      ${Object.entries(s).map(([k,v]) => `
+        <div class="field flex" style="margin-bottom:8px">
+          <input style="width:180px;flex-shrink:0" value="${k}" id="sk_${k}" readonly placeholder="key">
+          <input style="flex:1" value="${(v||'').replace(/"/g,'&quot;')}" id="sv_${k}" placeholder="value">
+          <button class="btn btn-sm btn-primary" onclick="updateSetting('${k}')">保存</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteSetting('${k}')">删除</button>
+        </div>`).join('')}
+      <div class="field flex" style="margin-top:16px;padding-top:12px;border-top:1px solid #f0f0f0">
+        <input style="width:180px;flex-shrink:0" id="newSk" placeholder="新 key">
+        <input style="flex:1" id="newSv" placeholder="新 value">
+        <button class="btn btn-sm btn-success" onclick="addSetting()">添加</button>
+      </div>
+    </div>`
+  return html
+}
+async function updateSetting(key) {
+  const val = document.getElementById('sv_' + key).value
+  const res = await put('/api/settings', { [key]: val })
+  if (res.code === 0) { toast('已更新'); state.settings[key] = val }
+  else { toast(res.message, 'error') }
+}
+async function deleteSetting(key) {
+  if (!confirm('确定删除设置项「' + key + '」？')) return
+  const res = await put('/api/settings', { [key]: '' })
+  if (res.code === 0) { toast('已删除'); delete state.settings[key]; render() }
+}
+async function addSetting() {
+  const key = document.getElementById('newSk').value.trim()
+  const val = document.getElementById('newSv').value
+  if (!key) { toast('key 不能为空', 'error'); return }
+  const res = await put('/api/settings', { [key]: val })
+  if (res.code === 0) { toast('已添加'); state.settings[key] = val; render() }
+  else { toast(res.message, 'error') }
+}
 
-    const app = createApp({
-      setup() {
-        const activeTab = ref('users');
-        const users = ref([]);
-        const ads = ref([]);
-        const loading = ref(false);
-        const online = ref(true);
-        const currentVersion = ref(0);
+// ========== Hot Products ==========
+function renderHotProducts() {
+  const pg = paginate(state.hotProducts, state.pageData.products)
+  let html = `
+    <h2>🏆 畅销商品榜</h2>
+    <div class="flex flex-wrap gap-2 mb-2">
+      <button class="btn btn-primary" onclick="showProductModal()">+ 添加商品</button>
+      <button class="btn btn-warning" onclick="refreshHotProducts()">🔄 刷新畅销榜</button>
+      <span style="color:#888;font-size:12px">共 ${pg.total} 条</span>
+    </div>
+    <div class="card"><div class="table-wrap">
+    <table>
+      <tr><th>ID</th><th>标题</th><th>价格</th><th>月销量</th><th>销售额</th><th>站点</th><th>图片</th><th>排序</th><th>状态</th><th>链接</th><th>操作</th></tr>
+      ${pg.items.map(p => `
+        <tr>
+          <td>${p.id}</td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${(p.title||'').replace(/"/g,'&quot;')}">${p.title || '-'}</td>
+          <td>${p.price || 0}</td>
+          <td>${p.sales30 || 0}</td>
+          <td>${p.revenue || 0}</td>
+          <td>${p.region || '-'}</td>
+          <td>${p.imageUrl ? '<a href="' + p.imageUrl + '" target="_blank" style="color:#1a73e8">查看</a>' : '-'}</td>
+          <td>${p.sortOrder || 0}</td>
+          <td>${p.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-red">禁用</span>'}</td>
+          <td>${p.linkUrl ? '<a href="' + p.linkUrl + '" target="_blank" style="color:#1a73e8">打开</a>' : '-'}</td>
+          <td><button class="btn btn-sm btn-primary mr-2" onclick="showProductEditModal(${p.id})">编辑</button><button class="btn btn-sm btn-danger" onclick="deleteProduct(${p.id})">删</button></td>
+        </tr>`).join('')}
+    </table>
+    </div>${renderPagination('products', pg)}</div>`
+  return html
+}
+function showProductModal(editData) {
+  const d = editData || {}
+  const modal = showModal(`
+    <h3>${d.id ? '编辑商品' : '添加商品'}</h3>
+    <div class="field"><label>标题 *</label><input type="text" id="mPrdTitle" value="${(d.title||'').replace(/"/g,'&quot;')}"></div>
+    <div class="field"><label>价格 *</label><input type="number" id="mPrdPrice" value="${d.price||''}"></div>
+    <div class="field"><label>货币</label><input type="text" id="mPrdCur" value="${d.currency||'USD'}" style="width:100px"></div>
+    <div class="field"><label>月销量 *</label><input type="number" id="mPrdSales" value="${d.sales30||''}"></div>
+    <div class="field"><label>销售额 *</label><input type="number" id="mPrdRev" value="${d.revenue||''}"></div>
+    <div class="field"><label>站点</label><select id="mPrdReg">
+      ${['MLM','MLB','MLC','MLA','MCO'].map(r => `<option value="${r}"${d.region===r?' selected':''}>${r}</option>`).join('')}
+    </select></div>
+    <div class="field"><label>图片链接</label><input type="url" id="mPrdImg" value="${(d.imageUrl||'').replace(/"/g,'&quot;')}"></div>
+    <div class="field"><label>商品链接</label><input type="url" id="mPrdLink" value="${(d.linkUrl||'').replace(/"/g,'&quot;')}"></div>
+    <div class="field"><label>排序</label><input type="number" id="mPrdSort" value="${d.sortOrder||0}" style="width:100px"></div>
+    <div class="field flex"><label style="min-width:60px">启用</label><label style="font-weight:400"><input type="checkbox" id="mPrdEn" ${d.enabled!==false?'checked':''}> 启用</label></div>
+    <div class="btns">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">取消</button>
+      <button class="btn btn-primary" onclick="${d.id ? `doEditProduct(${d.id})` : 'doAddProduct()'}">${d.id ? '保存' : '添加'}</button>
+    </div>`)
+}
+function showProductEditModal(id) {
+  const p = state.hotProducts.find(x => x.id === id)
+  if (p) showProductModal(p)
+}
+async function doAddProduct() {
+  const overlay = document.querySelector('.modal-overlay')
+  const title = document.getElementById('mPrdTitle').value.trim()
+  if (!title) { toast('标题不能为空', 'error'); return }
+  const res = await post('/api/admin/dashboard/hot-products', {
+    title, price: parseFloat(document.getElementById('mPrdPrice').value) || 0,
+    currency: document.getElementById('mPrdCur').value || 'USD',
+    sales30: parseInt(document.getElementById('mPrdSales').value) || 0,
+    revenue: parseFloat(document.getElementById('mPrdRev').value) || 0,
+    region: document.getElementById('mPrdReg').value,
+    imageUrl: document.getElementById('mPrdImg').value,
+    linkUrl: document.getElementById('mPrdLink').value,
+    sortOrder: parseInt(document.getElementById('mPrdSort').value) || 0,
+    enabled: document.getElementById('mPrdEn').checked
+  })
+  if (res.code === 0) { toast('添加成功'); overlay.remove(); await loadHotProducts(); render() }
+  else { toast(res.message, 'error') }
+}
+async function doEditProduct(id) {
+  const overlay = document.querySelector('.modal-overlay')
+  const title = document.getElementById('mPrdTitle').value.trim()
+  if (!title) { toast('标题不能为空', 'error'); return }
+  const res = await put('/api/admin/dashboard/hot-products/' + id, {
+    title, price: parseFloat(document.getElementById('mPrdPrice').value) || 0,
+    currency: document.getElementById('mPrdCur').value || 'USD',
+    sales30: parseInt(document.getElementById('mPrdSales').value) || 0,
+    revenue: parseFloat(document.getElementById('mPrdRev').value) || 0,
+    region: document.getElementById('mPrdReg').value,
+    imageUrl: document.getElementById('mPrdImg').value,
+    linkUrl: document.getElementById('mPrdLink').value,
+    sortOrder: parseInt(document.getElementById('mPrdSort').value) || 0,
+    enabled: document.getElementById('mPrdEn').checked
+  })
+  if (res.code === 0) { toast('已更新'); overlay.remove(); await loadHotProducts(); render() }
+  else { toast(res.message, 'error') }
+}
+async function deleteProduct(id) {
+  if (!confirm('确定删除此商品？')) return
+  const res = await del('/api/admin/dashboard/hot-products/' + id)
+  if (res.code === 0) { toast('已删除'); await loadHotProducts(); render() }
+  else { toast(res.message, 'error') }
+}
+async function refreshHotProducts() {
+  if (!confirm('确定要从 meikeduoshuju API 重新拉取畅销商品数据？')) return
+  const btn = event.target; btn.disabled = true; btn.textContent = '刷新中...'
+  const res = await post('/api/dashboard/refresh-hot-products')
+  btn.disabled = false; btn.textContent = '🔄 刷新畅销榜'
+  if (res.code === 0) { toast('刷新成功，共 ' + (res.data?.count || 0) + ' 条'); await loadHotProducts(); render() }
+  else { toast(res.message || '刷新失败', 'error') }
+}
 
-        // 设置表单
-        const settingsForm = reactive({ appTitle: '', priceCurrency: 'local', loginBackground: '', bannerInterval: 5, latestVersion: '', downloadUrl: '' });
-        const settingsLoading = ref(false);
+// ========== Hot Keywords ==========
+function renderHotKeywords() {
+  const pg = paginate(state.hotKeywords, state.pageData.keywords)
+  let html = `
+    <h2>🔑 热搜词榜</h2>
+    <div class="flex mb-2">
+      <button class="btn btn-primary" onclick="showKeywordModal()">+ 添加热搜词</button>
+      <span style="color:#888;font-size:12px">共 ${pg.total} 条</span>
+    </div>
+    <div class="card"><div class="table-wrap">
+    <table>
+      <tr><th>ID</th><th>关键词</th><th>搜索量</th><th>销量</th><th>商品数</th><th>趋势</th><th>站点</th><th>周</th><th>状态</th><th>操作</th></tr>
+      ${pg.items.map(k => `
+        <tr>
+          <td>${k.id}</td>
+          <td>${k.keyword}</td>
+          <td>${k.searchVol}</td>
+          <td>${k.salesVol}</td>
+          <td>${k.productCount}</td>
+          <td>${(k.trend || 0).toFixed(1)}%</td>
+          <td>${k.region || '-'}</td>
+          <td>第 ${(k.weekIndex||0)+1} 周</td>
+          <td>${k.enabled ? '<span class="tag tag-green">启用</span>' : '<span class="tag tag-red">禁用</span>'}</td>
+          <td><button class="btn btn-sm btn-primary mr-2" onclick="showKeywordEditModal(${k.id})">编辑</button><button class="btn btn-sm btn-danger" onclick="deleteKeyword(${k.id})">删</button></td>
+        </tr>`).join('')}
+    </table>
+    </div>${renderPagination('keywords', pg)}</div>`
+  return html
+}
+function showKeywordModal(editData) {
+  const d = editData || {}
+  const modal = showModal(`
+    <h3>${d.id ? '编辑热搜词' : '添加热搜词'}</h3>
+    <div class="field"><label>关键词 *</label><input type="text" id="mKw" value="${(d.keyword||'').replace(/"/g,'&quot;')}"></div>
+    <div class="field"><label>搜索量 *</label><input type="number" id="mKwSv" value="${d.searchVol||''}"></div>
+    <div class="field"><label>月销量 *</label><input type="number" id="mKwSa" value="${d.salesVol||''}"></div>
+    <div class="field"><label>商品数 *</label><input type="number" id="mKwPc" value="${d.productCount||''}"></div>
+    <div class="field"><label>趋势 %</label><input type="number" step="0.1" id="mKwTr" value="${d.trend||''}" style="width:120px"></div>
+    <div class="field"><label>站点</label><select id="mKwReg">
+      ${['MLM','MLB','MLC','MLA','MCO'].map(r => `<option value="${r}"${d.region===r?' selected':''}>${r}</option>`).join('')}
+    </select></div>
+    <div class="field"><label>周索引</label><select id="mKwWi">
+      ${[0,1,2,3,4].map(w => `<option value="${w}"${d.weekIndex===w?' selected':''}>第 ${w+1} 周</option>`).join('')}
+    </select></div>
+    <div class="field flex"><label style="min-width:60px">启用</label><label style="font-weight:400"><input type="checkbox" id="mKwEn" ${d.enabled!==false?'checked':''}> 启用</label></div>
+    <div class="btns">
+      <button class="btn" onclick="this.closest('.modal-overlay').remove()">取消</button>
+      <button class="btn btn-primary" onclick="${d.id ? `doEditKeyword(${d.id})` : 'doAddKeyword()'}">${d.id ? '保存' : '添加'}</button>
+    </div>`)
+}
+function showKeywordEditModal(id) {
+  const kw = state.hotKeywords.find(x => x.id === id)
+  if (kw) showKeywordModal(kw)
+}
+async function doAddKeyword() {
+  const overlay = document.querySelector('.modal-overlay')
+  const keyword = document.getElementById('mKw').value.trim()
+  if (!keyword) { toast('关键词不能为空', 'error'); return }
+  const res = await post('/api/admin/dashboard/hot-keywords', {
+    keyword,
+    searchVol: parseInt(document.getElementById('mKwSv').value) || 0,
+    salesVol: parseInt(document.getElementById('mKwSa').value) || 0,
+    productCount: parseInt(document.getElementById('mKwPc').value) || 0,
+    trend: parseFloat(document.getElementById('mKwTr').value) || 0,
+    region: document.getElementById('mKwReg').value,
+    weekIndex: parseInt(document.getElementById('mKwWi').value) || 0,
+    enabled: document.getElementById('mKwEn').checked
+  })
+  if (res.code === 0) { toast('添加成功'); overlay.remove(); await loadHotKeywords(); render() }
+  else { toast(res.message, 'error') }
+}
+async function doEditKeyword(id) {
+  const overlay = document.querySelector('.modal-overlay')
+  const keyword = document.getElementById('mKw').value.trim()
+  if (!keyword) { toast('关键词不能为空', 'error'); return }
+  const res = await put('/api/admin/dashboard/hot-keywords/' + id, {
+    keyword,
+    searchVol: parseInt(document.getElementById('mKwSv').value) || 0,
+    salesVol: parseInt(document.getElementById('mKwSa').value) || 0,
+    productCount: parseInt(document.getElementById('mKwPc').value) || 0,
+    trend: parseFloat(document.getElementById('mKwTr').value) || 0,
+    region: document.getElementById('mKwReg').value,
+    weekIndex: parseInt(document.getElementById('mKwWi').value) || 0,
+    enabled: document.getElementById('mKwEn').checked
+  })
+  if (res.code === 0) { toast('已更新'); overlay.remove(); await loadHotKeywords(); render() }
+  else { toast(res.message, 'error') }
+}
+async function deleteKeyword(id) {
+  if (!confirm('确定删除此热搜词？')) return
+  const res = await del('/api/admin/dashboard/hot-keywords/' + id)
+  if (res.code === 0) { toast('已删除'); await loadHotKeywords(); render() }
+  else { toast(res.message, 'error') }
+}
 
-        // 用户对话框状态
-        const userDialog = reactive({
-          visible: false, isEdit: false, loading: false,
-          form: { username: '', password: '', nickname: '', role: 'user', validUntil: '' },
-          editId: null
-        });
+// ========== Pagination helper ==========
+function renderPagination(key, pg) {
+  if (pg.pages <= 1) return ''
+  const curPage = state.pageData[key] || 1
+  return `<div class="pagination">
+    <button onclick="changePage('${key}', ${curPage-1})" ${curPage<=1?'disabled':''}>上一页</button>
+    <span>第 ${curPage}/${pg.pages} 页</span>
+    <button onclick="changePage('${key}', ${curPage+1})" ${curPage>=pg.pages?'disabled':''}>下一页</button>
+  </div>`
+}
+function changePage(key, page) {
+  state.pageData[key] = page
+  render()
+}
 
-        // 时间工具函数
-        function formatDate(iso) {
-          if (!iso) return '';
-          const d = new Date(iso);
-          if (isNaN(d.getTime())) return iso;
-          return d.toISOString().split('T')[0];
-        }
-
-        function isExpired(iso) {
-          if (!iso) return false;
-          const end = new Date(iso);
-          // 到期日当天的23:59:59过期
-          end.setHours(23, 59, 59, 999);
-          return Date.now() > end.getTime();
-        }
-
-        function daysLeft(iso) {
-          if (!iso) return -1;
-          const end = new Date(iso);
-          end.setHours(23, 59, 59, 999);
-          const diff = end.getTime() - Date.now();
-          if (diff <= 0) return 0;
-          return Math.ceil(diff / (1000 * 60 * 60 * 24));
-        }
-
-        // 广告对话框状态
-        const adDialog = reactive({
-          visible: false, isEdit: false, loading: false,
-          form: { title: '', content: '', imageUrl: '', linkUrl: '', enabled: true, isPopup: false },
-          editId: null
-        });
-
-        async function api(url, method = 'GET', data = null) {
-          try {
-            const config = { method, url };
-            if (data) config.data = data;
-            const res = await axios(config);
-            online.value = true;
-            return res.data;
-          } catch (e) {
-            online.value = false;
-            ElementPlus.ElMessage.error('连接云端失败: ' + e.message);
-            return null;
-          }
-        }
-
-        async function fetchUsers() {
-          const res = await api('/api/users');
-          if (res?.code === 0) users.value = res.data;
-        }
-
-        async function fetchAds() {
-          const res = await api('/api/ads');
-          if (res?.code === 0) ads.value = res.data;
-        }
-
-        async function fetchSettings() {
-          const res = await api('/api/settings');
-          if (res?.code === 0) {
-            settingsForm.appTitle = res.data?.appTitle || '';
-            settingsForm.priceCurrency = res.data?.priceCurrency || 'local';
-            settingsForm.loginBackground = res.data?.loginBackground || '';
-            settingsForm.bannerInterval = res.data?.bannerInterval ? parseInt(res.data.bannerInterval) : 5;
-            settingsForm.latestVersion = res.data?.latestVersion || '';
-            settingsForm.downloadUrl = res.data?.downloadUrl || '';
-          }
-        }
-
-        async function submitSettings() {
-          settingsLoading.value = true;
-          const payload = {
-            appTitle: settingsForm.appTitle || '',
-            priceCurrency: settingsForm.priceCurrency || 'local',
-            loginBackground: settingsForm.loginBackground || '',
-            bannerInterval: String(settingsForm.bannerInterval || 5),
-            latestVersion: settingsForm.latestVersion || '',
-            downloadUrl: settingsForm.downloadUrl || ''
-          };
-          const res = await api('/api/settings', 'PUT', payload);
-          settingsLoading.value = false;
-          if (res?.code === 0) {
-            ElementPlus.ElMessage.success('设置已保存');
-          } else {
-            ElementPlus.ElMessage.error(res?.message || '保存失败');
-          }
-        }
-
-        async function refreshAll() {
-          loading.value = true;
-          await Promise.all([fetchUsers(), fetchAds(), fetchSettings()]);
-
-          const health = await api('/api/health');
-          if (health?.code === 0) {
-            currentVersion.value = health.data.version;
-            online.value = true;
-          }
-          loading.value = false;
-        }
-
-
-        // ===== 用户操作 =====
-        function showAddUserDialog() {
-          userDialog.isEdit = false;
-          userDialog.form = { username: '', password: '', nickname: '', role: 'user', validUntil: '' };
-          userDialog.editId = null;
-          userDialog.visible = true;
-        }
-
-        function showEditUserDialog(row) {
-          userDialog.isEdit = true;
-          userDialog.form = {
-            username: row.username, password: '', nickname: row.nickname,
-            role: row.role, validUntil: row.validUntil ? formatDate(row.validUntil) : ''
-          };
-          userDialog.editId = row.id;
-          userDialog.visible = true;
-        }
-
-        async function submitUser() {
-          if (!userDialog.isEdit && !userDialog.form.username) {
-            ElementPlus.ElMessage.warning('请输入用户名');
-            return;
-          }
-          if (!userDialog.isEdit && !userDialog.form.password) {
-            ElementPlus.ElMessage.warning('请输入密码');
-            return;
-          }
-          userDialog.loading = true;
-          let res;
-          if (userDialog.isEdit) {
-            res = await api(`/api/users/${userDialog.editId}`, 'PUT', userDialog.form);
-          } else {
-            res = await api('/api/users', 'POST', userDialog.form);
-          }
-          userDialog.loading = false;
-          if (res?.code === 0) {
-            ElementPlus.ElMessage.success(res.message);
-            userDialog.visible = false;
-            await refreshAll();
-          } else {
-            ElementPlus.ElMessage.error(res?.message || '操作失败');
-          }
-        }
-
-        async function deleteUser(row) {
-          try {
-            await ElementPlus.ElMessageBox.confirm(`确定删除用户「${row.username}」？`, '确认删除', {
-              type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消'
-            });
-            const res = await api(`/api/users/${row.id}`, 'DELETE');
-            if (res?.code === 0) {
-              ElementPlus.ElMessage.success(res.message);
-              await refreshAll();
-            } else {
-              ElementPlus.ElMessage.error(res?.message || '删除失败');
-            }
-          } catch (e) { /* 取消 */ }
-        }
-
-        // ===== 广告操作 =====
-        function showAddAdDialog() {
-          adDialog.isEdit = false;
-          adDialog.form = { title: '', content: '', imageUrl: '', linkUrl: '', enabled: true, isPopup: false, isBanner: false };
-          adDialog.editId = null;
-          adDialog.visible = true;
-        }
-
-        function showEditAdDialog(row) {
-          adDialog.isEdit = true;
-          adDialog.form = {
-            title: row.title, content: row.content || '',
-            imageUrl: row.imageUrl || '', linkUrl: row.linkUrl || '',
-            enabled: !!row.enabled, isPopup: !!row.isPopup, isBanner: !!row.isBanner
-          };
-          adDialog.editId = row.id;
-          adDialog.visible = true;
-        }
-
-        async function submitAd() {
-          if (!adDialog.form.title) {
-            ElementPlus.ElMessage.warning('请输入广告标题');
-            return;
-          }
-          adDialog.loading = true;
-          let res;
-          if (adDialog.isEdit) {
-            res = await api(`/api/ads/${adDialog.editId}`, 'PUT', adDialog.form);
-          } else {
-            res = await api('/api/ads', 'POST', adDialog.form);
-          }
-          adDialog.loading = false;
-          if (res?.code === 0) {
-            ElementPlus.ElMessage.success(res.message);
-            adDialog.visible = false;
-            await refreshAll();
-          } else {
-            ElementPlus.ElMessage.error(res?.message || '操作失败');
-          }
-        }
-
-        async function deleteAd(row) {
-          try {
-            await ElementPlus.ElMessageBox.confirm(`确定删除广告「${row.title}」？`, '确认删除', {
-              type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消'
-            });
-            const res = await api(`/api/ads/${row.id}`, 'DELETE');
-            if (res?.code === 0) {
-              ElementPlus.ElMessage.success(res.message);
-              await refreshAll();
-            } else {
-              ElementPlus.ElMessage.error(res?.message || '删除失败');
-            }
-          } catch (e) { /* 取消 */ }
-        }
-
-        onMounted(() => {
-          refreshAll();
-          // 每5秒自动刷新版本检测
-          setInterval(async () => {
-            const res = await api('/api/health', 'GET');
-            if (res?.code === 0 && res.data.version !== currentVersion.value) {
-              currentVersion.value = res.data.version;
-              await refreshAll();
-            }
-          }, 5000);
-        });
-
-        return {
-          activeTab, users, ads, loading, online, currentVersion,
-          settingsForm, settingsLoading,
-          userDialog, adDialog, formatDate, isExpired, daysLeft,
-          showAddUserDialog, showEditUserDialog, submitUser, deleteUser,
-          showAddAdDialog, showEditAdDialog, submitAd, deleteAd,
-          refreshAll, submitSettings
-        };
-      }
-    });
-
-    app.use(ElementPlus);
-    app.mount('#app');
-  </script>
+// ========== Init ==========
+async function init() {
+  const saved = localStorage.getItem(TOKEN_KEY)
+  if (saved) {
+    state.token = saved
+    const v = await get('/api/auth/verify')
+    if (v.code === 0) {
+      state.user = v.data.user
+      state.page = 'overview'
+      await Promise.all([loadHealth(), loadUsers(), loadAds(), loadSettings(), loadHotProducts(), loadHotKeywords()])
+    } else {
+      state.token = ''
+      localStorage.removeItem(TOKEN_KEY)
+    }
+  }
+  render()
+}
+init()
+</script>
 </body>
 </html>
