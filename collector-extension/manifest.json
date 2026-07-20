@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "美客多国际购采集器",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "在本地已登录浏览器中低频采集四国国际购商品并上传到选品助手云端。",
   "permissions": ["storage", "tabs", "scripting", "alarms"],
   "host_permissions": [

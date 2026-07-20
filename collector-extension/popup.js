@@ -11,7 +11,7 @@ $('login').onclick = async () => {
   const data = await res.json(); if(data.code!==0 || data.data?.user?.role!=='admin') return alert(data.message||'必须使用管理员账号')
   await chrome.storage.local.set({collectorToken:data.data.token}); $('password').value=''; refresh()
 }
-$('start').onclick = () => chrome.runtime.sendMessage({type:'START',country:$('country').value,delay:Math.max(8,Number($('delay').value)||15)},refresh)
+$('start').onclick = () => chrome.runtime.sendMessage({type:'START',country:$('country').value,delay:Math.max(2,Number($('delay').value)||5)},refresh)
 $('stop').onclick = () => chrome.runtime.sendMessage({type:'STOP'},refresh)
 $('logout').onclick = async () => { await chrome.storage.local.remove(['collectorToken','collectorState']); refresh() }
 chrome.storage.onChanged.addListener(refresh); refresh()

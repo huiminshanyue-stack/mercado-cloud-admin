@@ -3,6 +3,6 @@ body{font:13px Arial;width:330px;padding:16px;color:#263238}h2{font-size:17px;ma
 <body><h2>🌐 美客多国际购采集器</h2>
 <div id="loginBox"><input id="username" placeholder="云后台管理员账号"><input id="password" type="password" placeholder="云后台管理员密码"><button id="login" class="primary">连接云后台</button></div>
 <div id="controlBox" hidden><select id="country"><option value="BR">巴西</option><option value="CO">哥伦比亚</option><option value="CL">智利</option><option value="MX">墨西哥</option></select>
-<label>每页间隔（秒）</label><input id="delay" type="number" min="8" max="120" value="15"><button id="start" class="primary">开始/继续采集</button><button id="stop" class="danger">暂停</button><button id="logout">断开</button></div>
+<label>每页间隔（秒）</label><input id="delay" type="number" min="2" max="120" value="5"><button id="start" class="primary">开始/继续采集</button><button id="stop" class="danger">暂停</button><button id="logout">断开</button></div>
 <div class="box" id="status">尚未连接</div><small>验证码或登录页面出现时会自动暂停，请完成验证后点击“开始/继续采集”。</small>
 <script src="popup.js"></script></body></html>
