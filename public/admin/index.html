@@ -95,6 +95,9 @@ tr:hover td{background:#f5f7fa}
 .tab{padding:10px 20px;cursor:pointer;font-size:13px;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s}
 .tab:hover{color:#1a73e8}
 .tab.active{color:#1a73e8;border-bottom-color:#1a73e8;font-weight:600}
+.country-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.country-tabs button.active{background:#1a73e8;color:#fff;border-color:#1a73e8}
+.status-box{padding:10px 14px;border-radius:5px;background:#fffbe6;border:1px solid #ffe58f;color:#8a6500;margin-bottom:12px;font-size:13px}
+.product-title{white-space:normal;min-width:280px;line-height:1.45}.price{font-weight:700;color:#e65100}.source-note{margin-top:12px;color:#888;font-size:12px}
 /* Responsive */
 @media(max-width:768px){.sidebar{width:160px}.main-area{padding:16px}}
 </style>
@@ -105,7 +108,7 @@ tr:hover td{background:#f5f7fa}
 // ========== State ==========
 const BASE = ''
 const TOKEN_KEY = 'mgmt_token'
-let state = { page: 'login', token: '', user: null, health: null, users: [], ads: [], settings: {}, hotProducts: [], hotKeywords: [], pageData: { users: 1, ads: 1, products: 1, keywords: 1 } }
+let state = { page: 'login', token: '', user: null, health: null, users: [], ads: [], settings: {}, hotProducts: [], hotKeywords: [], internationalCountry: 'MX', international: null, internationalLoading: false, pageData: { users: 1, ads: 1, products: 1, keywords: 1 } }
 const PAGE_SIZE = 15
 
 // ========== API ==========
@@ -152,7 +155,7 @@ async function loadHotProducts() { state.hotProducts = (await get('/api/admin/da
 async function loadHotKeywords() { state.hotKeywords = (await get('/api/admin/dashboard/hot-keywords')).data || [] }
 
 // ========== Router ==========
-function navigateTo(page) { state.page = page; render() }
+async function navigateTo(page) { state.page = page; render(); if (page === 'international' && !state.international) await loadInternational(false) }
 
 // ========== Pagination ==========
 function paginate(list, page) {
@@ -175,7 +178,8 @@ function render() {
             ['ads','📢 广告管理'],
             ['settings','⚙️ 系统设置'],
             ['products','🏆 畅销商品榜'],
-            ['keywords','🔑 热搜词榜']
+            ['keywords','🔑 热搜词榜'],
+            ['international','🌐 国际购选品']
           ].map(([k,v]) => `<div class="nav-item${state.page===k?' active':''}" onclick="navigateTo('${k}')">${v}</div>`).join('')}
         </div>
         <div class="logout-btn" onclick="handleLogout()">🚪 退出登录</div>
@@ -192,6 +196,7 @@ function renderPage() {
     case 'settings': return renderSettings()
     case 'products': return renderHotProducts()
     case 'keywords': return renderHotKeywords()
+    case 'international': return renderInternational()
     default: return '<h2>404</h2>'
   }
 }
@@ -693,6 +698,41 @@ async function deleteKeyword(id) {
   const res = await del('/api/admin/dashboard/hot-keywords/' + id)
   if (res.code === 0) { toast('已删除'); await loadHotKeywords(); render() }
   else { toast(res.message, 'error') }
+}
+
+// ========== 国际购选品（管理员专用） ==========
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
+}
+function renderInternational() {
+  const countries = [['MX','墨西哥'],['BR','巴西'],['CL','智利'],['CO','哥伦比亚']]
+  const data = state.international
+  const rows = (data?.products || []).map(item => `<tr>
+    <td>${escapeHtml(item.id)}</td><td class="product-title">${escapeHtml(item.title)}</td>
+    <td class="price">${escapeHtml(item.currency)} ${Number(item.price).toLocaleString()}</td>
+    <td>${escapeHtml(item.discount || '-')}</td><td><a href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">查看官方商品</a></td>
+  </tr>`).join('')
+  return `<h2>🌐 国际购选品 <span class="tag tag-admin">仅管理员</span></h2>
+    <div class="card">
+      <div class="country-tabs">${countries.map(([code,name]) => `<button class="btn${state.internationalCountry===code?' active':''}" onclick="changeInternationalCountry('${code}')">${name}</button>`).join('')}
+        <button class="btn btn-primary" onclick="loadInternational(true)" ${state.internationalLoading?'disabled':''}>${state.internationalLoading?'采集中...':'刷新采集'}</button></div>
+      ${data && data.status !== 'ok' ? `<div class="status-box">${escapeHtml(data.message)}</div>` : ''}
+      <div class="table-wrap"><table><thead><tr><th>商品ID</th><th>商品标题</th><th>价格</th><th>折扣</th><th>操作</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="5" style="text-align:center;color:#999;padding:30px">${state.internationalLoading?'正在读取国际购商品...':'暂无商品'}</td></tr>`}</tbody></table></div>
+      ${data ? `<div class="source-note">${escapeHtml(data.message)} · ${new Date(data.fetchedAt).toLocaleString()}${data.cached?'（缓存）':''} · <a href="${escapeHtml(data.sourceUrl)}" target="_blank" rel="noopener noreferrer">官方来源</a></div>` : ''}
+    </div>`
+}
+async function loadInternational(refresh) {
+  state.internationalLoading = true; render()
+  const suffix = refresh ? '&refresh=1' : ''
+  const res = await get('/api/admin/international-products?country=' + state.internationalCountry + '&limit=36' + suffix)
+  state.internationalLoading = false
+  if (res.code === 0) state.international = res.data
+  else toast(res.message || '采集失败', 'error')
+  render()
+}
+async function changeInternationalCountry(code) {
+  state.internationalCountry = code; state.international = null; await loadInternational(false)
 }
 
 // ========== Pagination helper ==========

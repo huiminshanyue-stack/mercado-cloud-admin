@@ -1997,6 +1997,79 @@ app.delete('/api/admin/dashboard/hot-keywords/:id', requireAdmin, async (req, re
   }
 });
 
+// ========== 管理员国际购选品 ==========
+const INTERNATIONAL_SOURCES = {
+  MX: { name: '墨西哥', currency: 'MXN', host: 'www.mercadolibre.com.mx', url: 'https://www.mercadolibre.com.mx/importados/compra-internacional' },
+  BR: { name: '巴西', currency: 'BRL', host: 'www.mercadolivre.com.br', url: 'https://www.mercadolivre.com.br/importados/compra-internacional' },
+  CL: { name: '智利', currency: 'CLP', host: 'www.mercadolibre.cl', url: 'https://www.mercadolibre.cl/importados/compra-internacional' },
+  CO: { name: '哥伦比亚', currency: 'COP', host: 'www.mercadolibre.com.co', url: 'https://www.mercadolibre.com.co/importados/compra-internacional' }
+};
+const internationalCache = new Map();
+const INTERNATIONAL_CACHE_MS = 15 * 60 * 1000;
+
+function decodeInternationalText(value = '') {
+  return value.replace(/\\u002F/g, '/').replace(/\\u0026/g, '&').replace(/\\u003D/g, '=')
+    .replace(/\\"/g, '"').replace(/\\n/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+}
+
+function parseInternationalProducts(html, source, limit) {
+  const products = [], seen = new Set();
+  const pattern = /\\"metadata\\":\{(.{0,5000}?)\\"card_type\\":\\"(?:grid|list)\\".{0,3000}?\\"components\\":\[(.{0,12000}?)\]\}/gs;
+  let match;
+  while ((match = pattern.exec(html)) && products.length < limit) {
+    const metadata = match[1], components = match[2];
+    if (!/international_context(?:%3D|=)true/i.test(metadata)) continue;
+    const id = metadata.match(/\\"id\\":\\"(M[A-Z]{2}\d+)\\"/)?.[1];
+    const title = components.match(/\\"type\\":\\"title\\".*?\\"text\\":\\"(.*?)\\"/)?.[1];
+    const price = components.match(/\\"current_price\\":\{\\"value\\":([\d.]+)/)?.[1];
+    const currency = components.match(/\\"current_price\\":\{.*?\\"currency\\":\\"([A-Z]{3})\\"/)?.[1] || source.currency;
+    const discount = components.match(/\\"discount_label\\":\{\\"text\\":\\"(.*?)\\"/)?.[1] || '';
+    const rawUrl = metadata.match(/\\"url\\":\\"(.*?)\\"/)?.[1];
+    if (!id || !title || !price || !rawUrl || seen.has(id)) continue;
+    const decodedUrl = decodeInternationalText(rawUrl);
+    const productUrl = decodedUrl.startsWith('http') ? decodedUrl : `https://${decodedUrl.replace(/^\/+/, '')}`;
+    try {
+      const hostname = new URL(productUrl).hostname, baseHost = source.host.replace(/^www\./, '');
+      if (hostname !== source.host && !hostname.endsWith(`.${baseHost}`)) continue;
+    } catch (e) { continue; }
+    seen.add(id);
+    products.push({ id, title: decodeInternationalText(title), price: Number(price), currency,
+      discount: decodeInternationalText(discount), url: productUrl });
+  }
+  return products;
+}
+
+async function fetchInternationalCountry(code, limit, forceRefresh) {
+  const source = INTERNATIONAL_SOURCES[code], cached = internationalCache.get(code);
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < INTERNATIONAL_CACHE_MS) return { ...cached, cached: true };
+  try {
+    const response = await axios.get(source.url, { timeout: 30000, maxRedirects: 5, responseType: 'text', headers: {
+      Accept: 'text/html,application/xhtml+xml',
+      'Accept-Language': code === 'BR' ? 'pt-BR,pt;q=0.9' : 'es-419,es;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36'
+    }});
+    const products = parseInternationalProducts(String(response.data), source, limit);
+    const result = { country: code, countryName: source.name, sourceUrl: source.url,
+      status: products.length ? 'ok' : 'empty', message: products.length ? `已读取 ${products.length} 个国际购商品` : '页面可访问，但暂未解析到国际购商品',
+      products, fetchedAt: Date.now(), cached: false };
+    internationalCache.set(code, result);
+    return result;
+  } catch (error) {
+    return { country: code, countryName: source.name, sourceUrl: source.url,
+      status: error.response?.status === 403 ? 'blocked' : 'error',
+      message: error.response?.status === 403 ? 'Mercado 暂时拦截了服务器访问，请稍后重试' : `采集失败：${error.code || error.message}`,
+      products: [], fetchedAt: Date.now(), cached: false };
+  }
+}
+
+app.get('/api/admin/international-products', requireAdmin, async (req, res) => {
+  const requested = String(req.query.country || 'MX').toUpperCase();
+  if (!INTERNATIONAL_SOURCES[requested]) return res.status(400).json({ code: 400, message: '只支持 MX、BR、CL、CO 四个国家' });
+  const limit = Math.min(60, Math.max(1, parseInt(req.query.limit, 10) || 36));
+  const data = await fetchInternationalCountry(requested, limit, req.query.refresh === '1');
+  res.json(jsonOk(data));
+});
+
 // ========== 健康检查 ==========
 app.get('/api/health', async (req, res) => {
   try {
