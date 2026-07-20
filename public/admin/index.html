@@ -714,7 +714,7 @@ function renderInternational() {
     <td>${escapeHtml(item.categoryName || '-')}</td><td>${item.listingTime ? new Date(item.listingTime).toLocaleDateString() : '-'}</td>
     <td><a href="${escapeHtml(item.productUrl)}" target="_blank" rel="noopener noreferrer">查看官方商品</a></td>
   </tr>`).join('')
-  return `<h2>🌐 国际购选品 <span class="tag tag-admin">仅管理员</span> <a class="btn btn-success" href="/downloads/mercado-international-collector-v1.0.1.zip" download>下载本地采集扩展 v1.0.1</a></h2>
+  return `<h2>🌐 国际购选品 <span class="tag tag-admin">仅管理员</span> <a class="btn btn-success" href="/downloads/mercado-international-collector-v1.0.2.zip" download>下载本地采集扩展 v1.0.2</a></h2>
     <div class="card">
       <div class="country-tabs">${countries.map(([code,name]) => `<button class="btn${state.internationalCountry===code?' active':''}" onclick="changeInternationalCountry('${code}')">${name}</button>`).join('')}</div>
       <div class="search-bar"><input id="internationalKeyword" value="${escapeHtml(state.internationalKeyword)}" placeholder="搜索商品标题或分类"><button class="btn btn-primary" onclick="searchInternational()">搜索</button><button class="btn" onclick="loadInternational(false)">刷新商品库</button></div>
