@@ -194,6 +194,13 @@ async function initInternationalProductTable() {
   `);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_international_products_country ON international_products(country)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_international_products_last_seen ON international_products(last_seen_at DESC)');
+  await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS original_price NUMERIC(18,2)');
+  await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS rating NUMERIC(4,2)');
+  await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS review_count INTEGER');
+  await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS sold_text VARCHAR(120)');
+  await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS seller VARCHAR(300)');
+  await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS shipping_text VARCHAR(500)');
+  await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS origin_text VARCHAR(200)');
 }
 
 async function seedDashboardData() {
@@ -2035,18 +2042,26 @@ app.post('/api/admin/international-import', requireAdmin, async (req, res) => {
       if (!item?.itemId || !item?.title || !item?.productUrl) continue;
       await client.query(`
         INSERT INTO international_products
-          (country, item_id, title, price, currency, discount, image_url, product_url, category_name, category_url, listing_time, last_seen_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+          (country, item_id, title, price, currency, discount, image_url, product_url, category_name, category_url, listing_time,
+           original_price, rating, review_count, sold_text, seller, shipping_text, origin_text, last_seen_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
         ON CONFLICT (country, item_id) DO UPDATE SET
           title=EXCLUDED.title, price=EXCLUDED.price, currency=EXCLUDED.currency,
           discount=EXCLUDED.discount, image_url=EXCLUDED.image_url, product_url=EXCLUDED.product_url,
           category_name=EXCLUDED.category_name, category_url=EXCLUDED.category_url,
+          original_price=EXCLUDED.original_price, rating=EXCLUDED.rating, review_count=EXCLUDED.review_count,
+          sold_text=EXCLUDED.sold_text, seller=EXCLUDED.seller, shipping_text=EXCLUDED.shipping_text, origin_text=EXCLUDED.origin_text,
           listing_time=COALESCE(EXCLUDED.listing_time, international_products.listing_time), last_seen_at=NOW()`,
         [country, String(item.itemId).slice(0, 40), String(item.title).slice(0, 1000),
-          Number.isFinite(Number(item.price)) ? Number(item.price) : null, String(item.currency || '').slice(0, 3),
+          item.price !== null && item.price !== '' && Number.isFinite(Number(item.price)) ? Number(item.price) : null, String(item.currency || '').slice(0, 3),
           String(item.discount || '').slice(0, 80), String(item.imageUrl || '').slice(0, 3000),
           String(item.productUrl).slice(0, 3000), String(item.categoryName || '').slice(0, 300),
-          String(item.categoryUrl || '').slice(0, 3000), item.listingTime ? new Date(item.listingTime) : null]
+          String(item.categoryUrl || '').slice(0, 3000), item.listingTime ? new Date(item.listingTime) : null,
+          item.originalPrice !== null && item.originalPrice !== '' && Number.isFinite(Number(item.originalPrice)) ? Number(item.originalPrice) : null,
+          item.rating !== null && item.rating !== '' && Number.isFinite(Number(item.rating)) ? Number(item.rating) : null,
+          item.reviewCount !== null && item.reviewCount !== '' && Number.isFinite(Number(item.reviewCount)) ? Number(item.reviewCount) : null,
+          String(item.soldText || '').slice(0, 120), String(item.seller || '').slice(0, 300),
+          String(item.shippingText || '').slice(0, 500), String(item.originText || '').slice(0, 200)]
       );
       imported++;
     }
@@ -2071,7 +2086,8 @@ app.get('/api/admin/international-library', requireAdmin, async (req, res) => {
   const countResult = await pool.query(`SELECT COUNT(*)::int AS total FROM international_products ${where}`, params);
   params.push(size, (page - 1) * size);
   const { rows } = await pool.query(`SELECT item_id AS "itemId", title, price, currency, discount,
-    image_url AS "imageUrl", product_url AS "productUrl", category_name AS "categoryName",
+    image_url AS "imageUrl", product_url AS "productUrl", category_name AS "categoryName", original_price AS "originalPrice",
+    rating, review_count AS "reviewCount", sold_text AS "soldText", seller, shipping_text AS "shippingText", origin_text AS "originText",
     listing_time AS "listingTime", first_seen_at AS "firstSeenAt", last_seen_at AS "lastSeenAt"
     FROM international_products ${where} ORDER BY last_seen_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
   res.json(jsonOk({ items: rows, total: countResult.rows[0].total, page, size }));

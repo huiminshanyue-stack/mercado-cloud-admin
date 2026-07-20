@@ -710,16 +710,17 @@ function renderInternational() {
   const rows = (data?.items || []).map(item => `<tr>
     <td><img src="${escapeHtml(item.imageUrl || '')}" alt="" loading="lazy" style="width:64px;height:64px;object-fit:contain;border-radius:4px;background:#f7f7f7"></td>
     <td>${escapeHtml(item.itemId)}</td><td class="product-title">${escapeHtml(item.title)}</td>
-    <td class="price">${escapeHtml(item.currency)} ${Number(item.price).toLocaleString()}</td>
-    <td>${escapeHtml(item.categoryName || '-')}</td><td>${item.listingTime ? new Date(item.listingTime).toLocaleDateString() : '-'}</td>
+    <td class="price">${escapeHtml(item.currency)} ${Number(item.price).toLocaleString()}${item.originalPrice?`<br><del style="color:#999;font-weight:400">${Number(item.originalPrice).toLocaleString()}</del>`:''}</td>
+    <td>${escapeHtml(item.categoryName || '-')}</td><td>${item.rating || '-'} / ${item.reviewCount ?? '-'}<br>${escapeHtml(item.soldText || '')}</td>
+    <td>${escapeHtml(item.seller || '-')}<br>${escapeHtml(item.originText || item.shippingText || '')}</td><td>${item.listingTime ? new Date(item.listingTime).toLocaleDateString() : '-'}</td>
     <td><a href="${escapeHtml(item.productUrl)}" target="_blank" rel="noopener noreferrer">查看官方商品</a></td>
   </tr>`).join('')
-  return `<h2>🌐 国际购选品 <span class="tag tag-admin">仅管理员</span> <a class="btn btn-success" href="/downloads/mercado-international-collector-v1.0.2.zip" download>下载本地采集扩展 v1.0.2</a></h2>
+  return `<h2>🌐 国际购选品 <span class="tag tag-admin">仅管理员</span> <a class="btn btn-success" href="/downloads/mercado-international-collector-v1.1.0.zip" download>下载本地采集扩展 v1.1.0</a></h2>
     <div class="card">
       <div class="country-tabs">${countries.map(([code,name]) => `<button class="btn${state.internationalCountry===code?' active':''}" onclick="changeInternationalCountry('${code}')">${name}</button>`).join('')}</div>
       <div class="search-bar"><input id="internationalKeyword" value="${escapeHtml(state.internationalKeyword)}" placeholder="搜索商品标题或分类"><button class="btn btn-primary" onclick="searchInternational()">搜索</button><button class="btn" onclick="loadInternational(false)">刷新商品库</button></div>
-      <div class="table-wrap"><table><thead><tr><th>图片</th><th>商品ID</th><th>商品标题</th><th>价格</th><th>分类</th><th>上架时间</th><th>操作</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="7" style="text-align:center;color:#999;padding:30px">${state.internationalLoading?'正在读取商品库...':'暂无商品，请先运行本地采集扩展'}</td></tr>`}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>图片</th><th>商品ID</th><th>商品标题</th><th>价格/原价</th><th>分类</th><th>评分/销量</th><th>卖家/来源</th><th>上架时间</th><th>操作</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="9" style="text-align:center;color:#999;padding:30px">${state.internationalLoading?'正在读取商品库...':'暂无商品，请先运行本地采集扩展'}</td></tr>`}</tbody></table></div>
       ${data ? `<div class="pagination"><button onclick="changeInternationalPage(-1)" ${data.page<=1?'disabled':''}>上一页</button><span>共 ${data.total} 件 · 第 ${data.page}/${Math.max(1,Math.ceil(data.total/data.size))} 页</span><button onclick="changeInternationalPage(1)" ${data.page*data.size>=data.total?'disabled':''}>下一页</button></div>` : ''}
       <div class="source-note">数据由本地浏览器采集扩展上传；遇到验证码时扩展会自动暂停。</div>
     </div>`
