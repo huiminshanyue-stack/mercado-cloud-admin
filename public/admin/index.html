@@ -108,7 +108,7 @@ tr:hover td{background:#f5f7fa}
 // ========== State ==========
 const BASE = ''
 const TOKEN_KEY = 'mgmt_token'
-let state = { page: 'login', token: '', user: null, health: null, users: [], ads: [], settings: {}, hotProducts: [], hotKeywords: [], internationalCountry: 'MX', international: null, internationalLoading: false, pageData: { users: 1, ads: 1, products: 1, keywords: 1 } }
+let state = { page: 'login', token: '', user: null, health: null, users: [], ads: [], settings: {}, hotProducts: [], hotKeywords: [], internationalCountry: 'MX', international: null, internationalLoading: false, internationalPage: 1, internationalKeyword: '', pageData: { users: 1, ads: 1, products: 1, keywords: 1 } }
 const PAGE_SIZE = 15
 
 // ========== API ==========
@@ -707,33 +707,36 @@ function escapeHtml(value) {
 function renderInternational() {
   const countries = [['MX','墨西哥'],['BR','巴西'],['CL','智利'],['CO','哥伦比亚']]
   const data = state.international
-  const rows = (data?.products || []).map(item => `<tr>
-    <td>${escapeHtml(item.id)}</td><td class="product-title">${escapeHtml(item.title)}</td>
+  const rows = (data?.items || []).map(item => `<tr>
+    <td><img src="${escapeHtml(item.imageUrl || '')}" alt="" loading="lazy" style="width:64px;height:64px;object-fit:contain;border-radius:4px;background:#f7f7f7"></td>
+    <td>${escapeHtml(item.itemId)}</td><td class="product-title">${escapeHtml(item.title)}</td>
     <td class="price">${escapeHtml(item.currency)} ${Number(item.price).toLocaleString()}</td>
-    <td>${escapeHtml(item.discount || '-')}</td><td><a href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">查看官方商品</a></td>
+    <td>${escapeHtml(item.categoryName || '-')}</td><td>${item.listingTime ? new Date(item.listingTime).toLocaleDateString() : '-'}</td>
+    <td><a href="${escapeHtml(item.productUrl)}" target="_blank" rel="noopener noreferrer">查看官方商品</a></td>
   </tr>`).join('')
-  return `<h2>🌐 国际购选品 <span class="tag tag-admin">仅管理员</span></h2>
+  return `<h2>🌐 国际购选品 <span class="tag tag-admin">仅管理员</span> <a class="btn btn-success" href="/downloads/mercado-international-collector-v1.0.0.zip" download>下载本地采集扩展</a></h2>
     <div class="card">
-      <div class="country-tabs">${countries.map(([code,name]) => `<button class="btn${state.internationalCountry===code?' active':''}" onclick="changeInternationalCountry('${code}')">${name}</button>`).join('')}
-        <button class="btn btn-primary" onclick="loadInternational(true)" ${state.internationalLoading?'disabled':''}>${state.internationalLoading?'采集中...':'刷新采集'}</button></div>
-      ${data && data.status !== 'ok' ? `<div class="status-box">${escapeHtml(data.message)}</div>` : ''}
-      <div class="table-wrap"><table><thead><tr><th>商品ID</th><th>商品标题</th><th>价格</th><th>折扣</th><th>操作</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="5" style="text-align:center;color:#999;padding:30px">${state.internationalLoading?'正在读取国际购商品...':'暂无商品'}</td></tr>`}</tbody></table></div>
-      ${data ? `<div class="source-note">${escapeHtml(data.message)} · ${new Date(data.fetchedAt).toLocaleString()}${data.cached?'（缓存）':''} · <a href="${escapeHtml(data.sourceUrl)}" target="_blank" rel="noopener noreferrer">官方来源</a></div>` : ''}
+      <div class="country-tabs">${countries.map(([code,name]) => `<button class="btn${state.internationalCountry===code?' active':''}" onclick="changeInternationalCountry('${code}')">${name}</button>`).join('')}</div>
+      <div class="search-bar"><input id="internationalKeyword" value="${escapeHtml(state.internationalKeyword)}" placeholder="搜索商品标题或分类"><button class="btn btn-primary" onclick="searchInternational()">搜索</button><button class="btn" onclick="loadInternational(false)">刷新商品库</button></div>
+      <div class="table-wrap"><table><thead><tr><th>图片</th><th>商品ID</th><th>商品标题</th><th>价格</th><th>分类</th><th>上架时间</th><th>操作</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="7" style="text-align:center;color:#999;padding:30px">${state.internationalLoading?'正在读取商品库...':'暂无商品，请先运行本地采集扩展'}</td></tr>`}</tbody></table></div>
+      ${data ? `<div class="pagination"><button onclick="changeInternationalPage(-1)" ${data.page<=1?'disabled':''}>上一页</button><span>共 ${data.total} 件 · 第 ${data.page}/${Math.max(1,Math.ceil(data.total/data.size))} 页</span><button onclick="changeInternationalPage(1)" ${data.page*data.size>=data.total?'disabled':''}>下一页</button></div>` : ''}
+      <div class="source-note">数据由本地浏览器采集扩展上传；遇到验证码时扩展会自动暂停。</div>
     </div>`
 }
 async function loadInternational(refresh) {
   state.internationalLoading = true; render()
-  const suffix = refresh ? '&refresh=1' : ''
-  const res = await get('/api/admin/international-products?country=' + state.internationalCountry + '&limit=36' + suffix)
+  const res = await get('/api/admin/international-library?country=' + state.internationalCountry + '&page=' + state.internationalPage + '&size=30&keyword=' + encodeURIComponent(state.internationalKeyword))
   state.internationalLoading = false
   if (res.code === 0) state.international = res.data
   else toast(res.message || '采集失败', 'error')
   render()
 }
 async function changeInternationalCountry(code) {
-  state.internationalCountry = code; state.international = null; await loadInternational(false)
+  state.internationalCountry = code; state.internationalPage = 1; state.international = null; await loadInternational(false)
 }
+async function changeInternationalPage(delta) { state.internationalPage = Math.max(1, state.internationalPage + delta); await loadInternational(false) }
+async function searchInternational() { state.internationalKeyword = document.getElementById('internationalKeyword').value.trim(); state.internationalPage = 1; await loadInternational(false) }
 
 // ========== Pagination helper ==========
 function renderPagination(key, pg) {

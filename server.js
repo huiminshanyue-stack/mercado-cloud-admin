@@ -172,6 +172,30 @@ async function seedAdmin() {
   }
 }
 
+async function initInternationalProductTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS international_products (
+      id BIGSERIAL PRIMARY KEY,
+      country VARCHAR(2) NOT NULL,
+      item_id VARCHAR(40) NOT NULL,
+      title TEXT NOT NULL,
+      price NUMERIC(18,2),
+      currency VARCHAR(3),
+      discount VARCHAR(80),
+      image_url TEXT,
+      product_url TEXT NOT NULL,
+      category_name VARCHAR(300),
+      category_url TEXT,
+      listing_time TIMESTAMPTZ,
+      first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(country, item_id)
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_international_products_country ON international_products(country)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_international_products_last_seen ON international_products(last_seen_at DESC)');
+}
+
 async function seedDashboardData() {
   // 仅在首次初始化的空数据库中写入示例数据，避免部署或重启覆盖运营数据。
   const [productCount, keywordCount] = await Promise.all([
@@ -1998,6 +2022,61 @@ app.delete('/api/admin/dashboard/hot-keywords/:id', requireAdmin, async (req, re
 });
 
 // ========== 管理员国际购选品 ==========
+app.post('/api/admin/international-import', requireAdmin, async (req, res) => {
+  const country = String(req.body?.country || '').toUpperCase();
+  const products = Array.isArray(req.body?.products) ? req.body.products.slice(0, 100) : [];
+  if (!['MX', 'BR', 'CL', 'CO'].includes(country)) return res.status(400).json(jsonFail('国家代码无效'));
+  if (!products.length) return res.json(jsonOk({ imported: 0 }));
+  let imported = 0;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const item of products) {
+      if (!item?.itemId || !item?.title || !item?.productUrl) continue;
+      await client.query(`
+        INSERT INTO international_products
+          (country, item_id, title, price, currency, discount, image_url, product_url, category_name, category_url, listing_time, last_seen_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+        ON CONFLICT (country, item_id) DO UPDATE SET
+          title=EXCLUDED.title, price=EXCLUDED.price, currency=EXCLUDED.currency,
+          discount=EXCLUDED.discount, image_url=EXCLUDED.image_url, product_url=EXCLUDED.product_url,
+          category_name=EXCLUDED.category_name, category_url=EXCLUDED.category_url,
+          listing_time=COALESCE(EXCLUDED.listing_time, international_products.listing_time), last_seen_at=NOW()`,
+        [country, String(item.itemId).slice(0, 40), String(item.title).slice(0, 1000),
+          Number.isFinite(Number(item.price)) ? Number(item.price) : null, String(item.currency || '').slice(0, 3),
+          String(item.discount || '').slice(0, 80), String(item.imageUrl || '').slice(0, 3000),
+          String(item.productUrl).slice(0, 3000), String(item.categoryName || '').slice(0, 300),
+          String(item.categoryUrl || '').slice(0, 3000), item.listingTime ? new Date(item.listingTime) : null]
+      );
+      imported++;
+    }
+    await client.query('COMMIT');
+    res.json(jsonOk({ imported }));
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[International] 导入失败:', e.message);
+    res.status(500).json(jsonFail('导入失败'));
+  } finally { client.release(); }
+});
+
+app.get('/api/admin/international-library', requireAdmin, async (req, res) => {
+  const country = String(req.query.country || 'MX').toUpperCase();
+  if (!['MX', 'BR', 'CL', 'CO'].includes(country)) return res.status(400).json(jsonFail('国家代码无效'));
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const size = Math.min(100, Math.max(10, parseInt(req.query.size, 10) || 30));
+  const keyword = String(req.query.keyword || '').trim();
+  const params = [country];
+  let where = 'WHERE country=$1';
+  if (keyword) { params.push(`%${keyword}%`); where += ` AND (title ILIKE $${params.length} OR category_name ILIKE $${params.length})`; }
+  const countResult = await pool.query(`SELECT COUNT(*)::int AS total FROM international_products ${where}`, params);
+  params.push(size, (page - 1) * size);
+  const { rows } = await pool.query(`SELECT item_id AS "itemId", title, price, currency, discount,
+    image_url AS "imageUrl", product_url AS "productUrl", category_name AS "categoryName",
+    listing_time AS "listingTime", first_seen_at AS "firstSeenAt", last_seen_at AS "lastSeenAt"
+    FROM international_products ${where} ORDER BY last_seen_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+  res.json(jsonOk({ items: rows, total: countResult.rows[0].total, page, size }));
+});
+
 const INTERNATIONAL_SOURCES = {
   MX: { name: '墨西哥', currency: 'MXN', host: 'www.mercadolibre.com.mx', url: 'https://www.mercadolibre.com.mx/importados/compra-internacional' },
   BR: { name: '巴西', currency: 'BRL', host: 'www.mercadolivre.com.br', url: 'https://www.mercadolivre.com.br/importados/compra-internacional' },
@@ -2094,6 +2173,7 @@ async function start() {
   await initDashboardTables();
   await seedDashboardData();
   await seedDashboardStats();
+  await initInternationalProductTable();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');
