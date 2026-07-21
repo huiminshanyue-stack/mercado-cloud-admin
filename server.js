@@ -2240,11 +2240,11 @@ function translateBillingDescription(value, category, subType) {
   const key = text.toLowerCase();
   const rules = [
     [/shipping costs?.*gross weight.*dimensions|costos? de env[ií]o.*peso|cargo por mercado env[ií]os/, '按商品毛重和尺寸计算的物流运输费'],
+    [/anulaci[oó]n.*transferencia de dinero.*cuenta internacional|cancellation.*money transfer/, '撤销国际账户转账手续费'],
+    [/anulaci[oó]n.*cargo por gesti[oó]n de venta|cancellation of cost for selling|cancellation.*selling fee/, '撤销美客多平台销售佣金'],
     [/cargo por transferencia de dinero a.*cuenta internacional|money transfer.*international account/, '国际账户转账手续费'],
     [/fee for receiving payments.*mercado pago|tarifa por recibir pagos/, 'Mercado Pago 收款手续费'],
     [/selling fee|sale fee|cost for selling on mercado libre|cargo por (venta|vender|gesti[oó]n de venta)/, '美客多平台销售佣金'],
-    [/anulaci[oó]n.*transferencia de dinero.*cuenta internacional|cancellation.*money transfer/, '撤销国际账户转账手续费'],
-    [/anulaci[oó]n.*cargo por gesti[oó]n de venta|cancellation of cost for selling|cancellation.*selling fee/, '撤销美客多平台销售佣金'],
     [/refund|reembolso|devoluci[oó]n/, '退款相关调整'],
     [/tax|impuesto|iva/, '税费'],
     [/financing|financiaci[oó]n/, '分期付款服务费']
@@ -2254,11 +2254,26 @@ function translateBillingDescription(value, category, subType) {
   return subType ? `${safeCategory}（费用代码 ${subType}）` : safeCategory;
 }
 
+function classifyBillingEntry(entry) {
+  const subType = String(entry.detail_sub_type || '').toUpperCase();
+  const conceptType = String(entry.concept_type || '').toUpperCase();
+  const raw = String(entry.transaction_detail || entry.detail_description || '');
+  const text = `${raw} ${subType} ${conceptType}`.toLowerCase();
+  if (String(entry.detail_type || '').toUpperCase() === 'BONUS') return { key: 'bonusAmount', category: '优惠/返还' };
+  if (subType === 'CV' || subType.startsWith('CVML') || /selling fee|sale fee|cost for selling|cargo por (venta|vender|gesti[oó]n de venta)/.test(text)) return { key: 'saleFee', category: '销售佣金' };
+  if (subType === 'CVMPCB' || /receiving payments|recibir pagos|mercado pago.*(fee|tarifa)/.test(text)) return { key: 'paymentFee', category: '收款手续费' };
+  if (subType === 'CVMPI' || /transferencia de dinero.*cuenta internacional|international account.*transfer/.test(text)) return { key: 'transferFee', category: '国际转账手续费' };
+  if (subType === 'CXD' || subType === 'CCSI' || conceptType === 'SHIPPING' || /shipping|shipment|freight|logistic|env[ií]o/.test(text)) return { key: 'shippingFee', category: '物流运输' };
+  if (/cancel|anulaci[oó]n/.test(text)) return { key: 'cancellationFee', category: '取消费用' };
+  if (/tax|impuesto|iva/.test(text)) return { key: 'taxFee', category: '税费' };
+  return { key: 'adjustmentFee', category: '官方账单调整' };
+}
+
 function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
-    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [] });
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
     const group = groups.get(groupId);
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
@@ -2266,21 +2281,27 @@ function aggregatePackedOrders(rows) {
     for (const field of ['paidAmount','totalAmount','saleFee','shippingFee','otherFee','refundAmount','productCost']) group[field] += Number(row[field] || 0);
     group.financeIsOfficial ||= Boolean(row.financeIsOfficial);
     const parsed = parseOrderBilling(row.billingData, Number(row.paidAmount || 0));
-    group.bonusAmount += Number(parsed?.totalBonuses || 0);
     for (const entry of parsed?.entries || []) {
       const subType = String(entry.detail_sub_type || '').toUpperCase();
       const conceptType = String(entry.concept_type || '').toUpperCase();
       const rawDescription = String(entry.transaction_detail || entry.detail_description || subType || '官方账单费用');
-      const text = `${rawDescription} ${subType} ${conceptType}`.toLowerCase();
-      const category = String(entry.detail_type || '').toUpperCase() === 'BONUS' ? '优惠/返还' : (subType === 'CV' ? '销售佣金' : (subType === 'CXD' || conceptType === 'SHIPPING' || /shipping|shipment|freight|logistic|env[ií]o/.test(text) ? '物流运输' : '其他费用'));
+      const classified = classifyBillingEntry(entry), category = classified.category;
       const description = translateBillingDescription(rawDescription, category, subType);
-      if (!group.billingBreakdown.some(item => item.id === String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`))) group.billingBreakdown.push({ id: String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`), category, description, subType, amount: Number(entry.detail_amount || 0), type: entry.detail_type || '' });
+      const entryId = String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`);
+      if (!group._billingEntryIds.has(entryId)) {
+        group._billingEntryIds.add(entryId); group._officialEntryCount++;
+        group._officialFees[classified.key] += Math.abs(Number(entry.detail_amount || 0));
+        group.billingBreakdown.push({ id: entryId, category, description, subType, amount: Number(entry.detail_amount || 0), type: entry.detail_type || '' });
+      }
     }
   }
   for (const group of groups.values()) {
-    group.saleFee = Number(group.saleFee.toFixed(2)); group.shippingFee = Number(group.shippingFee.toFixed(2)); group.otherFee = Number(group.otherFee.toFixed(2));
-    group.bonusAmount = Number(group.bonusAmount.toFixed(2));
-    group.netAmount = group.financeIsOfficial ? Math.max(0, Number((group.paidAmount - group.saleFee - group.shippingFee - group.otherFee + group.bonusAmount).toFixed(2))) : null;
+    if (group._officialEntryCount) for (const field of Object.keys(group._officialFees)) group[field] = group._officialFees[field];
+    for (const field of ['saleFee','shippingFee','paymentFee','transferFee','cancellationFee','taxFee','adjustmentFee','bonusAmount']) group[field] = Number(group[field].toFixed(2));
+    if (group._officialEntryCount) group.otherFee = group.cancellationFee;
+    const totalCharges = group.saleFee + group.shippingFee + group.paymentFee + group.transferFee + group.cancellationFee + group.taxFee + group.adjustmentFee;
+    group.netAmount = group.financeIsOfficial ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2))) : null;
+    delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees;
   }
   return [...groups.values()];
 }
