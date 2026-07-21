@@ -234,6 +234,15 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS tracking_number VARCHAR(200)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS tracking_method VARCHAR(200)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS logistic_type VARCHAR(100)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS pack_id VARCHAR(80)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS handling_deadline TIMESTAMPTZ');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_alerts (
+    id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
+    title VARCHAR(300) NOT NULL, content TEXT, is_read BOOLEAN NOT NULL DEFAULT FALSE,
+    event_key VARCHAR(300) UNIQUE NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_order_alerts_unread ON order_alerts(is_read, created_at DESC)');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS erp_connectors (
       id BIGSERIAL PRIMARY KEY,
@@ -2220,17 +2229,41 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       });
       sourceOrders = response.data?.results || [];
     }
+    const itemIds = [...new Set(sourceOrders.flatMap(order =>
+      (order.order_items || []).map(entry => entry.item?.id).filter(Boolean)
+    ))];
+    const itemPictures = new Map();
+    for (let i = 0; i < itemIds.length; i += 10) {
+      await Promise.all(itemIds.slice(i, i + 10).map(async id => {
+        try {
+          const itemResponse = await axios.get(`https://api.mercadolibre.com/items/${id}`, {
+            headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
+          });
+          const item = itemResponse.data || {};
+          itemPictures.set(String(id), item.thumbnail || item.secure_thumbnail || item.pictures?.[0]?.secure_url || item.pictures?.[0]?.url || '');
+        } catch (error) {
+          console.warn('[Orders] 商品图片读取失败:', id, error.response?.status || error.message);
+        }
+      }));
+    }
     let imported = 0;
     for (const order of sourceOrders) {
       const shipment = order._shipment_detail || {};
+      const orderItems = (order.order_items || []).map(entry => ({
+        ...entry,
+        item: { ...entry.item, thumbnail: entry.item?.thumbnail || itemPictures.get(String(entry.item?.id)) || '' }
+      }));
       const itemId = order.order_items?.[0]?.item?.id || '';
       const siteId = shipment.source?.site_id || shipment.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '';
       const country = ({ MLM:'MX', MLB:'BR', MLC:'CL', MCO:'CO', MLA:'AR' })[siteId] || siteId;
+      const handlingDeadline = shipment.shipping_option?.estimated_handling_limit?.date ||
+        shipment.lead_time?.estimated_handling_limit?.date || shipment.estimated_handling_limit?.date || null;
+      const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1', [String(order.id)]);
       await pool.query(`
         INSERT INTO ml_orders
           (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,
-           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,NOW())
+           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,shipment_data,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb,NOW())
         ON CONFLICT (ml_order_id) DO UPDATE SET
           status=EXCLUDED.status,date_closed=EXCLUDED.date_closed,buyer_id=EXCLUDED.buyer_id,
           buyer_nickname=EXCLUDED.buyer_nickname,currency=EXCLUDED.currency,total_amount=EXCLUDED.total_amount,
@@ -2238,13 +2271,21 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           raw_data=EXCLUDED.raw_data,site_id=EXCLUDED.site_id,country=EXCLUDED.country,
           shipment_status=EXCLUDED.shipment_status,shipment_substatus=EXCLUDED.shipment_substatus,
           tracking_number=EXCLUDED.tracking_number,tracking_method=EXCLUDED.tracking_method,
-          logistic_type=EXCLUDED.logistic_type,updated_at=NOW()`,
+          logistic_type=EXCLUDED.logistic_type,pack_id=EXCLUDED.pack_id,
+          handling_deadline=EXCLUDED.handling_deadline,shipment_data=EXCLUDED.shipment_data,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
-          JSON.stringify(order.order_items || []), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
-          shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '']
+          JSON.stringify(orderItems), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
+          shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
+          order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, JSON.stringify(shipment)]
       );
+      const old = previous.rows[0];
+      if (!old) await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'new_order','收到新订单',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
+      if (order.status === 'cancelled' && old?.status !== 'cancelled') await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'cancelled','订单已取消',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `${country || '未知站点'}订单已被取消`, `cancelled:${order.id}`]);
+      if (handlingDeadline && new Date(handlingDeadline).getTime() > Date.now() && new Date(handlingDeadline).getTime() - Date.now() <= 86400000 && !['shipped','delivered','cancelled'].includes(shipment.status)) {
+        await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'deadline','订单即将延误',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `官方待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
+      }
       imported++;
     }
     res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId,
@@ -2266,8 +2307,64 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders ${clause}`, params);
   params.push(size, (page - 1) * size);
-  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt",site_id AS "siteId",country,shipment_status AS "shipmentStatus",shipment_substatus AS "shipmentSubstatus",tracking_number AS "trackingNumber",tracking_method AS "trackingMethod",logistic_type AS "logisticType" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt",site_id AS "siteId",country,shipment_status AS "shipmentStatus",shipment_substatus AS "shipmentSubstatus",tracking_number AS "trackingNumber",tracking_method AS "trackingMethod",logistic_type AS "logisticType",pack_id AS "packId",handling_deadline AS "handlingDeadline",shipment_data AS "shipmentData" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
   res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
+});
+
+app.get('/api/admin/order-alerts', requireAdmin, async (req, res) => {
+  const params = [], where = [];
+  if (req.query.type) { params.push(String(req.query.type)); where.push(`alert_type=$${params.length}`); }
+  if (req.query.read === 'true' || req.query.read === 'false') { params.push(req.query.read === 'true'); where.push(`is_read=$${params.length}`); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const [{ rows }, unread] = await Promise.all([
+    pool.query(`SELECT id,order_id AS "orderId",alert_type AS type,title,content,is_read AS "isRead",created_at AS "createdAt" FROM order_alerts ${clause} ORDER BY created_at DESC LIMIT 200`, params),
+    pool.query('SELECT COUNT(*)::int AS count FROM order_alerts WHERE is_read=FALSE')
+  ]);
+  res.json({ code: 0, data: { items: rows, unread: unread.rows[0].count } });
+});
+
+app.post('/api/admin/order-alerts/read-all', requireAdmin, async (req, res) => {
+  await pool.query('UPDATE order_alerts SET is_read=TRUE WHERE is_read=FALSE');
+  res.json({ code: 0 });
+});
+
+app.post('/api/admin/order-alerts/:id/read', requireAdmin, async (req, res) => {
+  await pool.query('UPDATE order_alerts SET is_read=TRUE WHERE id=$1', [req.params.id]);
+  res.json({ code: 0 });
+});
+
+app.get('/api/admin/orders/:orderId/messages', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT pack_id FROM ml_orders WHERE ml_order_id=$1', [req.params.orderId]);
+    if (!rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
+    const token = await getMLAccessToken();
+    const packId = rows[0].pack_id || req.params.orderId;
+    const response = await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    });
+    res.json({ code: 0, data: response.data });
+  } catch (e) {
+    const status = e.response?.status || 502;
+    res.status(status).json({ code: status, message: status === 403 ? '该店铺或订单暂不支持美客多售后会话' : (e.response?.data?.message || e.message) });
+  }
+});
+
+app.post('/api/admin/orders/:orderId/messages', requireAdmin, async (req, res) => {
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ code: 400, message: '回复内容不能为空' });
+  try {
+    const { rows } = await pool.query('SELECT pack_id FROM ml_orders WHERE ml_order_id=$1', [req.params.orderId]);
+    if (!rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
+    const token = await getMLAccessToken();
+    const packId = rows[0].pack_id || req.params.orderId;
+    const response = await axios.post(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
+      text, text_translated: String(req.body?.textTranslated || '') || undefined, attachments: []
+    }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
+    res.json({ code: 0, data: response.data });
+  } catch (e) {
+    const status = e.response?.status || 502;
+    res.status(status).json({ code: status, message: status === 403 ? '该店铺或订单暂不支持美客多售后会话' : (e.response?.data?.message || e.message) });
+  }
 });
 
 app.get('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
