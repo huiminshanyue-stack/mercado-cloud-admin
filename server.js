@@ -2662,7 +2662,7 @@ app.get('/api/admin/order-alerts', requireAdmin, async (req, res) => {
   if (req.query.read === 'true' || req.query.read === 'false') { params.push(req.query.read === 'true'); where.push(`is_read=$${params.length}`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const [{ rows }, unread] = await Promise.all([
-    pool.query(`SELECT id,order_id AS "orderId",alert_type AS type,title,content,is_read AS "isRead",created_at AS "createdAt" FROM order_alerts ${clause} ORDER BY created_at DESC LIMIT 200`, params),
+    pool.query(`SELECT a.id,a.order_id AS "orderId",COALESCE(NULLIF(o.pack_id,''),a.order_id) AS "displayOrderId",a.alert_type AS type,a.title,a.content,a.is_read AS "isRead",a.created_at AS "createdAt",o.country,COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'授权店铺') AS "storeName" FROM order_alerts a LEFT JOIN ml_orders o ON o.ml_order_id=a.order_id LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause ? clause.replaceAll('alert_type','a.alert_type').replaceAll('is_read','a.is_read') : ''} ORDER BY a.created_at DESC LIMIT 200`, params),
     pool.query('SELECT COUNT(*)::int AS count FROM order_alerts WHERE is_read=FALSE')
   ]);
   res.json({ code: 0, data: { items: rows, unread: unread.rows[0].count } });
