@@ -2235,6 +2235,36 @@ function parseOrderBilling(detail, grossAmount) {
   return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, netAmount: officialNet, entries };
 }
 
+function aggregatePackedOrders(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const groupId = String(row.packId || row.orderId);
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [] });
+    const group = groups.get(groupId);
+    group.internalOrderIds.push(String(row.orderId));
+    if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
+    group.items.push(...(Array.isArray(row.items) ? row.items : []));
+    for (const field of ['paidAmount','totalAmount','saleFee','shippingFee','otherFee','refundAmount','productCost']) group[field] += Number(row[field] || 0);
+    group.financeIsOfficial ||= Boolean(row.financeIsOfficial);
+    const parsed = parseOrderBilling(row.billingData, Number(row.paidAmount || 0));
+    group.bonusAmount += Number(parsed?.totalBonuses || 0);
+    for (const entry of parsed?.entries || []) {
+      const subType = String(entry.detail_sub_type || '').toUpperCase();
+      const conceptType = String(entry.concept_type || '').toUpperCase();
+      const description = String(entry.transaction_detail || entry.detail_description || subType || '官方账单费用');
+      const text = `${description} ${subType} ${conceptType}`.toLowerCase();
+      const category = String(entry.detail_type || '').toUpperCase() === 'BONUS' ? '优惠/返还' : (subType === 'CV' ? '销售佣金' : (subType === 'CXD' || conceptType === 'SHIPPING' || /shipping|shipment|freight|logistic|env[ií]o/.test(text) ? '物流运输' : '其他费用'));
+      if (!group.billingBreakdown.some(item => item.id === String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`))) group.billingBreakdown.push({ id: String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`), category, description, subType, amount: Number(entry.detail_amount || 0), type: entry.detail_type || '' });
+    }
+  }
+  for (const group of groups.values()) {
+    group.saleFee = Number(group.saleFee.toFixed(2)); group.shippingFee = Number(group.shippingFee.toFixed(2)); group.otherFee = Number(group.otherFee.toFixed(2));
+    group.bonusAmount = Number(group.bonusAmount.toFixed(2));
+    group.netAmount = group.financeIsOfficial ? Math.max(0, Number((group.paidAmount - group.saleFee - group.shippingFee - group.otherFee + group.bonusAmount).toFixed(2))) : null;
+  }
+  return [...groups.values()];
+}
+
 app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
   try {
     const accessToken = await getMLAccessToken();
@@ -2435,11 +2465,14 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   if (req.query.buyer) { params.push(String(req.query.buyer)); where.push(`o.buyer_nickname = $${params.length}`); }
   if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`(o.ml_order_id = $${params.length} OR o.pack_id = $${params.length})`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders o ${clause}`, params);
+  const count = await pool.query(`SELECT COUNT(DISTINCT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))::int AS total FROM ml_orders o ${clause}`, params);
   params.push(size, (page - 1) * size);
   const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
-  for (const row of rows.rows) row.displayOrderId = row.packId || row.orderId;
-  res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
+  const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId)]) : { rows: [] };
+  const financeMap = new Map(financeRows.rows.map(row => [row.ml_order_id, row.billing_data]));
+  for (const row of rows.rows) row.billingData = financeMap.get(row.orderId) || {};
+  const packedRows = aggregatePackedOrders(rows.rows);
+  res.json({ code: 0, data: { items: packedRows, total: count.rows[0].total, page, size } });
 });
 
 app.get('/api/admin/order-stores', requireAdmin, async (req, res) => {
@@ -2513,12 +2546,14 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
   if ([1,3,7,15,30,90,180,365].includes(days)) { params.push(days); where.push(`o.date_created >= NOW() - ($${params.length}::int * INTERVAL '1 day')`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
-  const idRows = rows.length ? await pool.query('SELECT ml_order_id,pack_id FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.map(row => row.orderId)]) : { rows: [] };
+  const idRows = rows.length ? await pool.query('SELECT ml_order_id,pack_id,billing_data,shipping_id FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.map(row => row.orderId)]) : { rows: [] };
   const displayIdMap = new Map(idRows.rows.map(row => [row.ml_order_id, row.pack_id || row.ml_order_id]));
-  for (const row of rows) row.displayOrderId = displayIdMap.get(row.orderId) || row.orderId;
+  const idDetailMap = new Map(idRows.rows.map(row => [row.ml_order_id, row]));
+  for (const row of rows) { const detail = idDetailMap.get(row.orderId); row.packId = detail?.pack_id || row.orderId; row.shippingId = detail?.shipping_id || ''; row.billingData = detail?.billing_data || {}; }
+  const packedProfitRows = aggregatePackedOrders(rows);
   const exchangeRate = await getUsdCnyRate();
   const summary = {};
-  for (const row of rows) {
+  for (const row of packedProfitRows) {
     const currency = row.currency || '-';
     const payoutForProfit = row.financeIsOfficial
       ? Number(row.netAmount ?? 0)
@@ -2529,14 +2564,15 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
     summary[currency].refundAmount += Number(row.refundAmount || 0); summary[currency].productCostCny += Number(row.productCost || 0);
     summary[currency].profitCny += Number(row.profitCny || 0); summary[currency].orderCount++;
   }
-  res.json({ code: 0, data: { items: rows, summary, exchangeRate } });
+  res.json({ code: 0, data: { items: packedProfitRows, summary, exchangeRate } });
 });
 
 app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
   try {
     const token = await getMLAccessToken();
+    const sellerId = await getMLSellerId(token);
     const response = await axios.get('https://api.mercadolibre.com/marketplace/messages/unread', {
-      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+      params: { user_id: sellerId }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     });
     const raw = response.data || {};
     const source = Array.isArray(raw) ? raw : (raw.results || raw.messages || raw.unread_messages || raw.data || []);
@@ -2574,6 +2610,32 @@ app.post('/api/admin/order-alerts/read-all', requireAdmin, async (req, res) => {
 app.post('/api/admin/order-alerts/:id/read', requireAdmin, async (req, res) => {
   await pool.query('UPDATE order_alerts SET is_read=TRUE WHERE id=$1', [req.params.id]);
   res.json({ code: 0 });
+});
+
+app.get('/api/admin/orders/:orderId/label', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT shipping_id FROM ml_orders WHERE ml_order_id=$1 OR pack_id=$1 ORDER BY date_created', [req.params.orderId]);
+    const shipmentIds = [...new Set(rows.map(row => row.shipping_id).filter(Boolean))];
+    if (!shipmentIds.length) return res.status(404).json({ code: 404, message: '该订单暂无可下载面单' });
+    const token = await getMLAccessToken();
+    let pdfResponse;
+    for (const path of ['shipment_labels', 'marketplace/shipment_labels']) {
+      try {
+        pdfResponse = await axios.get(`https://api.mercadolibre.com/${path}`, {
+          params: { shipment_ids: shipmentIds.join(','), response_type: 'pdf' },
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/pdf' }, responseType: 'arraybuffer', timeout: 30000
+        });
+        if (pdfResponse?.data) break;
+      } catch (error) { if (error.response?.status !== 404) throw error; }
+    }
+    if (!pdfResponse?.data) return res.status(404).json({ code: 404, message: '美客多暂未生成该订单面单' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="mercado-label-${req.params.orderId}.pdf"`);
+    res.send(Buffer.from(pdfResponse.data));
+  } catch (e) {
+    const status = e.response?.status || 502;
+    res.status(status).json({ code: status, message: e.response?.data?.message || e.message });
+  }
 });
 
 app.get('/api/admin/orders/:orderId/messages', requireAdmin, async (req, res) => {
