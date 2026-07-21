@@ -2567,7 +2567,7 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
   res.json({ code: 0, data: { items: packedProfitRows, summary, exchangeRate } });
 });
 
-app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
+app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
   try {
     const token = await getMLAccessToken();
     const sellerId = await getMLSellerId(token);
@@ -2583,11 +2583,57 @@ app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
       const result = await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated" FROM ml_orders WHERE pack_id=ANY($1::varchar[]) OR ml_order_id=ANY($1::varchar[])`, [packIds]);
       orders = result.rows;
     }
-    res.json({ code: 0, data: { count: Number(raw.count || raw.total || list.length), items: list, orders } });
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const todayItems = list.filter(item => {
+      const value = item.message_date || item.date_created || item.created_at || item.last_updated;
+      return !value || new Date(value) >= todayStart;
+    });
+    const todayPackIds = new Set(todayItems.map(item => String(item.pack_id || item.packId || item.resource?.split('/')?.pop() || '')).filter(Boolean));
+    const todayOrders = todayPackIds.size ? orders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : orders;
+    res.json({ code: 0, data: { count: todayItems.length, items: todayItems, orders: todayOrders } });
   } catch (e) {
     const status = e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺暂不支持美客多售后消息接口' : (e.response?.data?.message || e.message) });
   }
+});
+
+app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
+  try {
+    const token = await getMLAccessToken();
+    const sellerId = await getMLSellerId(token);
+    const response = await axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
+      params: { status: 'opened', seller_id: sellerId, sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    });
+    const raw = response.data || {};
+    const claims = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
+    const orderIds = [...new Set(claims.map(claim => String(claim.resource_id || claim.order_id || claim.resource?.split('/')?.pop() || '')).filter(Boolean))];
+    const orderResult = orderIds.length ? await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE ml_order_id=ANY($1::varchar[]) OR pack_id=ANY($1::varchar[])`, [orderIds]) : { rows: [] };
+    const ordersById = new Map();
+    for (const order of orderResult.rows) { ordersById.set(String(order.orderId), order); ordersById.set(String(order.packId), order); }
+    const items = claims.map(claim => ({ ...claim, order: ordersById.get(String(claim.resource_id || claim.order_id || claim.resource?.split('/')?.pop() || '')) || null }));
+    res.json({ code: 0, data: { count: Number(raw.paging?.total || raw.total || items.length), items, orders: items.map(item => item.order).filter(Boolean) } });
+  } catch (e) {
+    const status = e.response?.status || 502;
+    res.status(status).json({ code: status, message: status === 403 ? '该店铺暂不支持售后申诉接口' : (e.response?.data?.message || e.message) });
+  }
+});
+
+app.get('/api/admin/order-claims/:claimId/messages', requireAdmin, async (req, res) => {
+  try {
+    const token = await getMLAccessToken();
+    const response = await axios.get(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(req.params.claimId)}/messages`, { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+    res.json({ code: 0, data: response.data });
+  } catch (e) { const status = e.response?.status || 502; res.status(status).json({ code: status, message: e.response?.data?.message || e.message }); }
+});
+
+app.post('/api/admin/order-claims/:claimId/messages', requireAdmin, async (req, res) => {
+  const text = String(req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ code: 400, message: '回复内容不能为空' });
+  try {
+    const token = await getMLAccessToken();
+    const response = await axios.post(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(req.params.claimId)}/messages`, { receiver_role: 'complainant', message: text }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
+    res.json({ code: 0, data: response.data });
+  } catch (e) { const status = e.response?.status || 502; res.status(status).json({ code: status, message: e.response?.data?.message || e.message }); }
 });
 
 app.get('/api/admin/order-alerts', requireAdmin, async (req, res) => {
