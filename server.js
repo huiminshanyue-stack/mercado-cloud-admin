@@ -2202,14 +2202,15 @@ async function getMLSellerId(accessToken) {
 function parseOrderBilling(detail, grossAmount) {
   if (!detail || typeof detail !== 'object') return null;
   const seen = new Set(), entries = [];
-  const walk = value => {
-    if (Array.isArray(value)) return value.forEach(walk);
+  const walk = (value, inheritedCurrency = '') => {
+    if (Array.isArray(value)) return value.forEach(item => walk(item, inheritedCurrency));
     if (!value || typeof value !== 'object') return;
+    const currency = String(value.currency_info?.currency_id || value.currency_info?.id || value.currency_id || inheritedCurrency || '').toUpperCase();
     if (value.detail_amount !== undefined && value.detail_amount !== null) {
       const key = String(value.detail_id || `${value.detail_sub_type || ''}:${value.detail_description || ''}:${value.detail_amount}`);
-      if (!seen.has(key)) { seen.add(key); entries.push(value); }
+      if (!seen.has(key)) { seen.add(key); entries.push({ ...value, _currencyId: currency }); }
     }
-    Object.values(value).forEach(walk);
+    Object.values(value).forEach(child => walk(child, currency));
   };
   walk(detail);
   let saleFee = 0, shippingFee = 0, otherFee = 0, totalCharges = 0, totalBonuses = 0;
@@ -2233,6 +2234,21 @@ function parseOrderBilling(detail, grossAmount) {
   if (!shippingFee && explicitShipping) shippingFee = Math.abs(explicitShipping);
   const officialNet = Math.max(0, Number(grossAmount || 0) - totalCharges + totalBonuses);
   return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, netAmount: officialNet, entries };
+}
+
+const billingFxCache = new Map();
+async function getBillingFxRate(fromCurrency, toCurrency) {
+  const from = String(fromCurrency || '').toUpperCase(), to = String(toCurrency || '').toUpperCase();
+  if (!from || !to || from === to) return 1;
+  const key = `${from}:${to}`, cached = billingFxCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.rate;
+  try {
+    const token = await getMLAccessToken();
+    const response = await axios.get('https://api.mercadolibre.com/currency_conversions/search', { params: { from, to }, headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
+    const rate = Number(response.data?.ratio || response.data?.rate || 0);
+    if (rate > 0) { billingFxCache.set(key, { rate, expiresAt: Date.now() + 6 * 3600000 }); return rate; }
+  } catch (error) { console.warn('[Orders] 账单币种换算失败:', from, to, error.response?.status || error.message); }
+  return null;
 }
 
 function translateBillingDescription(value, category, subType) {
@@ -2269,7 +2285,7 @@ function classifyBillingEntry(entry) {
   return { key: 'adjustmentFee', category: '官方账单调整' };
 }
 
-function aggregatePackedOrders(rows) {
+async function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
@@ -2289,9 +2305,13 @@ function aggregatePackedOrders(rows) {
       const description = translateBillingDescription(rawDescription, category, subType);
       const entryId = String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`);
       if (!group._billingEntryIds.has(entryId)) {
+        const entryCurrency = String(entry._currencyId || row.currency || '').toUpperCase();
+        const fxRate = await getBillingFxRate(entryCurrency, row.currency);
         group._billingEntryIds.add(entryId); group._officialEntryCount++;
-        group._officialFees[classified.key] += Math.abs(Number(entry.detail_amount || 0));
-        group.billingBreakdown.push({ id: entryId, category, description, subType, amount: Number(entry.detail_amount || 0), type: entry.detail_type || '' });
+        if (fxRate === null) { group.billingCurrencyMismatch = true; continue; }
+        const normalizedAmount = Math.abs(Number(entry.detail_amount || 0)) * fxRate;
+        group._officialFees[classified.key] += normalizedAmount;
+        group.billingBreakdown.push({ id: entryId, category, description, subType, amount: normalizedAmount, originalAmount: Number(entry.detail_amount || 0), originalCurrency: entryCurrency, type: entry.detail_type || '' });
       }
     }
   }
@@ -2300,7 +2320,7 @@ function aggregatePackedOrders(rows) {
     for (const field of ['saleFee','shippingFee','paymentFee','transferFee','cancellationFee','taxFee','adjustmentFee','bonusAmount']) group[field] = Number(group[field].toFixed(2));
     if (group._officialEntryCount) group.otherFee = group.cancellationFee;
     const totalCharges = group.saleFee + group.shippingFee + group.paymentFee + group.transferFee + group.cancellationFee + group.taxFee + group.adjustmentFee;
-    group.netAmount = group.financeIsOfficial ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2))) : null;
+    group.netAmount = group.financeIsOfficial && !group.billingCurrencyMismatch ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2))) : null;
     delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees;
   }
   return [...groups.values()];
@@ -2512,7 +2532,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId)]) : { rows: [] };
   const financeMap = new Map(financeRows.rows.map(row => [row.ml_order_id, row.billing_data]));
   for (const row of rows.rows) row.billingData = financeMap.get(row.orderId) || {};
-  const packedRows = aggregatePackedOrders(rows.rows);
+  const packedRows = await aggregatePackedOrders(rows.rows);
   res.json({ code: 0, data: { items: packedRows, total: count.rows[0].total, page, size } });
 });
 
@@ -2591,7 +2611,7 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
   const displayIdMap = new Map(idRows.rows.map(row => [row.ml_order_id, row.pack_id || row.ml_order_id]));
   const idDetailMap = new Map(idRows.rows.map(row => [row.ml_order_id, row]));
   for (const row of rows) { const detail = idDetailMap.get(row.orderId); row.packId = detail?.pack_id || row.orderId; row.shippingId = detail?.shipping_id || ''; row.billingData = detail?.billing_data || {}; }
-  const packedProfitRows = aggregatePackedOrders(rows);
+  const packedProfitRows = await aggregatePackedOrders(rows);
   const exchangeRate = await getUsdCnyRate();
   const summary = {};
   for (const row of packedProfitRows) {
