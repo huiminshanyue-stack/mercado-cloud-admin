@@ -288,6 +288,15 @@ async function initOrderManagementTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_services (
+    id BIGSERIAL PRIMARY KEY, name VARCHAR(120) NOT NULL, code VARCHAR(100), description VARCHAR(500), enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_submissions (
+    id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80) NOT NULL, warehouse_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
+    carrier VARCHAR(200) NOT NULL, tracking_number VARCHAR(300) NOT NULL, service_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status VARCHAR(30) NOT NULL DEFAULT 'pending', request_data JSONB NOT NULL DEFAULT '{}'::jsonb, response_text TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(order_id)
+  )`);
 }
 
 async function seedDashboardData() {
@@ -2777,6 +2786,53 @@ app.post('/api/admin/orders/:orderId/messages', requireAdmin, async (req, res) =
     const status = e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺或订单暂不支持美客多售后会话' : (e.response?.data?.message || e.message) });
   }
+});
+
+app.get('/api/admin/fulfillment-services', requireAdmin, async (req, res) => {
+  const { rows } = await pool.query('SELECT id,name,code,description,enabled FROM fulfillment_services ORDER BY id DESC');
+  res.json({ code: 0, data: rows });
+});
+
+app.post('/api/admin/fulfillment-services', requireAdmin, async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ code: 400, message: '增值服务名称不能为空' });
+  const { rows } = await pool.query('INSERT INTO fulfillment_services(name,code,description) VALUES($1,$2,$3) RETURNING id', [name.slice(0,120), String(req.body?.code || '').trim().slice(0,100), String(req.body?.description || '').trim().slice(0,500)]);
+  res.json({ code: 0, data: rows[0] });
+});
+
+app.delete('/api/admin/fulfillment-services/:id', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM fulfillment_services WHERE id=$1', [req.params.id]);
+  res.json({ code: 0 });
+});
+
+app.post('/api/admin/fulfillment/submit', requireAdmin, async (req, res) => {
+  const orderIds = [...new Set((Array.isArray(req.body?.orderIds) ? req.body.orderIds : []).map(String).filter(Boolean))];
+  const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
+  const trackingByOrder = req.body?.trackingByOrder || {}, serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
+  if (!orderIds.length || !warehouseId || !carrier) return res.status(400).json({ code: 400, message: '请选择订单、仓库和物流公司' });
+  const connectorResult = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND enabled=TRUE', [warehouseId]);
+  if (!connectorResult.rows[0]) return res.status(404).json({ code: 404, message: '仓库不存在或已停用' });
+  const serviceResult = serviceIds.length ? await pool.query('SELECT id,name,code,description FROM fulfillment_services WHERE enabled=TRUE AND id=ANY($1::bigint[])', [serviceIds]) : { rows: [] };
+  const warehouse = connectorResult.rows[0], headers = { 'Content-Type': 'application/json' };
+  if (warehouse.auth_header && warehouse.auth_value) headers[warehouse.auth_header] = decryptErpCredential(warehouse.auth_value);
+  const results = [];
+  for (const displayOrderId of orderIds) {
+    const trackingNumber = String(trackingByOrder[displayOrderId] || '').trim();
+    if (!trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少快递单号' }); continue; }
+    const orderResult = await pool.query('SELECT * FROM ml_orders WHERE ml_order_id=$1 OR pack_id=$1 ORDER BY date_created', [displayOrderId]);
+    if (!orderResult.rows.length) { results.push({ orderId: displayOrderId, success: false, message: '订单不存在' }); continue; }
+    const payload = { source: 'shanyue-erp', action: 'fulfillment_label', order_id: displayOrderId, carrier, tracking_number: trackingNumber, value_added_services: serviceResult.rows, orders: orderResult.rows.map(row => row.raw_data) };
+    try {
+      const pushed = await axios.post(warehouse.endpoint, payload, { headers, timeout: 30000, maxRedirects: 0 });
+      await pool.query(`INSERT INTO fulfillment_submissions(order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text) VALUES($1,$2,$3,$4,$5::jsonb,'success',$6::jsonb,$7) ON CONFLICT(order_id) DO UPDATE SET warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,updated_at=NOW()`, [displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed.data).slice(0,5000)]);
+      results.push({ orderId: displayOrderId, success: true });
+    } catch (error) {
+      await pool.query(`INSERT INTO fulfillment_submissions(order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text) VALUES($1,$2,$3,$4,$5::jsonb,'failed',$6::jsonb,$7) ON CONFLICT(order_id) DO UPDATE SET status='failed',response_text=EXCLUDED.response_text,updated_at=NOW()`, [displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000)]);
+      results.push({ orderId: displayOrderId, success: false, message: error.response?.data?.message || error.message });
+    }
+  }
+  const success = results.filter(item => item.success).length;
+  res.status(success ? 200 : 502).json({ code: success ? 0 : 502, data: { success, failed: results.length - success, results }, message: success ? '代贴单已提交' : '代贴单提交失败' });
 });
 
 app.get('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
