@@ -2170,13 +2170,37 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       axios.get('https://api.mercadolibre.com/users/me', { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }),
       axios.get(`https://api.mercadolibre.com/users/${sellerId}/items/search`, { params: { limit: 1 }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }).catch(() => null)
     ]);
+    const me = accountResponse.data || {};
     const limit = Math.min(50, Math.max(1, Number(req.body?.limit) || 50));
-    const response = await axios.get('https://api.mercadolibre.com/orders/search', {
-      params: { seller: sellerId, sort: 'date_desc', limit, offset: 0 },
-      headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
-    });
+    let response, sourceOrders;
+    if (me.site_id === 'CBT') {
+      response = await axios.get('https://api.mercadolibre.com/marketplace/orders/search', {
+        params: { sort: 'date_desc', limit }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+      });
+      const orderIds = [...new Set((response.data?.results || []).flatMap(pack =>
+        (pack.orders || []).map(order => order.id).filter(Boolean)
+      ))].slice(0, limit);
+      sourceOrders = [];
+      for (let i = 0; i < orderIds.length; i += 5) {
+        const batch = await Promise.all(orderIds.slice(i, i + 5).map(id =>
+          axios.get(`https://api.mercadolibre.com/marketplace/orders/${id}`, {
+            headers: { Authorization: `Bearer ${accessToken}` }, timeout: 20000
+          }).then(r => r.data).catch(error => {
+            console.warn('[Orders] CBT订单详情读取失败:', id, error.response?.status || error.message);
+            return null;
+          })
+        ));
+        sourceOrders.push(...batch.filter(Boolean));
+      }
+    } else {
+      response = await axios.get('https://api.mercadolibre.com/orders/search', {
+        params: { seller: sellerId, sort: 'date_desc', limit, offset: 0 },
+        headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+      });
+      sourceOrders = response.data?.results || [];
+    }
     let imported = 0;
-    for (const order of response.data?.results || []) {
+    for (const order of sourceOrders) {
       await pool.query(`
         INSERT INTO ml_orders
           (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,updated_at)
@@ -2193,7 +2217,6 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       );
       imported++;
     }
-    const me = accountResponse.data || {};
     res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId,
       account: { id: me.id, nickname: me.nickname || '', siteId: me.site_id || '', countryId: me.country_id || '',
         listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } } });
