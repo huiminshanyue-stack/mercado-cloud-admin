@@ -2216,12 +2216,14 @@ function parseOrderBilling(detail, grossAmount) {
   for (const entry of entries) {
     const amount = Math.abs(Number(entry.detail_amount || 0));
     const type = String(entry.detail_type || '').toUpperCase();
-    const text = `${entry.detail_description || ''} ${entry.detail_sub_type || ''} ${entry.concept_type || ''}`.toLowerCase();
+    const subType = String(entry.detail_sub_type || '').toUpperCase();
+    const conceptType = String(entry.concept_type || '').toUpperCase();
+    const text = `${entry.transaction_detail || ''} ${entry.detail_description || ''} ${subType} ${conceptType}`.toLowerCase();
     if (type === 'BONUS' || /bonus|rebate|credit/.test(text)) totalBonuses += amount;
     else {
       totalCharges += amount;
-      if (/shipping|shipment|freight|logistic|env[ií]o/.test(text)) shippingFee += amount;
-      else if (/sale.?fee|commission|selling.?fee|cargo por venta|tarifa de venta/.test(text)) saleFee += amount;
+      if (subType === 'CXD' || conceptType === 'SHIPPING' || /shipping|shipment|freight|logistic|env[ií]o|mercado env[ií]os/.test(text)) shippingFee += amount;
+      else if (subType === 'CV' || /sale.?fee|commission|selling.?fee|cargo por venta|cargo por vender|tarifa de venta/.test(text)) saleFee += amount;
       else otherFee += amount;
     }
   }
@@ -2431,11 +2433,12 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   if (req.query.shipmentStatus) { params.push(String(req.query.shipmentStatus)); where.push(`o.shipment_status = $${params.length}`); }
   if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id = $${params.length}`); }
   if (req.query.buyer) { params.push(String(req.query.buyer)); where.push(`o.buyer_nickname = $${params.length}`); }
-  if (req.query.orderId) { params.push(`%${String(req.query.orderId).trim()}%`); where.push(`o.ml_order_id ILIKE $${params.length}`); }
+  if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`(o.ml_order_id = $${params.length} OR o.pack_id = $${params.length})`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders o ${clause}`, params);
   params.push(size, (page - 1) * size);
   const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  for (const row of rows.rows) row.displayOrderId = row.packId || row.orderId;
   res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
 });
 
@@ -2505,11 +2508,14 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
   const params = [], where = [];
   if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id=$${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country=$${params.length}`); }
-  if (req.query.orderId) { params.push(`%${String(req.query.orderId).trim()}%`); where.push(`o.ml_order_id ILIKE $${params.length}`); }
+  if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`(o.ml_order_id = $${params.length} OR o.pack_id = $${params.length})`); }
   const days = Number(req.query.days || 0);
   if ([1,3,7,15,30,90,180,365].includes(days)) { params.push(days); where.push(`o.date_created >= NOW() - ($${params.length}::int * INTERVAL '1 day')`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
+  const idRows = rows.length ? await pool.query('SELECT ml_order_id,pack_id FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.map(row => row.orderId)]) : { rows: [] };
+  const displayIdMap = new Map(idRows.rows.map(row => [row.ml_order_id, row.pack_id || row.ml_order_id]));
+  for (const row of rows) row.displayOrderId = displayIdMap.get(row.orderId) || row.orderId;
   const exchangeRate = await getUsdCnyRate();
   const summary = {};
   for (const row of rows) {
