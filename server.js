@@ -2235,6 +2235,25 @@ function parseOrderBilling(detail, grossAmount) {
   return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, netAmount: officialNet, entries };
 }
 
+function translateBillingDescription(value, category, subType) {
+  const text = String(value || '').trim();
+  const key = text.toLowerCase();
+  const rules = [
+    [/shipping costs?.*gross weight.*dimensions|costos? de env[ií]o.*peso|cargo por mercado env[ií]os/, '按商品毛重和尺寸计算的物流运输费'],
+    [/cargo por transferencia de dinero a.*cuenta internacional|money transfer.*international account/, '国际账户转账手续费'],
+    [/fee for receiving payments.*mercado pago|tarifa por recibir pagos/, 'Mercado Pago 收款手续费'],
+    [/selling fee|sale fee|cost for selling on mercado libre|cargo por (venta|vender|gesti[oó]n de venta)/, '美客多平台销售佣金'],
+    [/anulaci[oó]n.*transferencia de dinero.*cuenta internacional|cancellation.*money transfer/, '撤销国际账户转账手续费'],
+    [/anulaci[oó]n.*cargo por gesti[oó]n de venta|cancellation of cost for selling|cancellation.*selling fee/, '撤销美客多平台销售佣金'],
+    [/refund|reembolso|devoluci[oó]n/, '退款相关调整'],
+    [/tax|impuesto|iva/, '税费'],
+    [/financing|financiaci[oó]n/, '分期付款服务费']
+  ];
+  for (const [pattern, translated] of rules) if (pattern.test(key)) return translated;
+  const safeCategory = category || '官方账单费用';
+  return subType ? `${safeCategory}（费用代码 ${subType}）` : safeCategory;
+}
+
 function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
@@ -2251,9 +2270,10 @@ function aggregatePackedOrders(rows) {
     for (const entry of parsed?.entries || []) {
       const subType = String(entry.detail_sub_type || '').toUpperCase();
       const conceptType = String(entry.concept_type || '').toUpperCase();
-      const description = String(entry.transaction_detail || entry.detail_description || subType || '官方账单费用');
-      const text = `${description} ${subType} ${conceptType}`.toLowerCase();
+      const rawDescription = String(entry.transaction_detail || entry.detail_description || subType || '官方账单费用');
+      const text = `${rawDescription} ${subType} ${conceptType}`.toLowerCase();
       const category = String(entry.detail_type || '').toUpperCase() === 'BONUS' ? '优惠/返还' : (subType === 'CV' ? '销售佣金' : (subType === 'CXD' || conceptType === 'SHIPPING' || /shipping|shipment|freight|logistic|env[ií]o/.test(text) ? '物流运输' : '其他费用'));
+      const description = translateBillingDescription(rawDescription, category, subType);
       if (!group.billingBreakdown.some(item => item.id === String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`))) group.billingBreakdown.push({ id: String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`), category, description, subType, amount: Number(entry.detail_amount || 0), type: entry.detail_type || '' });
     }
   }
