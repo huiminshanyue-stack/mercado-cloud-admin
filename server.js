@@ -237,6 +237,7 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS pack_id VARCHAR(80)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS handling_deadline TIMESTAMPTZ');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS deadline_is_estimated BOOLEAN NOT NULL DEFAULT FALSE');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS cancellation_reason VARCHAR(500)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_alerts (
     id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
@@ -2272,12 +2273,14 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
         const extraDays = created.getDay() === 5 ? 2 : ([0, 6].includes(created.getDay()) ? 1 : 0);
         handlingDeadline = new Date(created.getTime() + (48 + extraDays * 24) * 3600000).toISOString();
       }
+      const cancellationReason = order.cancel_detail?.description || order.cancel_detail?.reason ||
+        order.cancellation?.reason || order.status_detail || order.reason || '';
       const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1', [String(order.id)]);
       await pool.query(`
         INSERT INTO ml_orders
           (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,
-           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,shipment_data,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb,NOW())
+           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,cancellation_reason,shipment_data,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,NOW())
         ON CONFLICT (ml_order_id) DO UPDATE SET
           status=EXCLUDED.status,date_closed=EXCLUDED.date_closed,buyer_id=EXCLUDED.buyer_id,
           buyer_nickname=EXCLUDED.buyer_nickname,currency=EXCLUDED.currency,total_amount=EXCLUDED.total_amount,
@@ -2286,13 +2289,15 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           shipment_status=EXCLUDED.shipment_status,shipment_substatus=EXCLUDED.shipment_substatus,
           tracking_number=EXCLUDED.tracking_number,tracking_method=EXCLUDED.tracking_method,
           logistic_type=EXCLUDED.logistic_type,pack_id=EXCLUDED.pack_id,
-          handling_deadline=EXCLUDED.handling_deadline,deadline_is_estimated=EXCLUDED.deadline_is_estimated,shipment_data=EXCLUDED.shipment_data,updated_at=NOW()`,
+          handling_deadline=EXCLUDED.handling_deadline,deadline_is_estimated=EXCLUDED.deadline_is_estimated,
+          cancellation_reason=EXCLUDED.cancellation_reason,shipment_data=EXCLUDED.shipment_data,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
           JSON.stringify(orderItems), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
           shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
-          order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, !officialHandlingDeadline, JSON.stringify(shipment)]
+          order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, !officialHandlingDeadline,
+          String(cancellationReason).slice(0, 500), JSON.stringify(shipment)]
       );
       const old = previous.rows[0];
       if (!old) await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'new_order','收到新订单',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
@@ -2321,7 +2326,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders ${clause}`, params);
   params.push(size, (page - 1) * size);
-  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt",site_id AS "siteId",country,shipment_status AS "shipmentStatus",shipment_substatus AS "shipmentSubstatus",tracking_number AS "trackingNumber",tracking_method AS "trackingMethod",logistic_type AS "logisticType",pack_id AS "packId",handling_deadline AS "handlingDeadline",deadline_is_estimated AS "deadlineIsEstimated",shipment_data AS "shipmentData" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt",site_id AS "siteId",country,shipment_status AS "shipmentStatus",shipment_substatus AS "shipmentSubstatus",tracking_number AS "trackingNumber",tracking_method AS "trackingMethod",logistic_type AS "logisticType",pack_id AS "packId",handling_deadline AS "handlingDeadline",deadline_is_estimated AS "deadlineIsEstimated",cancellation_reason AS "cancellationReason",shipment_data AS "shipmentData" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
   res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
 });
 
