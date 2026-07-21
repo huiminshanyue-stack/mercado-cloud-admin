@@ -203,6 +203,55 @@ async function initInternationalProductTable() {
   await pool.query('ALTER TABLE international_products ADD COLUMN IF NOT EXISTS origin_text VARCHAR(200)');
 }
 
+async function initOrderManagementTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ml_orders (
+      id BIGSERIAL PRIMARY KEY,
+      ml_order_id VARCHAR(80) UNIQUE NOT NULL,
+      status VARCHAR(80),
+      date_created TIMESTAMPTZ,
+      date_closed TIMESTAMPTZ,
+      buyer_id VARCHAR(80),
+      buyer_nickname VARCHAR(300),
+      currency VARCHAR(10),
+      total_amount NUMERIC(18,2),
+      paid_amount NUMERIC(18,2),
+      shipping_id VARCHAR(80),
+      items JSONB NOT NULL DEFAULT '[]'::jsonb,
+      raw_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      push_status VARCHAR(30) NOT NULL DEFAULT 'pending',
+      last_pushed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_date ON ml_orders(date_created DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_status ON ml_orders(status, push_status)');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS erp_connectors (
+      id BIGSERIAL PRIMARY KEY,
+      name VARCHAR(120) NOT NULL,
+      endpoint TEXT NOT NULL,
+      auth_header VARCHAR(120),
+      auth_value TEXT,
+      enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS erp_push_logs (
+      id BIGSERIAL PRIMARY KEY,
+      order_id VARCHAR(80) NOT NULL,
+      connector_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
+      success BOOLEAN NOT NULL,
+      http_status INTEGER,
+      response_text TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
 async function seedDashboardData() {
   // 仅在首次初始化的空数据库中写入示例数据，避免部署或重启覆盖运营数据。
   const [productCount, keywordCount] = await Promise.all([
@@ -1279,6 +1328,27 @@ app.get('/api/search', async (req, res) => {
 const ML_CLIENT_ID = process.env.ML_CLIENT_ID || '';
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || '';
 const ML_REDIRECT_URI = process.env.ML_REDIRECT_URI || 'https://mercado-cloud-admin-production.up.railway.app/api/ml/oauth/callback';
+const ERP_CREDENTIAL_KEY = process.env.ERP_CREDENTIAL_KEY || ML_CLIENT_SECRET || SYNC_API_KEY;
+
+function encryptErpCredential(value) {
+  if (!value) return '';
+  if (!ERP_CREDENTIAL_KEY) throw new Error('服务器尚未配置 ERP_CREDENTIAL_KEY');
+  const key = crypto.createHash('sha256').update(ERP_CREDENTIAL_KEY).digest();
+  const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
+  return ['v1', iv.toString('base64'), cipher.getAuthTag().toString('base64'), encrypted.toString('base64')].join(':');
+}
+
+function decryptErpCredential(value) {
+  if (!value) return '';
+  if (!ERP_CREDENTIAL_KEY) throw new Error('服务器尚未配置 ERP_CREDENTIAL_KEY');
+  const [version, iv, tag, encrypted] = String(value).split(':');
+  if (version !== 'v1') throw new Error('ERP凭据格式不受支持');
+  const key = crypto.createHash('sha256').update(ERP_CREDENTIAL_KEY).digest();
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(tag, 'base64'));
+  return Buffer.concat([decipher.update(Buffer.from(encrypted, 'base64')), decipher.final()]).toString('utf8');
+}
 
 // 从数据库获取 refresh_token
 async function getMLRefreshToken() {
@@ -1331,6 +1401,10 @@ async function getMLAccessToken() {
     );
     // 保存新的 refresh_token（ML 每次刷新都会给新的）
     if (data.refresh_token) await setMLRefreshToken(data.refresh_token);
+    if (data.user_id) await pool.query(
+      "INSERT INTO settings (key, value, updated_at) VALUES ('ml_user_id', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
+      [String(data.user_id)]
+    );
     return data.access_token;
   } catch (e) {
     console.error('[ML] Token刷新失败:', e.response?.data || e.message);
@@ -1379,6 +1453,10 @@ app.get('/api/ml/oauth/callback', async (req, res) => {
     await pool.query(
       "INSERT INTO settings (key, value, updated_at) VALUES ('ml_token_expires_at', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
       [(Date.now() + data.expires_in * 1000 - 60000).toString()]
+    );
+    if (data.user_id) await pool.query(
+      "INSERT INTO settings (key, value, updated_at) VALUES ('ml_user_id', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
+      [String(data.user_id)]
     );
 
     res.send(`
@@ -2074,6 +2152,104 @@ app.post('/api/admin/international-import', requireAdmin, async (req, res) => {
   } finally { client.release(); }
 });
 
+async function getMLSellerId(accessToken) {
+  const saved = await pool.query("SELECT value FROM settings WHERE key = 'ml_user_id'");
+  if (saved.rows[0]?.value) return saved.rows[0].value;
+  const me = await axios.get('https://api.mercadolibre.com/users/me', {
+    headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
+  });
+  const id = String(me.data.id);
+  await pool.query("INSERT INTO settings (key, value, updated_at) VALUES ('ml_user_id', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()", [id]);
+  return id;
+}
+
+app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
+  try {
+    const accessToken = await getMLAccessToken();
+    if (!accessToken) return res.status(401).json({ code: 401, message: '美客多应用尚未授权或授权已失效' });
+    const sellerId = await getMLSellerId(accessToken);
+    const limit = Math.min(50, Math.max(1, Number(req.body?.limit) || 50));
+    const response = await axios.get('https://api.mercadolibre.com/orders/search', {
+      params: { seller: sellerId, sort: 'date_desc', limit, offset: 0 },
+      headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+    });
+    let imported = 0;
+    for (const order of response.data?.results || []) {
+      await pool.query(`
+        INSERT INTO ml_orders
+          (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,NOW())
+        ON CONFLICT (ml_order_id) DO UPDATE SET
+          status=EXCLUDED.status,date_closed=EXCLUDED.date_closed,buyer_id=EXCLUDED.buyer_id,
+          buyer_nickname=EXCLUDED.buyer_nickname,currency=EXCLUDED.currency,total_amount=EXCLUDED.total_amount,
+          paid_amount=EXCLUDED.paid_amount,shipping_id=EXCLUDED.shipping_id,items=EXCLUDED.items,
+          raw_data=EXCLUDED.raw_data,updated_at=NOW()`,
+        [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
+          order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
+          order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
+          JSON.stringify(order.order_items || []), JSON.stringify(order)]
+      );
+      imported++;
+    }
+    res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId } });
+  } catch (e) {
+    console.error('[Orders] 同步失败:', e.response?.data || e.message);
+    res.status(502).json({ code: 502, message: e.response?.data?.message || e.message });
+  }
+});
+
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+  const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
+  const params = [], where = [];
+  if (req.query.status) { params.push(String(req.query.status)); where.push(`status = $${params.length}`); }
+  if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`push_status = $${params.length}`); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders ${clause}`, params);
+  params.push(size, (page - 1) * size);
+  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
+});
+
+app.get('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
+  const { rows } = await pool.query('SELECT id,name,endpoint,auth_header AS "authHeader",enabled,created_at AS "createdAt" FROM erp_connectors ORDER BY id DESC');
+  res.json({ code: 0, data: rows });
+});
+
+app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
+  const { name, endpoint, authHeader, authValue } = req.body || {};
+  if (!name || !endpoint) return res.status(400).json({ code: 400, message: '缺少连接名称或推单地址' });
+  let target; try { target = new URL(endpoint); } catch { return res.status(400).json({ code: 400, message: '推单地址格式错误' }); }
+  if (target.protocol !== 'https:' || /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(target.hostname)) return res.status(400).json({ code: 400, message: '只允许公网 HTTPS 推单地址' });
+  let encryptedAuth;
+  try { encryptedAuth = encryptErpCredential(String(authValue || '').slice(0,2000)); }
+  catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
+  const { rows } = await pool.query('INSERT INTO erp_connectors(name,endpoint,auth_header,auth_value) VALUES($1,$2,$3,$4) RETURNING id', [String(name).slice(0,120), target.href, String(authHeader || '').slice(0,120), encryptedAuth]);
+  res.json({ code: 0, data: { id: rows[0].id } });
+});
+
+app.delete('/api/admin/erp-connectors/:id', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM erp_connectors WHERE id=$1', [req.params.id]);
+  res.json({ code: 0 });
+});
+
+app.post('/api/admin/orders/:orderId/push', requireAdmin, async (req, res) => {
+  const order = await pool.query('SELECT * FROM ml_orders WHERE ml_order_id=$1', [req.params.orderId]);
+  const connector = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND enabled=TRUE', [req.body?.connectorId]);
+  if (!order.rows[0] || !connector.rows[0]) return res.status(404).json({ code: 404, message: '订单或ERP连接不存在' });
+  const c = connector.rows[0], headers = { 'Content-Type': 'application/json' };
+  try {
+    if (c.auth_header && c.auth_value) headers[c.auth_header] = decryptErpCredential(c.auth_value);
+    const pushed = await axios.post(c.endpoint, { source: 'shanyue-erp', order: order.rows[0].raw_data }, { headers, timeout: 30000, maxRedirects: 0 });
+    await pool.query("UPDATE ml_orders SET push_status='success',last_pushed_at=NOW() WHERE ml_order_id=$1", [req.params.orderId]);
+    await pool.query('INSERT INTO erp_push_logs(order_id,connector_id,success,http_status,response_text) VALUES($1,$2,TRUE,$3,$4)', [req.params.orderId,c.id,pushed.status,JSON.stringify(pushed.data).slice(0,5000)]);
+    res.json({ code: 0, data: { status: pushed.status } });
+  } catch (e) {
+    await pool.query("UPDATE ml_orders SET push_status='failed',last_pushed_at=NOW() WHERE ml_order_id=$1", [req.params.orderId]);
+    await pool.query('INSERT INTO erp_push_logs(order_id,connector_id,success,http_status,response_text) VALUES($1,$2,FALSE,$3,$4)', [req.params.orderId,c.id,e.response?.status || null,JSON.stringify(e.response?.data || e.message).slice(0,5000)]);
+    res.status(502).json({ code: 502, message: 'ERP推单失败', detail: e.response?.data || e.message });
+  }
+});
+
 app.get('/api/admin/international-library', requireAdmin, async (req, res) => {
   const country = String(req.query.country || 'MX').toUpperCase();
   if (!['MX', 'BR', 'CL', 'CO'].includes(country)) return res.status(400).json(jsonFail('国家代码无效'));
@@ -2190,6 +2366,7 @@ async function start() {
   await seedDashboardData();
   await seedDashboardStats();
   await initInternationalProductTable();
+  await initOrderManagementTables();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');
