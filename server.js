@@ -2301,8 +2301,11 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       ];
       const saleFee = saleFeeParts.length ? saleFeeParts.reduce((sum, v) => sum + Number(v || 0), 0) : null;
       const shippingCandidates = [shipment.cost, shipment.base_cost, order.shipping?.cost,
-        ...payments.map(p => p.shipping_cost)].filter(v => v !== undefined && v !== null);
-      const shippingFee = shippingCandidates.length ? Number(shippingCandidates[0] || 0) : null;
+        ...payments.map(p => p.shipping_cost),
+        ...payments.flatMap(p => (p.fee_details || []).filter(f => /shipping|freight|logistic/i.test(f.type || f.name || '')).map(f => f.amount))
+      ].filter(v => v !== undefined && v !== null);
+      const nonZeroShipping = shippingCandidates.find(v => Number(v) !== 0);
+      const shippingFee = shippingCandidates.length ? Number(nonZeroShipping ?? shippingCandidates[0] ?? 0) : null;
       const netParts = payments.map(p => p.transaction_details?.net_received_amount).filter(v => v !== undefined && v !== null);
       const grossAmount = Number(order.paid_amount || order.total_amount || 0);
       const netAmount = netParts.length ? netParts.reduce((sum, v) => sum + Number(v || 0), 0) :
@@ -2362,6 +2365,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   if (req.query.shipmentStatus) { params.push(String(req.query.shipmentStatus)); where.push(`o.shipment_status = $${params.length}`); }
   if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id = $${params.length}`); }
   if (req.query.buyer) { params.push(String(req.query.buyer)); where.push(`o.buyer_nickname = $${params.length}`); }
+  if (req.query.orderId) { params.push(`%${String(req.query.orderId).trim()}%`); where.push(`o.ml_order_id ILIKE $${params.length}`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders o ${clause}`, params);
   params.push(size, (page - 1) * size);
@@ -2405,19 +2409,52 @@ app.patch('/api/admin/orders/:orderId/cost', requireAdmin, async (req, res) => {
   res.json({ code: 0 });
 });
 
+let usdCnyRateCache = { value: 0, expiresAt: 0 };
+async function getUsdCnyRate() {
+  if (usdCnyRateCache.value && Date.now() < usdCnyRateCache.expiresAt) return usdCnyRateCache.value;
+  const saved = await pool.query("SELECT value FROM settings WHERE key='usd_cny_rate'");
+  let rate = Number(saved.rows[0]?.value || 0);
+  try {
+    const response = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 8000 });
+    const live = Number(response.data?.rates?.CNY || 0);
+    if (live > 0) {
+      rate = live;
+      await pool.query("INSERT INTO settings(key,value,updated_at) VALUES('usd_cny_rate',$1,NOW()) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()", [String(rate)]);
+    }
+  } catch (e) { console.warn('[Orders] 汇率更新失败，使用已保存汇率:', e.message); }
+  if (!rate) rate = 7.2;
+  usdCnyRateCache = { value: rate, expiresAt: Date.now() + 6 * 3600000 };
+  return rate;
+}
+
+app.patch('/api/admin/order-exchange-rate', requireAdmin, async (req, res) => {
+  const rate = Number(req.body?.rate);
+  if (!Number.isFinite(rate) || rate < 1 || rate > 20) return res.status(400).json({ code: 400, message: '请输入有效的 USD/CNY 汇率' });
+  await pool.query("INSERT INTO settings(key,value,updated_at) VALUES('usd_cny_rate',$1,NOW()) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()", [String(rate)]);
+  usdCnyRateCache = { value: rate, expiresAt: Date.now() + 24 * 3600000 };
+  res.json({ code: 0, data: { rate } });
+});
+
 app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
   const params = [], where = [];
   if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id=$${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country=$${params.length}`); }
+  if (req.query.orderId) { params.push(`%${String(req.query.orderId).trim()}%`); where.push(`o.ml_order_id ILIKE $${params.length}`); }
+  const days = Number(req.query.days || 0);
+  if ([1,3,7,15,30,90,180,365].includes(days)) { params.push(days); where.push(`o.date_created >= NOW() - ($${params.length}::int * INTERVAL '1 day')`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.product_cost AS "productCost",o.cost_note AS "costNote",(COALESCE(o.net_amount,o.paid_amount,0)-COALESCE(o.refund_amount,0)-COALESCE(o.product_cost,0)) AS profit,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
+  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
+  const exchangeRate = await getUsdCnyRate();
   const summary = {};
   for (const row of rows) {
     const currency = row.currency || '-';
-    summary[currency] ||= { paidAmount: 0, netAmount: 0, refundAmount: 0, productCost: 0, profit: 0 };
-    for (const key of Object.keys(summary[currency])) summary[currency][key] += Number(row[key] || 0);
+    row.profitCny = currency === 'USD' ? (Number(row.netAmount ?? row.paidAmount ?? 0) - Number(row.refundAmount || 0)) * exchangeRate - Number(row.productCost || 0) : null;
+    summary[currency] ||= { paidAmount: 0, netAmount: 0, refundAmount: 0, productCostCny: 0, profitCny: 0, orderCount: 0 };
+    summary[currency].paidAmount += Number(row.paidAmount || 0); summary[currency].netAmount += Number(row.netAmount ?? row.paidAmount ?? 0);
+    summary[currency].refundAmount += Number(row.refundAmount || 0); summary[currency].productCostCny += Number(row.productCost || 0);
+    summary[currency].profitCny += Number(row.profitCny || 0); summary[currency].orderCount++;
   }
-  res.json({ code: 0, data: { items: rows, summary } });
+  res.json({ code: 0, data: { items: rows, summary, exchangeRate } });
 });
 
 app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
