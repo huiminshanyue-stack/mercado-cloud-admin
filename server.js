@@ -2153,8 +2153,6 @@ app.post('/api/admin/international-import', requireAdmin, async (req, res) => {
 });
 
 async function getMLSellerId(accessToken) {
-  const saved = await pool.query("SELECT value FROM settings WHERE key = 'ml_user_id'");
-  if (saved.rows[0]?.value) return saved.rows[0].value;
   const me = await axios.get('https://api.mercadolibre.com/users/me', {
     headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
   });
@@ -2168,6 +2166,10 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
     const accessToken = await getMLAccessToken();
     if (!accessToken) return res.status(401).json({ code: 401, message: '美客多应用尚未授权或授权已失效' });
     const sellerId = await getMLSellerId(accessToken);
+    const [accountResponse, listingsResponse] = await Promise.all([
+      axios.get('https://api.mercadolibre.com/users/me', { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }),
+      axios.get(`https://api.mercadolibre.com/users/${sellerId}/items/search`, { params: { limit: 1 }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }).catch(() => null)
+    ]);
     const limit = Math.min(50, Math.max(1, Number(req.body?.limit) || 50));
     const response = await axios.get('https://api.mercadolibre.com/orders/search', {
       params: { seller: sellerId, sort: 'date_desc', limit, offset: 0 },
@@ -2191,7 +2193,10 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       );
       imported++;
     }
-    res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId } });
+    const me = accountResponse.data || {};
+    res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId,
+      account: { id: me.id, nickname: me.nickname || '', siteId: me.site_id || '', countryId: me.country_id || '',
+        listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } } });
   } catch (e) {
     console.error('[Orders] 同步失败:', e.response?.data || e.message);
     res.status(502).json({ code: 502, message: e.response?.data?.message || e.message });
