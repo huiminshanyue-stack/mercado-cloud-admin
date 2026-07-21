@@ -204,6 +204,13 @@ async function initInternationalProductTable() {
 }
 
 async function initOrderManagementTables() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS ml_stores (
+    ml_user_id VARCHAR(80) PRIMARY KEY,
+    nickname VARCHAR(300),
+    remark VARCHAR(300),
+    site_id VARCHAR(20),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ml_orders (
       id BIGSERIAL PRIMARY KEY,
@@ -238,6 +245,9 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS handling_deadline TIMESTAMPTZ');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS deadline_is_estimated BOOLEAN NOT NULL DEFAULT FALSE');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS cancellation_reason VARCHAR(500)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS store_user_id VARCHAR(80)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_store ON ml_orders(store_user_id, date_created DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_buyer ON ml_orders(buyer_nickname, date_created DESC)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_alerts (
     id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
@@ -2189,6 +2199,9 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       axios.get(`https://api.mercadolibre.com/users/${sellerId}/items/search`, { params: { limit: 1 }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }).catch(() => null)
     ]);
     const me = accountResponse.data || {};
+    await pool.query(`INSERT INTO ml_stores(ml_user_id,nickname,site_id,updated_at) VALUES($1,$2,$3,NOW())
+      ON CONFLICT(ml_user_id) DO UPDATE SET nickname=EXCLUDED.nickname,site_id=EXCLUDED.site_id,updated_at=NOW()`,
+      [String(me.id || sellerId), me.nickname || '', me.site_id || '']);
     const limit = Math.min(50, Math.max(1, Number(req.body?.limit) || 50));
     let response, sourceOrders;
     if (me.site_id === 'CBT') {
@@ -2279,8 +2292,8 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       await pool.query(`
         INSERT INTO ml_orders
           (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,
-           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,cancellation_reason,shipment_data,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,NOW())
+           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,cancellation_reason,shipment_data,store_user_id,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,$25,NOW())
         ON CONFLICT (ml_order_id) DO UPDATE SET
           status=EXCLUDED.status,date_closed=EXCLUDED.date_closed,buyer_id=EXCLUDED.buyer_id,
           buyer_nickname=EXCLUDED.buyer_nickname,currency=EXCLUDED.currency,total_amount=EXCLUDED.total_amount,
@@ -2290,14 +2303,15 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           tracking_number=EXCLUDED.tracking_number,tracking_method=EXCLUDED.tracking_method,
           logistic_type=EXCLUDED.logistic_type,pack_id=EXCLUDED.pack_id,
           handling_deadline=EXCLUDED.handling_deadline,deadline_is_estimated=EXCLUDED.deadline_is_estimated,
-          cancellation_reason=EXCLUDED.cancellation_reason,shipment_data=EXCLUDED.shipment_data,updated_at=NOW()`,
+          cancellation_reason=EXCLUDED.cancellation_reason,shipment_data=EXCLUDED.shipment_data,
+          store_user_id=EXCLUDED.store_user_id,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
           JSON.stringify(orderItems), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
           shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
           order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, !officialHandlingDeadline,
-          String(cancellationReason).slice(0, 500), JSON.stringify(shipment)]
+          String(cancellationReason).slice(0, 500), JSON.stringify(shipment), String(me.id || sellerId)]
       );
       const old = previous.rows[0];
       if (!old) await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'new_order','收到新订单',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
@@ -2319,15 +2333,44 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
 app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
   const params = [], where = [];
-  if (req.query.status) { params.push(String(req.query.status)); where.push(`status = $${params.length}`); }
-  if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`push_status = $${params.length}`); }
-  if (req.query.country) { params.push(String(req.query.country)); where.push(`country = $${params.length}`); }
-  if (req.query.shipmentStatus) { params.push(String(req.query.shipmentStatus)); where.push(`shipment_status = $${params.length}`); }
+  if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
+  if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`o.push_status = $${params.length}`); }
+  if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country = $${params.length}`); }
+  if (req.query.shipmentStatus) { params.push(String(req.query.shipmentStatus)); where.push(`o.shipment_status = $${params.length}`); }
+  if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id = $${params.length}`); }
+  if (req.query.buyer) { params.push(String(req.query.buyer)); where.push(`o.buyer_nickname = $${params.length}`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders ${clause}`, params);
+  const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders o ${clause}`, params);
   params.push(size, (page - 1) * size);
-  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt",site_id AS "siteId",country,shipment_status AS "shipmentStatus",shipment_substatus AS "shipmentSubstatus",tracking_number AS "trackingNumber",tracking_method AS "trackingMethod",logistic_type AS "logisticType",pack_id AS "packId",handling_deadline AS "handlingDeadline",deadline_is_estimated AS "deadlineIsEstimated",cancellation_reason AS "cancellationReason",shipment_data AS "shipmentData" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
   res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
+});
+
+app.get('/api/admin/order-stores', requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(`SELECT s.ml_user_id AS id,s.nickname,s.remark,COALESCE(NULLIF(s.remark,''),s.nickname,s.ml_user_id) AS "displayName",s.site_id AS "siteId",COUNT(o.id)::int AS "orderCount" FROM ml_stores s LEFT JOIN ml_orders o ON o.store_user_id=s.ml_user_id GROUP BY s.ml_user_id ORDER BY "displayName"`);
+  res.json({ code: 0, data: rows });
+});
+
+app.patch('/api/admin/order-stores/:id', requireAdmin, async (req, res) => {
+  const remark = String(req.body?.remark || '').trim().slice(0, 300);
+  const { rowCount } = await pool.query('UPDATE ml_stores SET remark=$1,updated_at=NOW() WHERE ml_user_id=$2', [remark, req.params.id]);
+  if (!rowCount) return res.status(404).json({ code: 404, message: '店铺不存在' });
+  res.json({ code: 0 });
+});
+
+app.get('/api/admin/order-buyers', requireAdmin, async (req, res) => {
+  const params = [], where = ["buyer_nickname IS NOT NULL", "buyer_nickname<>''"];
+  if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`store_user_id=$${params.length}`); }
+  if (req.query.country) { params.push(String(req.query.country)); where.push(`country=$${params.length}`); }
+  const { rows } = await pool.query(`SELECT buyer_nickname AS buyer,COUNT(*)::int AS "orderCount",MIN(date_created) AS "firstOrderAt",MAX(date_created) AS "lastOrderAt",ARRAY_REMOVE(ARRAY_AGG(DISTINCT country),NULL) AS countries FROM ml_orders WHERE ${where.join(' AND ')} GROUP BY buyer_nickname ORDER BY COUNT(*) DESC,MAX(date_created) DESC LIMIT 500`, params);
+  res.json({ code: 0, data: rows });
+});
+
+app.get('/api/admin/order-buyers/:buyer', requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(`SELECT ml_order_id AS "orderId",date_created AS "dateCreated",country,currency,paid_amount AS "paidAmount",status,shipment_status AS "shipmentStatus",items,store_user_id AS "storeId" FROM ml_orders WHERE buyer_nickname=$1 ORDER BY date_created DESC LIMIT 200`, [req.params.buyer]);
+  const totals = {};
+  for (const order of rows) totals[order.currency || '-'] = Number((totals[order.currency || '-'] || 0) + Number(order.paidAmount || 0)).toFixed(2);
+  res.json({ code: 0, data: { buyer: req.params.buyer, orders: rows, totals } });
 });
 
 app.get('/api/admin/order-alerts', requireAdmin, async (req, res) => {
