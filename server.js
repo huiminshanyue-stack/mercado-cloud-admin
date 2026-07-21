@@ -252,6 +252,10 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS refund_amount NUMERIC(18,2) NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS product_cost NUMERIC(18,2) NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS cost_note VARCHAR(500)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS other_fee NUMERIC(18,2)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS billing_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_is_official BOOLEAN NOT NULL DEFAULT FALSE');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_synced_at TIMESTAMPTZ');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_store ON ml_orders(store_user_id, date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_buyer ON ml_orders(buyer_nickname, date_created DESC)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
@@ -2195,6 +2199,40 @@ async function getMLSellerId(accessToken) {
   return id;
 }
 
+function parseOrderBilling(detail, grossAmount) {
+  if (!detail || typeof detail !== 'object') return null;
+  const seen = new Set(), entries = [];
+  const walk = value => {
+    if (Array.isArray(value)) return value.forEach(walk);
+    if (!value || typeof value !== 'object') return;
+    if (value.detail_amount !== undefined && value.detail_amount !== null) {
+      const key = String(value.detail_id || `${value.detail_sub_type || ''}:${value.detail_description || ''}:${value.detail_amount}`);
+      if (!seen.has(key)) { seen.add(key); entries.push(value); }
+    }
+    Object.values(value).forEach(walk);
+  };
+  walk(detail);
+  let saleFee = 0, shippingFee = 0, otherFee = 0, totalCharges = 0, totalBonuses = 0;
+  for (const entry of entries) {
+    const amount = Math.abs(Number(entry.detail_amount || 0));
+    const type = String(entry.detail_type || '').toUpperCase();
+    const text = `${entry.detail_description || ''} ${entry.detail_sub_type || ''} ${entry.concept_type || ''}`.toLowerCase();
+    if (type === 'BONUS' || /bonus|rebate|credit/.test(text)) totalBonuses += amount;
+    else {
+      totalCharges += amount;
+      if (/shipping|shipment|freight|logistic|env[ií]o/.test(text)) shippingFee += amount;
+      else if (/sale.?fee|commission|selling.?fee|cargo por venta|tarifa de venta/.test(text)) saleFee += amount;
+      else otherFee += amount;
+    }
+  }
+  const explicitSaleFee = Number(detail.sale_fee?.amount ?? detail.sale_fee ?? 0);
+  const explicitShipping = Number(detail.shipping_info?.sender_shipping_cost ?? detail.shipping_cost ?? 0);
+  if (!saleFee && explicitSaleFee) saleFee = Math.abs(explicitSaleFee);
+  if (!shippingFee && explicitShipping) shippingFee = Math.abs(explicitShipping);
+  const officialNet = Math.max(0, Number(grossAmount || 0) - totalCharges + totalBonuses);
+  return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, netAmount: officialNet, entries };
+}
+
 app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
   try {
     const accessToken = await getMLAccessToken();
@@ -2274,6 +2312,26 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
         }
       }));
     }
+    const billingByOrder = new Map();
+    const billingGroups = new Map();
+    for (const order of sourceOrders) {
+      const localSellerId = String(order.seller?.id || sellerId);
+      if (!billingGroups.has(localSellerId)) billingGroups.set(localSellerId, []);
+      billingGroups.get(localSellerId).push(String(order.id));
+    }
+    for (const [localSellerId, ids] of billingGroups) {
+      for (let i = 0; i < ids.length; i += 60) {
+        try {
+          const billingResponse = await axios.get('https://api.mercadolibre.com/billing/integration/group/ML/order/details', {
+            params: { order_ids: ids.slice(i, i + 60).join(','), seller_id: localSellerId },
+            headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+          });
+          for (const detail of billingResponse.data?.results || []) billingByOrder.set(String(detail.order_id), detail);
+        } catch (error) {
+          console.warn('[Orders] 官方对账明细读取失败:', localSellerId, error.response?.status || error.message);
+        }
+      }
+    }
     let imported = 0;
     for (const order of sourceOrders) {
       const shipment = order._shipment_detail || {};
@@ -2312,12 +2370,18 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
         (saleFee !== null || shippingFee !== null ? grossAmount - Number(saleFee || 0) - Number(shippingFee || 0) : null);
       const refundAmount = payments.reduce((sum, p) => sum + Number(p.total_refunded_amount || p.refunded_amount || 0), 0) ||
         Number(order.refund_amount || order.total_refunded_amount || 0);
+      const billingDetail = billingByOrder.get(String(order.id));
+      const officialFinance = parseOrderBilling(billingDetail, grossAmount);
+      const finalSaleFee = officialFinance ? officialFinance.saleFee : saleFee;
+      const finalShippingFee = officialFinance ? officialFinance.shippingFee : shippingFee;
+      const otherFee = officialFinance ? officialFinance.otherFee : null;
+      const finalNetAmount = officialFinance ? officialFinance.netAmount : null;
       const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1', [String(order.id)]);
       await pool.query(`
         INSERT INTO ml_orders
           (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,
-           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,cancellation_reason,shipment_data,store_user_id,sale_fee,shipping_fee,net_amount,refund_amount,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,$25,$26,$27,$28,$29,NOW())
+           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,cancellation_reason,shipment_data,store_user_id,sale_fee,shipping_fee,net_amount,refund_amount,other_fee,billing_data,finance_is_official,finance_synced_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,$25,$26,$27,$28,$29,$30,$31::jsonb,$32,CASE WHEN $32 THEN NOW() ELSE NULL END,NOW())
         ON CONFLICT (ml_order_id) DO UPDATE SET
           status=EXCLUDED.status,date_closed=EXCLUDED.date_closed,buyer_id=EXCLUDED.buyer_id,
           buyer_nickname=EXCLUDED.buyer_nickname,currency=EXCLUDED.currency,total_amount=EXCLUDED.total_amount,
@@ -2329,7 +2393,9 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           handling_deadline=EXCLUDED.handling_deadline,deadline_is_estimated=EXCLUDED.deadline_is_estimated,
           cancellation_reason=EXCLUDED.cancellation_reason,shipment_data=EXCLUDED.shipment_data,
           store_user_id=EXCLUDED.store_user_id,sale_fee=EXCLUDED.sale_fee,shipping_fee=EXCLUDED.shipping_fee,
-          net_amount=EXCLUDED.net_amount,refund_amount=EXCLUDED.refund_amount,updated_at=NOW()`,
+          net_amount=EXCLUDED.net_amount,refund_amount=EXCLUDED.refund_amount,other_fee=EXCLUDED.other_fee,
+          billing_data=EXCLUDED.billing_data,finance_is_official=EXCLUDED.finance_is_official,
+          finance_synced_at=EXCLUDED.finance_synced_at,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
@@ -2337,7 +2403,7 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
           order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, !officialHandlingDeadline,
           String(cancellationReason).slice(0, 500), JSON.stringify(shipment), String(me.id || sellerId),
-          saleFee, shippingFee, netAmount, refundAmount]
+          finalSaleFee, finalShippingFee, finalNetAmount, refundAmount, otherFee, JSON.stringify(billingDetail || {}), Boolean(billingDetail)]
       );
       const old = previous.rows[0];
       if (!old) await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'new_order','收到新订单',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
@@ -2369,7 +2435,7 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders o ${clause}`, params);
   params.push(size, (page - 1) * size);
-  const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.product_cost AS "productCost",o.cost_note AS "costNote",(COALESCE(o.net_amount,o.paid_amount,0)-COALESCE(o.refund_amount,0)-COALESCE(o.product_cost,0)) AS profit FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
   res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
 });
 
@@ -2443,12 +2509,15 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
   const days = Number(req.query.days || 0);
   if ([1,3,7,15,30,90,180,365].includes(days)) { params.push(days); where.push(`o.date_created >= NOW() - ($${params.length}::int * INTERVAL '1 day')`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
+  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
   const exchangeRate = await getUsdCnyRate();
   const summary = {};
   for (const row of rows) {
     const currency = row.currency || '-';
-    row.profitCny = currency === 'USD' ? (Number(row.netAmount ?? row.paidAmount ?? 0) - Number(row.refundAmount || 0)) * exchangeRate - Number(row.productCost || 0) : null;
+    const payoutForProfit = row.financeIsOfficial
+      ? Number(row.netAmount ?? 0)
+      : Number(row.netAmount ?? row.paidAmount ?? 0) - Number(row.refundAmount || 0);
+    row.profitCny = currency === 'USD' && row.netAmount !== null ? payoutForProfit * exchangeRate - Number(row.productCost || 0) : null;
     summary[currency] ||= { paidAmount: 0, netAmount: 0, refundAmount: 0, productCostCny: 0, profitCny: 0, orderCount: 0 };
     summary[currency].paidAmount += Number(row.paidAmount || 0); summary[currency].netAmount += Number(row.netAmount ?? row.paidAmount ?? 0);
     summary[currency].refundAmount += Number(row.refundAmount || 0); summary[currency].productCostCny += Number(row.productCost || 0);
