@@ -227,6 +227,13 @@ async function initOrderManagementTables() {
   `);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_date ON ml_orders(date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_status ON ml_orders(status, push_status)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS site_id VARCHAR(10)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS country VARCHAR(10)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_status VARCHAR(50)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_substatus VARCHAR(100)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS tracking_number VARCHAR(200)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS tracking_method VARCHAR(200)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS logistic_type VARCHAR(100)');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS erp_connectors (
       id BIGSERIAL PRIMARY KEY,
@@ -2192,6 +2199,20 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
         ));
         sourceOrders.push(...batch.filter(Boolean));
       }
+      for (let i = 0; i < sourceOrders.length; i += 5) {
+        await Promise.all(sourceOrders.slice(i, i + 5).map(async order => {
+          const shipmentId = order.shipping?.id;
+          if (!shipmentId) return;
+          try {
+            const shipment = await axios.get(`https://api.mercadolibre.com/marketplace/shipments/${shipmentId}`, {
+              headers: { Authorization: `Bearer ${accessToken}`, 'x-format-new': 'true' }, timeout: 20000
+            });
+            order._shipment_detail = shipment.data;
+          } catch (error) {
+            console.warn('[Orders] CBT物流详情读取失败:', shipmentId, error.response?.status || error.message);
+          }
+        }));
+      }
     } else {
       response = await axios.get('https://api.mercadolibre.com/orders/search', {
         params: { seller: sellerId, sort: 'date_desc', limit, offset: 0 },
@@ -2201,19 +2222,28 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
     }
     let imported = 0;
     for (const order of sourceOrders) {
+      const shipment = order._shipment_detail || {};
+      const itemId = order.order_items?.[0]?.item?.id || '';
+      const siteId = shipment.source?.site_id || shipment.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '';
+      const country = ({ MLM:'MX', MLB:'BR', MLC:'CL', MCO:'CO', MLA:'AR' })[siteId] || siteId;
       await pool.query(`
         INSERT INTO ml_orders
-          (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,NOW())
+          (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,
+           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,NOW())
         ON CONFLICT (ml_order_id) DO UPDATE SET
           status=EXCLUDED.status,date_closed=EXCLUDED.date_closed,buyer_id=EXCLUDED.buyer_id,
           buyer_nickname=EXCLUDED.buyer_nickname,currency=EXCLUDED.currency,total_amount=EXCLUDED.total_amount,
           paid_amount=EXCLUDED.paid_amount,shipping_id=EXCLUDED.shipping_id,items=EXCLUDED.items,
-          raw_data=EXCLUDED.raw_data,updated_at=NOW()`,
+          raw_data=EXCLUDED.raw_data,site_id=EXCLUDED.site_id,country=EXCLUDED.country,
+          shipment_status=EXCLUDED.shipment_status,shipment_substatus=EXCLUDED.shipment_substatus,
+          tracking_number=EXCLUDED.tracking_number,tracking_method=EXCLUDED.tracking_method,
+          logistic_type=EXCLUDED.logistic_type,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
-          JSON.stringify(order.order_items || []), JSON.stringify(order)]
+          JSON.stringify(order.order_items || []), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
+          shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '']
       );
       imported++;
     }
@@ -2231,10 +2261,12 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const params = [], where = [];
   if (req.query.status) { params.push(String(req.query.status)); where.push(`status = $${params.length}`); }
   if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`push_status = $${params.length}`); }
+  if (req.query.country) { params.push(String(req.query.country)); where.push(`country = $${params.length}`); }
+  if (req.query.shipmentStatus) { params.push(String(req.query.shipmentStatus)); where.push(`shipment_status = $${params.length}`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ml_orders ${clause}`, params);
   params.push(size, (page - 1) * size);
-  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  const rows = await pool.query(`SELECT ml_order_id AS "orderId",status,date_created AS "dateCreated",buyer_nickname AS buyer,currency,total_amount AS "totalAmount",paid_amount AS "paidAmount",shipping_id AS "shippingId",items,push_status AS "pushStatus",last_pushed_at AS "lastPushedAt",site_id AS "siteId",country,shipment_status AS "shipmentStatus",shipment_substatus AS "shipmentSubstatus",tracking_number AS "trackingNumber",tracking_method AS "trackingMethod",logistic_type AS "logisticType" FROM ml_orders ${clause} ORDER BY date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
   res.json({ code: 0, data: { items: rows.rows, total: count.rows[0].total, page, size } });
 });
 
