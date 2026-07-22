@@ -2,7 +2,13 @@ const { Pool } = require('pg');
 const axios = require('axios');
 const crypto = require('crypto');
 
-const databaseUrl = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL;
+let databaseUrl = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL;
+if (process.env.PROBE_DB_TUNNEL_PORT) {
+  const parsed = new URL(databaseUrl);
+  parsed.hostname = '127.0.0.1';
+  parsed.port = process.env.PROBE_DB_TUNNEL_PORT;
+  databaseUrl = parsed.toString();
+}
 const pool = new Pool({ connectionString: databaseUrl, ssl: databaseUrl?.includes('localhost') ? false : { rejectUnauthorized: false } });
 function decrypt(value) {
   const secret = process.env.ERP_CREDENTIAL_KEY || process.env.ML_CLIENT_SECRET || process.env.SYNC_API_KEY;

@@ -2966,13 +2966,35 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
       update.shipping = { dimensions: `${height}x${width}x${length},${weight}` };
     }
     if (!Object.keys(update).length && req.body?.description === undefined) return res.status(400).json({ code: 400, message: '没有可更新的商品字段' });
-    const itemResource = itemId.startsWith('CBT') ? 'marketplace/items' : 'items';
-    if (Object.keys(update).length) await axios.put(`https://api.mercadolibre.com/${itemResource}/${encodeURIComponent(itemId)}`, update, {
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000
-    });
-    if (req.body?.description !== undefined) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/description?api_version=2`, {
+    const requestHeaders = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    if (itemId.startsWith('CBT')) {
+      const unsupported = ['price', 'title', 'description', 'pictures', 'variations', 'packageDimensions'].filter(field => req.body?.[field] !== undefined);
+      if (unsupported.length) return res.status(400).json({ code: 400, message: `CBT 主商品不支持修改：${unsupported.join('、')}；当前仅允许库存和上架/暂停同步到国家站点商品` });
+      const childUpdate = {};
+      if (update.available_quantity !== undefined) childUpdate.available_quantity = update.available_quantity;
+      if (update.status !== undefined) childUpdate.status = update.status;
+      if (!Object.keys(childUpdate).length) return res.status(400).json({ code: 400, message: '该 CBT 商品没有可同步的字段' });
+      const marketplaceResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: requestHeaders, timeout: 20000 });
+      const marketplaceData = marketplaceResponse.data?.body || marketplaceResponse.data || {};
+      const children = Array.isArray(marketplaceData.marketplace_items) ? marketplaceData.marketplace_items : [];
+      if (!children.length) return res.status(409).json({ code: 409, message: '该 CBT 商品尚未生成可操作的国家站点商品' });
+      const results = [];
+      for (const child of children) {
+        try {
+          await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(child.item_id)}`, childUpdate, { headers: requestHeaders, timeout: 20000 });
+          results.push({ itemId: child.item_id, siteId: child.site_id, success: true });
+        } catch (error) {
+          results.push({ itemId: child.item_id, siteId: child.site_id, success: false, message: error.response?.data?.message || error.message });
+        }
+      }
+      const failed = results.filter(result => !result.success);
+      if (failed.length) return res.status(409).json({ code: 409, message: `部分站点更新失败：${failed.map(result => `${result.siteId} ${result.message}`).join('；')}`, data: results });
+    } else if (Object.keys(update).length) {
+      await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, update, { headers: requestHeaders, timeout: 20000 });
+    }
+    if (!itemId.startsWith('CBT') && req.body?.description !== undefined) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/description?api_version=2`, {
       plain_text: String(req.body.description || '').slice(0, 50000)
-    }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
+    }, { headers: requestHeaders, timeout: 20000 });
     const fresh = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
       headers: { Authorization: `Bearer ${token}` }, timeout: 15000
     });
