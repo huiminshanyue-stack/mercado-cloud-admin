@@ -2915,6 +2915,9 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
     const itemId = String(req.params.itemId);
     const product = await findScopedStoreProduct(req.authUser, itemId);
     if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
+    if (product.status === 'under_review') {
+      return res.status(409).json({ code: 409, message: '该商品正在美客多审核中，平台暂时禁止修改；请等待审核完成后再更新' });
+    }
     const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
     const token = await getStoreAuthorizationToken(auth);
     if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
@@ -2961,7 +2964,11 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
     await upsertStoreProduct(mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id));
     res.json({ code: 0, data: mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id) });
   } catch (e) {
-    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
+    const platformMessage = e.response?.data?.message || e.message;
+    const message = /Cannot update item .*status:under_review/i.test(String(platformMessage))
+      ? '该商品正在美客多审核中，平台暂时禁止修改；请等待审核完成后再更新'
+      : platformMessage;
+    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message });
   }
 });
 
