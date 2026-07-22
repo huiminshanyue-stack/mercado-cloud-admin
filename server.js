@@ -33,8 +33,13 @@ async function connectDB() {
   pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    client_encoding: 'utf8'
+    client_encoding: 'utf8',
+    max: Number(process.env.DB_POOL_MAX || 6),
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+    statement_timeout: 30000
   });
+  pool.on('error', error => console.error('[DB] idle client error:', error.message));
 
   try {
     const client = await pool.connect();
@@ -1360,12 +1365,14 @@ app.get('/api/sync', requireSyncKey, async (req, res) => {
 
 // ========== 搜索缓存（降低 meikeduoshuju WAF 命中率） ==========
 const searchCache = new Map();
+const SEARCH_CACHE_MAX_ENTRIES = 200;
 const CACHE_TTL = 5 * 60 * 1000; // 5 分钟缓存
 setInterval(() => {
   const now = Date.now();
   for (const [key, val] of searchCache) {
     if (now - val.time > CACHE_TTL) searchCache.delete(key);
   }
+  while (searchCache.size > SEARCH_CACHE_MAX_ENTRIES) searchCache.delete(searchCache.keys().next().value);
 }, 60000); // 每分钟清理一次过期缓存
 
 // ========== 搜索代理（前端 App.vue 调用） ==========
@@ -2778,11 +2785,16 @@ app.get('/api/store-products/stores', requireAuth, async (req, res) => {
   res.json({ code: 0, data: rows });
 });
 
+const activeStoreSyncs = new Set();
 app.post('/api/store-products/sync', requireAuth, async (req, res) => {
+  let syncKey = '';
   try {
     let auth = await findScopedStoreAuthorization(req.authUser, req.body?.storeId);
     if (!auth) auth = await ensureLegacyStoreAuthorization(req.authUser);
     if (!auth || (req.body?.storeId && String(auth.ml_user_id) !== String(req.body.storeId))) return res.status(404).json({ code: 404, message: '未找到该用户可访问的授权店铺' });
+    syncKey = `${auth.owner_username}:${auth.ml_user_id}`;
+    if (activeStoreSyncs.has(syncKey)) return res.status(409).json({ code: 409, message: '该店铺正在同步中，请勿重复提交' });
+    activeStoreSyncs.add(syncKey);
     const token = await getStoreAuthorizationToken(auth);
     if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
     const ids = [];
@@ -2799,8 +2811,8 @@ app.post('/api/store-products/sync', requireAuth, async (req, res) => {
       if (!batch.length || !scrollId || rounds >= 100) break;
     } while (true);
     let synced = 0, failed = 0;
-    for (let i = 0; i < ids.length; i += 10) {
-      const batch = await Promise.all(ids.slice(i, i + 10).map(async itemId => {
+    for (let i = 0; i < ids.length; i += 4) {
+      const batch = await Promise.all(ids.slice(i, i + 4).map(async itemId => {
         try {
           const response = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
             headers: { Authorization: `Bearer ${token}` }, timeout: 15000
@@ -2814,6 +2826,8 @@ app.post('/api/store-products/sync', requireAuth, async (req, res) => {
     res.json({ code: 0, data: { discovered: ids.length, synced, failed, storeId: auth.ml_user_id } });
   } catch (e) {
     res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
+  } finally {
+    if (syncKey) activeStoreSyncs.delete(syncKey);
   }
 });
 
@@ -2977,6 +2991,43 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
         : '美客多数据校验失败：提交的商品资料不符合平台规则，请检查标题、图片、包装尺寸和重量。';
     }
     res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message });
+  }
+});
+
+app.post('/api/internal/cbt-capability-probe', async (req, res) => {
+  if (!SYNC_API_KEY || req.headers['x-sync-key'] !== SYNC_API_KEY) return res.status(403).json({ message: 'Forbidden' });
+  try {
+    const { rows } = await pool.query(`SELECT p.item_id,a.* FROM ml_store_products p JOIN ml_store_authorizations a
+      ON a.owner_username=p.owner_username AND a.ml_user_id=p.store_user_id
+      WHERE p.item_id LIKE 'CBT%' AND a.enabled=TRUE ORDER BY p.last_synced_at DESC LIMIT 1`);
+    const product = rows[0];
+    if (!product) return res.status(404).json({ message: 'No CBT product' });
+    const token = await getStoreAuthorizationToken(product);
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const marketplaceResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${product.item_id}`, { headers, timeout: 20000 });
+    const marketplace = marketplaceResponse.data?.body || marketplaceResponse.data || {};
+    const result = { parentId: product.item_id, children: {} };
+    for (const child of (marketplace.marketplace_items || []).slice(0, 3)) {
+      const childId = child.item_id;
+      try {
+        const current = (await axios.get(`https://api.mercadolibre.com/items/${childId}`, { headers, timeout: 20000 })).data || {};
+        const tests = {};
+        for (const [name, payload] of Object.entries({ price: { price: current.price }, inventory: { available_quantity: current.available_quantity }, status: { status: current.status } })) {
+          try {
+            const response = await axios.put(`https://api.mercadolibre.com/items/${childId}`, payload, { headers, timeout: 20000 });
+            tests[name] = { accepted: true, status: response.status };
+          } catch (error) {
+            tests[name] = { accepted: false, status: error.response?.status, message: error.response?.data?.message, cause: error.response?.data?.cause };
+          }
+        }
+        result.children[childId] = { siteId: child.site_id, current: { price: current.price, inventory: current.available_quantity, status: current.status }, tests };
+      } catch (error) {
+        result.children[childId] = { siteId: child.site_id, readError: error.response?.data?.message || error.message, status: error.response?.status };
+      }
+    }
+    res.json(result);
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ message: error.response?.data?.message || error.message, cause: error.response?.data?.cause });
   }
 });
 
@@ -3533,13 +3584,23 @@ async function start() {
   await initInternationalProductTable();
   await initOrderManagementTables();
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');
     console.log('  美客多爆品选品雷达 - 云端管理后台');
     console.log(`  地址: http://localhost:${PORT}`);
     console.log(`  管理页面: http://localhost:${PORT}/`);
     console.log('============================================');
   });
+  const shutdown = signal => {
+    console.log(`[Server] ${signal} received, closing gracefully`);
+    server.close(async () => {
+      try { await pool?.end(); } catch (error) { console.error('[DB] close error:', error.message); }
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 15000).unref();
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 start();
