@@ -2706,7 +2706,7 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
     const packIds = [...new Set(list.map(x => String(x.pack_id || x.packId || x.resource?.split('/')?.pop() || '')).filter(Boolean))];
     let orders = [];
     if (packIds.length) {
-      const result = await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated" FROM ml_orders WHERE pack_id=ANY($1::varchar[]) OR ml_order_id=ANY($1::varchar[])`, [packIds]);
+      const result = await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE pack_id=ANY($1::varchar[]) OR ml_order_id=ANY($1::varchar[]) ORDER BY date_created DESC`, [packIds]);
       orders = result.rows;
     }
     const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
