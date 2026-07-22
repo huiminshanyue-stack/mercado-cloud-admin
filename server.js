@@ -2670,7 +2670,7 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
   const days = Number(req.query.days || 0);
   if ([1,3,7,15,30,90,180,365].includes(days)) { params.push(days); where.push(`o.date_created >= NOW() - ($${params.length}::int * INTERVAL '1 day')`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
+  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.shipment_status AS "shipmentStatus",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
   const idRows = rows.length ? await pool.query('SELECT ml_order_id,pack_id,billing_data,shipping_id FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.map(row => row.orderId)]) : { rows: [] };
   const displayIdMap = new Map(idRows.rows.map(row => [row.ml_order_id, row.pack_id || row.ml_order_id]));
   const idDetailMap = new Map(idRows.rows.map(row => [row.ml_order_id, row]));
@@ -2684,6 +2684,7 @@ app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
       ? Number(row.netAmount ?? 0)
       : Number(row.netAmount ?? row.paidAmount ?? 0) - Number(row.refundAmount || 0);
     row.profitCny = currency === 'USD' && row.netAmount !== null ? payoutForProfit * exchangeRate - Number(row.productCost || 0) : null;
+    row.profitBasis = 'net_payout';
     summary[currency] ||= { paidAmount: 0, netAmount: 0, refundAmount: 0, productCostCny: 0, profitCny: 0, orderCount: 0 };
     summary[currency].paidAmount += Number(row.paidAmount || 0); summary[currency].netAmount += Number(row.netAmount ?? row.paidAmount ?? 0);
     summary[currency].refundAmount += Number(row.refundAmount || 0); summary[currency].productCostCny += Number(row.productCost || 0);
@@ -2759,6 +2760,27 @@ app.post('/api/admin/order-claims/:claimId/messages', requireAdmin, async (req, 
     const response = await axios.post(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(req.params.claimId)}/messages`, { receiver_role: 'complainant', message: text }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
     res.json({ code: 0, data: response.data });
   } catch (e) { const status = e.response?.status || 502; res.status(status).json({ code: status, message: e.response?.data?.message || e.message }); }
+});
+
+app.post('/api/admin/translate', requireAdmin, async (req, res) => {
+  const text = String(req.body?.text || '').trim();
+  const source = String(req.body?.source || 'zh-CN');
+  const target = String(req.body?.target || 'en');
+  if (!text) return res.status(400).json({ code: 400, message: '翻译内容不能为空' });
+  if (text.length > 5000) return res.status(400).json({ code: 400, message: '单次翻译内容不能超过5000字' });
+  try {
+    const response = await axios.get('https://translate.googleapis.com/translate_a/single', {
+      params: { client: 'gtx', sl: source, tl: target, dt: 't', q: text },
+      timeout: 15000
+    });
+    const translated = Array.isArray(response.data?.[0])
+      ? response.data[0].map(part => part?.[0] || '').join('')
+      : '';
+    if (!translated) throw new Error('翻译服务未返回结果');
+    res.json({ code: 0, data: { text: translated, source, target } });
+  } catch (e) {
+    res.status(502).json({ code: 502, message: `翻译失败：${e.response?.data?.message || e.message}` });
+  }
 });
 
 app.get('/api/admin/order-alerts', requireAdmin, async (req, res) => {
