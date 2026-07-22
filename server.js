@@ -2703,7 +2703,18 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
     const raw = response.data || {};
     const source = Array.isArray(raw) ? raw : (raw.results || raw.messages || raw.unread_messages || raw.data || []);
     const list = Array.isArray(source) ? source : [];
-    const packIds = [...new Set(list.map(x => String(x.pack_id || x.packId || x.resource?.split('/')?.pop() || '')).filter(Boolean))];
+    const messageOrderRefs = item => {
+      const direct = [
+        item?.pack_id, item?.packId, item?.order_id, item?.orderId,
+        item?.resource_id, item?.resource?.id,
+        typeof item?.resource === 'string' ? item.resource.split('/').pop() : ''
+      ];
+      for (const resource of item?.message_resources || item?.resources || []) {
+        direct.push(resource?.id, resource?.resource_id, resource?.name?.split('/')?.pop());
+      }
+      return direct.map(value => String(value || '').trim()).filter(value => /^\d{8,}$/.test(value));
+    };
+    const packIds = [...new Set(list.flatMap(messageOrderRefs))];
     let orders = [];
     if (packIds.length) {
       const result = await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE pack_id=ANY($1::varchar[]) OR ml_order_id=ANY($1::varchar[]) ORDER BY date_created DESC`, [packIds]);
@@ -2712,9 +2723,10 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
     const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
     const todayItems = list.filter(item => {
       const value = item.message_date || item.date_created || item.created_at || item.last_updated;
-      return !value || new Date(value) >= todayStart;
+      const date = value ? new Date(value) : null;
+      return !date || Number.isNaN(date.getTime()) || date >= todayStart;
     });
-    const todayPackIds = new Set(todayItems.map(item => String(item.pack_id || item.packId || item.resource?.split('/')?.pop() || '')).filter(Boolean));
+    const todayPackIds = new Set(todayItems.flatMap(messageOrderRefs));
     const todayOrders = todayPackIds.size ? orders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : orders;
     res.json({ code: 0, data: { count: todayItems.length, items: todayItems, orders: todayOrders } });
   } catch (e) {
