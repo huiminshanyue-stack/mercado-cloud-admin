@@ -2697,10 +2697,10 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
   try {
     const token = await getMLAccessToken();
     const sellerId = await getMLSellerId(token);
-    const response = await axios.get('https://api.mercadolibre.com/marketplace/messages/unread', {
+    const unreadResponse = await axios.get('https://api.mercadolibre.com/marketplace/messages/unread', {
       params: { user_id: sellerId }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-    });
-    const raw = response.data || {};
+    }).catch(() => ({ data: {} }));
+    const raw = unreadResponse.data || {};
     const source = Array.isArray(raw) ? raw : (raw.results || raw.messages || raw.unread_messages || raw.data || []);
     const list = Array.isArray(source) ? source : [];
     const messageOrderRefs = item => {
@@ -2715,10 +2715,10 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
       return direct.map(value => String(value || '').trim()).filter(value => /^\d{8,}$/.test(value));
     };
     const packIds = [...new Set(list.flatMap(messageOrderRefs))];
-    let orders = [];
+    let unreadOrders = [];
     if (packIds.length) {
       const result = await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE pack_id=ANY($1::varchar[]) OR ml_order_id=ANY($1::varchar[]) ORDER BY date_created DESC`, [packIds]);
-      orders = result.rows;
+      unreadOrders = result.rows;
     }
     const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
     const todayItems = list.filter(item => {
@@ -2727,8 +2727,41 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
       return !date || Number.isNaN(date.getTime()) || date >= todayStart;
     });
     const todayPackIds = new Set(todayItems.flatMap(messageOrderRefs));
-    const todayOrders = todayPackIds.size ? orders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : orders;
-    res.json({ code: 0, data: { count: todayItems.length, items: todayItems, orders: todayOrders } });
+    const matchedUnreadOrders = todayPackIds.size ? unreadOrders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : unreadOrders;
+
+    // “今日咨询”必须包含已经被管理员点开、但今天确实收到过买家消息的订单，不能只依赖 unread。
+    const recentResult = await pool.query(`SELECT DISTINCT ON (COALESCE(NULLIF(pack_id,''),ml_order_id)) ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE date_created >= CURRENT_DATE - INTERVAL '1 day' ORDER BY COALESCE(NULLIF(pack_id,''),ml_order_id),date_created DESC LIMIT 40`);
+    const conversationOrders = [];
+    const conversationItems = [];
+    for (let i = 0; i < recentResult.rows.length; i += 5) {
+      const batch = await Promise.all(recentResult.rows.slice(i, i + 5).map(async order => {
+        const packId = order.packId || order.orderId;
+        try {
+          const response = await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
+            headers: { Authorization: `Bearer ${token}` }, timeout: 12000
+          });
+          const payload = response.data || {};
+          const messages = Array.isArray(payload) ? payload : (payload.messages || payload.results || payload.data?.messages || []);
+          const buyerMessages = messages.filter(message => {
+            const sender = String(message.from?.user_id || message.from || message.sender_id || '');
+            if (sender && sender === String(sellerId)) return false;
+            const rawDate = message.message_date || message.date_created || message.created_at;
+            const date = rawDate ? new Date(rawDate) : null;
+            return !date || Number.isNaN(date.getTime()) || date >= todayStart;
+          });
+          return buyerMessages.length ? { order, messages: buyerMessages } : null;
+        } catch (_) { return null; }
+      }));
+      for (const entry of batch.filter(Boolean)) {
+        conversationOrders.push(entry.order);
+        conversationItems.push(...entry.messages.map(message => ({ ...message, order_id: entry.order.orderId, pack_id: entry.order.packId || entry.order.orderId })));
+      }
+    }
+    const orderMap = new Map();
+    for (const order of [...matchedUnreadOrders, ...conversationOrders]) orderMap.set(String(order.packId || order.orderId), order);
+    const itemMap = new Map();
+    for (const item of [...todayItems, ...conversationItems]) itemMap.set(String(item.id || `${item.pack_id || item.order_id}:${item.message_date || item.date_created || ''}:${item.text || item.message || ''}`), item);
+    res.json({ code: 0, data: { count: itemMap.size, items: [...itemMap.values()], orders: [...orderMap.values()] } });
   } catch (e) {
     const status = e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺暂不支持美客多售后消息接口' : (e.response?.data?.message || e.message) });
