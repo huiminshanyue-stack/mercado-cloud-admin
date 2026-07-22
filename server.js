@@ -2329,7 +2329,9 @@ async function aggregatePackedOrders(rows) {
     for (const field of ['saleFee','shippingFee','paymentFee','transferFee','cancellationFee','taxFee','adjustmentFee','bonusAmount']) group[field] = Number(group[field].toFixed(2));
     if (group._officialEntryCount) group.otherFee = group.cancellationFee;
     const totalCharges = group.saleFee + group.shippingFee + group.paymentFee + group.transferFee + group.cancellationFee + group.taxFee + group.adjustmentFee;
-    group.netAmount = group.financeIsOfficial && !group.billingCurrencyMismatch ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2))) : null;
+    group.netAmount = group.status === 'cancelled'
+      ? 0
+      : (group.financeIsOfficial && !group.billingCurrencyMismatch ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2))) : null);
     delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees;
   }
   return [...groups.values()];
@@ -2452,8 +2454,14 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
         const extraDays = created.getDay() === 5 ? 2 : ([0, 6].includes(created.getDay()) ? 1 : 0);
         handlingDeadline = new Date(created.getTime() + (48 + extraDays * 24) * 3600000).toISOString();
       }
-      const cancellationReason = order.cancel_detail?.description || order.cancel_detail?.reason ||
+      const cancelActor = order.cancel_detail?.group || order.cancel_detail?.initiated_by ||
+        order.cancel_detail?.responsible || order.cancellation?.initiated_by ||
+        order.cancellation?.cancelled_by || order.cancelled_by || '';
+      const cancelDescription = order.cancel_detail?.description || order.cancel_detail?.reason ||
         order.cancellation?.reason || order.status_detail || order.reason || '';
+      const cancellationReason = cancelActor
+        ? `${String(cancelActor).toLowerCase()}|${cancelDescription}`
+        : cancelDescription;
       const payments = Array.isArray(order.payments) ? order.payments : [];
       const saleFeeParts = [
         ...(orderItems || []).map(x => x.sale_fee).filter(v => v !== undefined && v !== null),
@@ -2477,7 +2485,9 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       const finalSaleFee = officialFinance ? officialFinance.saleFee : saleFee;
       const finalShippingFee = officialFinance ? officialFinance.shippingFee : shippingFee;
       const otherFee = officialFinance ? officialFinance.otherFee : null;
-      const finalNetAmount = officialFinance ? officialFinance.netAmount : null;
+      const finalNetAmount = order.status === 'cancelled'
+        ? 0
+        : (officialFinance ? officialFinance.netAmount : null);
       const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1', [String(order.id)]);
       await pool.query(`
         INSERT INTO ml_orders
