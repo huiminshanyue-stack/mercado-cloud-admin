@@ -2965,9 +2965,16 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
     res.json({ code: 0, data: mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id) });
   } catch (e) {
     const platformMessage = e.response?.data?.message || e.message;
-    const message = /Cannot update item .*status:under_review/i.test(String(platformMessage))
-      ? '美客多平台规定审核期间禁止更新商品，因此图片、重量、尺寸、标题等内容都无法保存。'
-      : platformMessage;
+    const platformCauses = Array.isArray(e.response?.data?.cause) ? e.response.data.cause : [];
+    const causeDetails = platformCauses.map(cause => cause?.message || cause?.code).filter(Boolean).join('；');
+    let message = platformMessage;
+    if (/Cannot update item .*status:under_review/i.test(String(platformMessage))) {
+      message = '美客多平台规定审核期间禁止更新商品，因此图片、重量、尺寸、标题等内容都无法保存。';
+    } else if (/validation error/i.test(String(platformMessage))) {
+      message = causeDetails
+        ? `美客多数据校验失败：${causeDetails}`
+        : '美客多数据校验失败：提交的商品资料不符合平台规则，请检查标题、图片、包装尺寸和重量。';
+    }
     res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message });
   }
 });
