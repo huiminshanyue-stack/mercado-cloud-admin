@@ -2952,7 +2952,8 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
       update.shipping = { dimensions: `${height}x${width}x${length},${weight}` };
     }
     if (!Object.keys(update).length && req.body?.description === undefined) return res.status(400).json({ code: 400, message: '没有可更新的商品字段' });
-    if (Object.keys(update).length) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, update, {
+    const itemResource = itemId.startsWith('CBT') ? 'marketplace/items' : 'items';
+    if (Object.keys(update).length) await axios.put(`https://api.mercadolibre.com/${itemResource}/${encodeURIComponent(itemId)}`, update, {
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000
     });
     if (req.body?.description !== undefined) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/description?api_version=2`, {
