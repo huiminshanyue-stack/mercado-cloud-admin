@@ -285,31 +285,6 @@ async function initOrderManagementTables() {
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS ml_store_products (
-    id BIGSERIAL PRIMARY KEY,
-    owner_username VARCHAR(120) NOT NULL,
-    store_user_id VARCHAR(80) NOT NULL,
-    item_id VARCHAR(80) NOT NULL,
-    title TEXT,
-    status VARCHAR(50),
-    price NUMERIC(18,2),
-    currency VARCHAR(10),
-    available_quantity INTEGER,
-    sold_quantity INTEGER,
-    thumbnail TEXT,
-    permalink TEXT,
-    category_id VARCHAR(80),
-    listing_type_id VARCHAR(80),
-    condition VARCHAR(30),
-    health NUMERIC(8,4),
-    raw_data JSONB NOT NULL DEFAULT '{}'::jsonb,
-    ml_updated_at TIMESTAMPTZ,
-    last_synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(owner_username,item_id)
-  )`);
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_store_products_owner_store ON ml_store_products(owner_username,store_user_id,status)');
-  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_store_products_updated ON ml_store_products(last_synced_at DESC)');
-  await pool.query('ALTER TABLE ml_store_products ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT FALSE');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_alerts (
     id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
     title VARCHAR(300) NOT NULL, content TEXT, is_read BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1564,7 +1539,7 @@ async function findScopedStoreAuthorization(authUser, storeUserId) {
   return rows[0] || null;
 }
 
-app.post('/api/store-products/oauth-link', requireAuth, async (req, res) => {
+app.post('/api/marketing/oauth-link', requireAuth, async (req, res) => {
   if (!ML_CLIENT_ID || !ML_CLIENT_SECRET) return res.status(503).json({ code: 503, message: 'Mercado Libre OAuth 尚未配置' });
   const state = crypto.randomBytes(32).toString('hex');
   await pool.query('DELETE FROM ml_oauth_states WHERE expires_at<NOW()');
@@ -2746,320 +2721,58 @@ async function ensureLegacyStoreAuthorization(authUser) {
   });
 }
 
-function mapStoreProduct(item, ownerUsername, storeUserId) {
-  return {
-    ownerUsername,
-    storeUserId,
-    itemId: String(item.id || ''),
-    title: item.title || '', status: item.status || '', price: Number(item.price || 0),
-    currency: item.currency_id || '', availableQuantity: Number(item.available_quantity || 0),
-    soldQuantity: Number(item.sold_quantity || 0), thumbnail: item.thumbnail || item.pictures?.[0]?.secure_url || item.pictures?.[0]?.url || '',
-    permalink: item.permalink || '', categoryId: item.category_id || '', listingTypeId: item.listing_type_id || '',
-    condition: item.condition || '', health: item.health == null ? null : Number(item.health),
-    mlUpdatedAt: item.last_updated || item.date_created || null, rawData: item
-  };
-}
-
-async function upsertStoreProduct(product) {
-  await pool.query(`INSERT INTO ml_store_products
-    (owner_username,store_user_id,item_id,title,status,price,currency,available_quantity,sold_quantity,thumbnail,permalink,category_id,listing_type_id,condition,health,raw_data,ml_updated_at,last_synced_at)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
-    ON CONFLICT(owner_username,item_id) DO UPDATE SET
-      store_user_id=EXCLUDED.store_user_id,title=EXCLUDED.title,status=EXCLUDED.status,price=EXCLUDED.price,
-      currency=EXCLUDED.currency,available_quantity=EXCLUDED.available_quantity,sold_quantity=EXCLUDED.sold_quantity,
-      thumbnail=EXCLUDED.thumbnail,permalink=EXCLUDED.permalink,category_id=EXCLUDED.category_id,
-      listing_type_id=EXCLUDED.listing_type_id,condition=EXCLUDED.condition,health=EXCLUDED.health,
-      raw_data=EXCLUDED.raw_data,ml_updated_at=EXCLUDED.ml_updated_at,last_synced_at=NOW()`, [
-    product.ownerUsername, product.storeUserId, product.itemId, product.title, product.status, product.price,
-    product.currency, product.availableQuantity, product.soldQuantity, product.thumbnail, product.permalink,
-    product.categoryId, product.listingTypeId, product.condition, product.health, product.rawData,
-    product.mlUpdatedAt
-  ]);
-}
-
-app.get('/api/store-products/stores', requireAuth, async (req, res) => {
+app.get('/api/marketing/accounts', requireAuth, async (req, res) => {
   await ensureLegacyStoreAuthorization(req.authUser);
-  const params = [], where = ['a.enabled=TRUE'];
-  if (req.authUser.role !== 'admin') { params.push(req.authUser.username); where.push(`a.owner_username=$${params.length}`); }
-  const { rows } = await pool.query(`SELECT a.ml_user_id AS id,a.owner_username AS owner,a.nickname,a.site_id AS "siteId",a.updated_at AS "authorizedAt",COUNT(p.id)::int AS "productCount",MAX(p.last_synced_at) AS "lastSyncedAt" FROM ml_store_authorizations a LEFT JOIN ml_store_products p ON p.owner_username=a.owner_username AND p.store_user_id=a.ml_user_id WHERE ${where.join(' AND ')} GROUP BY a.ml_user_id,a.owner_username,a.nickname,a.site_id,a.updated_at ORDER BY a.updated_at DESC`, params);
+  const params = [], where = ['enabled=TRUE'];
+  if (req.authUser.role !== 'admin') { params.push(req.authUser.username); where.push(`owner_username=$${params.length}`); }
+  const { rows } = await pool.query(`SELECT ml_user_id AS id,nickname,site_id AS "siteId",updated_at AS "authorizedAt"
+    FROM ml_store_authorizations WHERE ${where.join(' AND ')} ORDER BY updated_at DESC`, params);
   res.json({ code: 0, data: rows });
 });
 
-const activeStoreSyncs = new Set();
-app.post('/api/store-products/sync', requireAuth, async (req, res) => {
-  let syncKey = '';
+app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
   try {
-    let auth = await findScopedStoreAuthorization(req.authUser, req.body?.storeId);
+    let auth = await findScopedStoreAuthorization(req.authUser, req.query.storeId);
     if (!auth) auth = await ensureLegacyStoreAuthorization(req.authUser);
-    if (!auth || (req.body?.storeId && String(auth.ml_user_id) !== String(req.body.storeId))) return res.status(404).json({ code: 404, message: '未找到该用户可访问的授权店铺' });
-    syncKey = `${auth.owner_username}:${auth.ml_user_id}`;
-    if (activeStoreSyncs.has(syncKey)) return res.status(409).json({ code: 409, message: '该店铺正在同步中，请勿重复提交' });
-    activeStoreSyncs.add(syncKey);
+    if (!auth) return res.status(404).json({ code: 404, message: '未找到已授权的美客多账号' });
     const token = await getStoreAuthorizationToken(auth);
-    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
-    const ids = [];
-    let scrollId = '', rounds = 0;
-    do {
-      const response = await axios.get(`https://api.mercadolibre.com/users/${auth.ml_user_id}/items/search`, {
-        params: scrollId ? { search_type: 'scan', scroll_id: scrollId, limit: 100 } : { search_type: 'scan', limit: 100 },
-        headers: { Authorization: `Bearer ${token}` }, timeout: 25000
-      });
-      const batch = response.data?.results || [];
-      ids.push(...batch.map(String));
-      scrollId = response.data?.scroll_id || '';
-      rounds++;
-      if (!batch.length || !scrollId || rounds >= 100) break;
-    } while (true);
-    let synced = 0, failed = 0;
-    for (let i = 0; i < ids.length; i += 4) {
-      const batch = await Promise.all(ids.slice(i, i + 4).map(async itemId => {
-        try {
-          const response = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
-            headers: { Authorization: `Bearer ${token}` }, timeout: 15000
-          });
-          await upsertStoreProduct(mapStoreProduct(response.data || {}, auth.owner_username, auth.ml_user_id));
-          return true;
-        } catch (error) { console.warn('[StoreProducts] 商品同步失败:', itemId, error.response?.status || error.message); return false; }
-      }));
-      synced += batch.filter(Boolean).length; failed += batch.filter(value => !value).length;
-    }
-    res.json({ code: 0, data: { discovered: ids.length, synced, failed, storeId: auth.ml_user_id } });
-  } catch (e) {
-    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
-  } finally {
-    if (syncKey) activeStoreSyncs.delete(syncKey);
-  }
-});
-
-app.get('/api/store-products', requireAuth, async (req, res) => {
-  const page = Math.max(1, Number(req.query.page || 1)), size = Math.min(100, Math.max(10, Number(req.query.size || 20)));
-  const params = [], where = [];
-  if (req.authUser.role !== 'admin') { params.push(req.authUser.username); where.push(`p.owner_username=$${params.length}`); }
-  if (req.query.owner && req.authUser.role === 'admin') { params.push(String(req.query.owner)); where.push(`p.owner_username=$${params.length}`); }
-  if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`p.store_user_id=$${params.length}`); }
-  if (req.query.status) { params.push(String(req.query.status)); where.push(`p.status=$${params.length}`); }
-  if (req.query.keyword) { params.push(`%${String(req.query.keyword).trim()}%`); where.push(`(p.title ILIKE $${params.length} OR p.item_id ILIKE $${params.length})`); }
-  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const count = await pool.query(`SELECT COUNT(*)::int AS total,COUNT(*) FILTER(WHERE status='active')::int AS active,COUNT(*) FILTER(WHERE status='paused')::int AS paused,COUNT(*) FILTER(WHERE status='closed')::int AS closed FROM ml_store_products p ${clause}`, params);
-  const listParams = [...params, size, (page - 1) * size];
-  const { rows } = await pool.query(`SELECT p.item_id AS "itemId",p.owner_username AS owner,p.store_user_id AS "storeId",COALESCE(NULLIF(a.nickname,''),p.store_user_id) AS "storeName",p.title,p.status,p.price,p.currency,p.available_quantity AS "availableQuantity",p.sold_quantity AS "soldQuantity",p.thumbnail,p.permalink,p.category_id AS "categoryId",p.listing_type_id AS "listingTypeId",p.condition,p.health,p.ignored,p.raw_data->'variations' AS variations,p.ml_updated_at AS "mlUpdatedAt",p.last_synced_at AS "lastSyncedAt" FROM ml_store_products p LEFT JOIN ml_store_authorizations a ON a.owner_username=p.owner_username AND a.ml_user_id=p.store_user_id ${clause} ORDER BY p.ml_updated_at DESC NULLS LAST,p.item_id LIMIT $${listParams.length-1} OFFSET $${listParams.length}`, listParams);
-  res.json({ code: 0, data: { items: rows, page, size, ...count.rows[0] } });
-});
-
-async function findScopedStoreProduct(authUser, itemId) {
-  const params = [String(itemId)];
-  let where = 'item_id=$1';
-  if (authUser.role !== 'admin') {
-    params.push(authUser.username);
-    where += ` AND owner_username=$${params.length}`;
-  }
-  const { rows } = await pool.query(`SELECT * FROM ml_store_products WHERE ${where} ORDER BY last_synced_at DESC LIMIT 1`, params);
-  return rows[0] || null;
-}
-
-function extractPackageDimensions(item, cachedItem = {}) {
-  const result = { length: null, width: null, height: null, weight: null, source: '' };
-  const sources = [item, cachedItem].filter(Boolean);
-  for (const source of sources) {
-    const raw = source?.shipping?.dimensions;
-    if (typeof raw === 'string') {
-      const match = raw.match(/^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?),(\d+(?:\.\d+)?)$/);
-      if (match) {
-        result.height = Number(match[1]); result.width = Number(match[2]);
-        result.length = Number(match[3]); result.weight = Number(match[4]); result.source = 'shipping.dimensions';
-        return result;
-      }
-    } else if (raw && typeof raw === 'object') {
-      result.height = Number(raw.height || raw.height_cm) || null;
-      result.width = Number(raw.width || raw.width_cm) || null;
-      result.length = Number(raw.length || raw.length_cm) || null;
-      result.weight = Number(raw.weight || raw.weight_g) || null;
-      if (result.length && result.width && result.height && result.weight) { result.source = 'shipping.dimensions'; return result; }
-    }
-  }
-  const attributes = sources.flatMap(source => [source?.attributes, source?.sale_terms]).filter(Array.isArray).flat();
-  const parseMeasure = (patterns, type) => {
-    const attribute = attributes.find(entry => patterns.some(pattern => pattern.test(String(entry?.id || '').toUpperCase())));
-    if (!attribute) return null;
-    const rawValue = attribute.value_struct?.number ?? attribute.value_name ?? attribute.value ?? attribute.values?.[0]?.name;
-    const number = Number(String(rawValue ?? '').replace(',', '.').match(/\d+(?:\.\d+)?/)?.[0]);
-    if (!(number > 0)) return null;
-    const unit = String(attribute.value_struct?.unit || attribute.value_name || '').toLowerCase();
-    if (type === 'weight') return unit.includes('kg') ? Math.round(number * 1000) : Math.round(number);
-    if (unit.includes('mm')) return Number((number / 10).toFixed(1));
-    if (unit.includes(' m') && !unit.includes('cm')) return Number((number * 100).toFixed(1));
-    return number;
-  };
-  result.length = parseMeasure([/SELLER_PACKAGE_LENGTH/,/PACKAGE_LENGTH/,/^LENGTH$/], 'dimension');
-  result.width = parseMeasure([/SELLER_PACKAGE_WIDTH/,/PACKAGE_WIDTH/,/^WIDTH$/], 'dimension');
-  result.height = parseMeasure([/SELLER_PACKAGE_HEIGHT/,/PACKAGE_HEIGHT/,/^HEIGHT$/], 'dimension');
-  result.weight = parseMeasure([/SELLER_PACKAGE_WEIGHT/,/PACKAGE_WEIGHT/,/^WEIGHT$/], 'weight');
-  if (result.length || result.width || result.height || result.weight) result.source = 'SELLER_PACKAGE attributes';
-  return result;
-}
-
-app.get('/api/store-products/:itemId/detail', requireAuth, async (req, res) => {
-  try {
-    const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
-    if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
-    const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
-    const token = await getStoreAuthorizationToken(auth);
-    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
-    const [itemResponse, marketplaceResponse, descriptionResponse] = await Promise.all([
-      axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }),
-      String(product.item_id).startsWith('CBT')
-        ? axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(product.item_id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }).catch(() => null)
-        : Promise.resolve(null),
-      axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}/description`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }).catch(() => ({ data: {} }))
+    if (!token) return res.status(401).json({ code: 401, message: '账号授权已失效，请重新授权' });
+    const headers = { Authorization: `Bearer ${token}` };
+    const [promotionResponse, advertiserResponse] = await Promise.all([
+      axios.get(`https://api.mercadolibre.com/seller-promotions/users/${encodeURIComponent(auth.ml_user_id)}`, {
+        params: { app_version: 'v2' }, headers, timeout: 20000
+      }).catch(error => error.response || { status: 500, data: { message: error.message } }),
+      axios.get('https://api.mercadolibre.com/advertising/advertisers', {
+        params: { product_id: 'PADS', type: 'SELLER' }, headers: { ...headers, 'api-version': '1' }, timeout: 20000
+      }).catch(error => error.response || { status: 500, data: { message: error.message } })
     ]);
-    const marketplaceData = marketplaceResponse?.data?.body || marketplaceResponse?.data || {};
-    const itemData = { ...itemResponse.data, ...marketplaceData };
+    const advertisers = advertiserResponse.status === 200 && Array.isArray(advertiserResponse.data?.advertisers)
+      ? advertiserResponse.data.advertisers.map(advertiser => ({
+          advertiserId: advertiser.advertiser_id,
+          siteId: advertiser.site_id,
+          advertiserName: advertiser.advertiser_name,
+          accountName: advertiser.account_name
+        }))
+      : [];
+    const promotionsSupported = promotionResponse.status === 200;
     res.json({ code: 0, data: {
-      ...itemData,
-      description: descriptionResponse.data?.plain_text || '',
-      packageDimensions: extractPackageDimensions(itemData, product.raw_data || {})
+      account: { id: auth.ml_user_id, nickname: auth.nickname, siteId: auth.site_id },
+      promotions: {
+        supported: promotionsSupported,
+        status: promotionResponse.status,
+        message: promotionsSupported ? '促销活动接口可用' : (promotionResponse.data?.message || '当前账号不支持促销活动接口'),
+        items: promotionsSupported ? (promotionResponse.data?.results || promotionResponse.data || []) : []
+      },
+      productAds: {
+        supported: advertiserResponse.status === 200,
+        status: advertiserResponse.status,
+        message: advertiserResponse.status === 200 ? `已读取 ${advertisers.length} 个广告账户` : (advertiserResponse.data?.message || '广告接口不可用'),
+        advertisers
+      }
     } });
-  } catch (e) {
-    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ code: error.response?.status || 500, message: error.response?.data?.message || error.message });
   }
-});
-
-app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
-  try {
-    const itemId = String(req.params.itemId);
-    const product = await findScopedStoreProduct(req.authUser, itemId);
-    if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
-    if (product.status === 'under_review') {
-      return res.status(409).json({ code: 409, message: '美客多平台规定审核期间禁止更新商品，因此图片、重量、尺寸、标题等内容都无法保存。' });
-    }
-    const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
-    const token = await getStoreAuthorizationToken(auth);
-    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
-    if (itemId.startsWith('CBT')) {
-      return res.status(403).json({ code: 403, message: '当前 CBT 授权经接口实测不支持商品写操作；价格、库存、状态及商品资料均不可修改，仅支持同步和查看' });
-    }
-    const update = {};
-    if (req.body?.price !== undefined) {
-      const price = Number(req.body.price); if (!(price > 0)) return res.status(400).json({ code: 400, message: '价格必须大于0' }); update.price = price;
-    }
-    if (req.body?.availableQuantity !== undefined) {
-      const quantity = Number(req.body.availableQuantity); if (!Number.isInteger(quantity) || quantity < 0) return res.status(400).json({ code: 400, message: '库存必须是大于等于0的整数' }); update.available_quantity = quantity;
-    }
-    if (req.body?.status !== undefined) {
-      const status = String(req.body.status); if (!['active','paused','closed'].includes(status)) return res.status(400).json({ code: 400, message: '仅支持上架、暂停或关闭商品' }); update.status = status;
-    }
-    if (req.body?.title !== undefined) update.title = String(req.body.title || '').trim().slice(0, 255);
-    if (req.body?.pictures !== undefined) {
-      if (!Array.isArray(req.body.pictures) || !req.body.pictures.length) return res.status(400).json({ code: 400, message: '至少保留一张商品图片' });
-      update.pictures = req.body.pictures.slice(0, 12).map(source => ({ source: String(source).trim() })).filter(picture => picture.source);
-    }
-    if (req.body?.variations !== undefined) {
-      if (!Array.isArray(req.body.variations)) return res.status(400).json({ code: 400, message: '变体数据格式不正确' });
-      update.variations = req.body.variations;
-    }
-    if (req.body?.packageDimensions !== undefined) {
-      const dimensions = req.body.packageDimensions || {};
-      const height = Math.round(Number(dimensions.height));
-      const width = Math.round(Number(dimensions.width));
-      const length = Math.round(Number(dimensions.length));
-      const weight = Math.round(Number(dimensions.weight));
-      if (![height, width, length, weight].every(value => Number.isInteger(value) && value > 0)) {
-        return res.status(400).json({ code: 400, message: '包装长宽高和重量必须是大于 0 的整数；尺寸单位为 cm，重量单位为 g' });
-      }
-      update.shipping = { dimensions: `${height}x${width}x${length},${weight}` };
-    }
-    if (!Object.keys(update).length && req.body?.description === undefined) return res.status(400).json({ code: 400, message: '没有可更新的商品字段' });
-    const requestHeaders = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
-    if (itemId.startsWith('CBT')) {
-      const unsupported = ['price', 'title', 'description', 'pictures', 'variations', 'packageDimensions'].filter(field => req.body?.[field] !== undefined);
-      if (unsupported.length) return res.status(400).json({ code: 400, message: `CBT 主商品不支持修改：${unsupported.join('、')}；当前仅允许库存和上架/暂停同步到国家站点商品` });
-      const childUpdate = {};
-      if (update.available_quantity !== undefined) childUpdate.available_quantity = update.available_quantity;
-      if (update.status !== undefined) childUpdate.status = update.status;
-      if (!Object.keys(childUpdate).length) return res.status(400).json({ code: 400, message: '该 CBT 商品没有可同步的字段' });
-      const marketplaceResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: requestHeaders, timeout: 20000 });
-      const marketplaceData = marketplaceResponse.data?.body || marketplaceResponse.data || {};
-      const children = Array.isArray(marketplaceData.marketplace_items) ? marketplaceData.marketplace_items : [];
-      if (!children.length) return res.status(409).json({ code: 409, message: '该 CBT 商品尚未生成可操作的国家站点商品' });
-      const results = [];
-      for (const child of children) {
-        try {
-          await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(child.item_id)}`, childUpdate, { headers: requestHeaders, timeout: 20000 });
-          results.push({ itemId: child.item_id, siteId: child.site_id, success: true });
-        } catch (error) {
-          results.push({ itemId: child.item_id, siteId: child.site_id, success: false, message: error.response?.data?.message || error.message });
-        }
-      }
-      const failed = results.filter(result => !result.success);
-      if (failed.length) return res.status(409).json({ code: 409, message: `部分站点更新失败：${failed.map(result => `${result.siteId} ${result.message}`).join('；')}`, data: results });
-    } else if (Object.keys(update).length) {
-      await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, update, { headers: requestHeaders, timeout: 20000 });
-    }
-    if (!itemId.startsWith('CBT') && req.body?.description !== undefined) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/description?api_version=2`, {
-      plain_text: String(req.body.description || '').slice(0, 50000)
-    }, { headers: requestHeaders, timeout: 20000 });
-    const fresh = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
-      headers: { Authorization: `Bearer ${token}` }, timeout: 15000
-    });
-    await upsertStoreProduct(mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id));
-    res.json({ code: 0, data: mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id) });
-  } catch (e) {
-    const platformMessage = e.response?.data?.message || e.message;
-    const platformCauses = Array.isArray(e.response?.data?.cause) ? e.response.data.cause : [];
-    const causeDetails = platformCauses.map(cause => cause?.message || cause?.code).filter(Boolean).join('；');
-    let message = platformMessage;
-    if (/Cannot update item .*status:under_review/i.test(String(platformMessage))) {
-      message = '美客多平台规定审核期间禁止更新商品，因此图片、重量、尺寸、标题等内容都无法保存。';
-    } else if (/validation error/i.test(String(platformMessage))) {
-      message = causeDetails
-        ? `美客多数据校验失败：${causeDetails}`
-        : '美客多数据校验失败：提交的商品资料不符合平台规则，请检查标题、图片、包装尺寸和重量。';
-    }
-    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message });
-  }
-});
-
-app.post('/api/store-products/:itemId/relist', requireAuth, async (req, res) => {
-  try {
-    const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
-    if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
-    const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
-    const token = await getStoreAuthorizationToken(auth);
-    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
-    if (product.status !== 'closed') return res.status(400).json({ code: 400, message: '只有已关闭且关闭未超过 60 天的商品可以重新发布' });
-    const raw = product.raw_data || {};
-    const relistBody = { listing_type_id: product.listing_type_id || raw.listing_type_id };
-    if (Array.isArray(raw.variations) && raw.variations.length) {
-      relistBody.variations = raw.variations.map(variation => ({
-        id: variation.id,
-        price: Number(variation.price || product.price),
-        quantity: Math.max(0, Number(variation.available_quantity || 0))
-      }));
-    } else {
-      relistBody.price = Number(product.price);
-      relistBody.quantity = Math.max(1, Number(product.available_quantity || 1));
-    }
-    const response = await axios.post(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}/relist`, relistBody, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
-    const fresh = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(response.data?.id || product.item_id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
-    await upsertStoreProduct(mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id));
-    res.json({ code: 0, data: response.data });
-  } catch (e) {
-    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
-  }
-});
-
-app.patch('/api/store-products/:itemId/local', requireAuth, async (req, res) => {
-  const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
-  if (!product) return res.status(404).json({ code: 404, message: '商品不存在' });
-  await pool.query('UPDATE ml_store_products SET ignored=$1 WHERE id=$2', [Boolean(req.body?.ignored), product.id]);
-  res.json({ code: 0 });
-});
-
-app.delete('/api/store-products/:itemId/local', requireAuth, async (req, res) => {
-  const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
-  if (!product) return res.status(404).json({ code: 404, message: '商品不存在' });
-  await pool.query('DELETE FROM ml_store_products WHERE id=$1', [product.id]);
-  res.json({ code: 0 });
 });
 
 app.patch('/api/admin/order-stores/:id', requireAdmin, async (req, res) => {
