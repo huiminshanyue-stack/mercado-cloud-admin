@@ -2887,10 +2887,16 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
       if (!Array.isArray(req.body.variations)) return res.status(400).json({ code: 400, message: '变体数据格式不正确' });
       update.variations = req.body.variations;
     }
-    if (req.body?.weight !== undefined) {
-      const weight = String(req.body.weight || '').trim();
-      if (!/^\d+(?:\.\d+)?\s*(?:g|kg)$/i.test(weight)) return res.status(400).json({ code: 400, message: '重量格式示例：500 g 或 1.2 kg' });
-      update.attributes = [{ id: 'PACKAGE_WEIGHT', value_name: weight }];
+    if (req.body?.packageDimensions !== undefined) {
+      const dimensions = req.body.packageDimensions || {};
+      const height = Math.round(Number(dimensions.height));
+      const width = Math.round(Number(dimensions.width));
+      const length = Math.round(Number(dimensions.length));
+      const weight = Math.round(Number(dimensions.weight));
+      if (![height, width, length, weight].every(value => Number.isInteger(value) && value > 0)) {
+        return res.status(400).json({ code: 400, message: '包装长宽高和重量必须是大于 0 的整数；尺寸单位为 cm，重量单位为 g' });
+      }
+      update.shipping = { dimensions: `${height}x${width}x${length},${weight}` };
     }
     if (!Object.keys(update).length && req.body?.description === undefined) return res.status(400).json({ code: 400, message: '没有可更新的商品字段' });
     if (Object.keys(update).length) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, update, {
