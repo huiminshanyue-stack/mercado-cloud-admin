@@ -2298,7 +2298,7 @@ async function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
-    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
     const group = groups.get(groupId);
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
@@ -2327,13 +2327,21 @@ async function aggregatePackedOrders(rows) {
         group._billingEntryIds.add(entryId); group._officialEntryCount++;
         if (fxRate === null) { group.billingCurrencyMismatch = true; continue; }
         const normalizedAmount = Math.abs(Number(entry.detail_amount || 0)) * fxRate;
+        const normalizedSignedAmount = Number(entry.detail_amount || 0) * fxRate;
         group._officialFees[classified.key] += normalizedAmount;
-        group.billingBreakdown.push({ id: entryId, category, description, subType, amount: normalizedAmount, originalAmount: Number(entry.detail_amount || 0), originalCurrency: entryCurrency, type: entry.detail_type || '' });
+        group._officialSignedFees[classified.key] += normalizedSignedAmount;
+        group.billingBreakdown.push({ id: entryId, category, description, subType, amount: normalizedAmount, signedAmount: normalizedSignedAmount, originalAmount: Number(entry.detail_amount || 0), originalCurrency: entryCurrency, type: entry.detail_type || '' });
       }
     }
   }
   for (const group of groups.values()) {
     if (group._officialEntryCount) for (const field of Object.keys(group._officialFees)) group[field] = group._officialFees[field];
+    if (group._officialEntryCount) {
+      for (const field of Object.keys(group._officialSignedFees)) {
+        group[`${field}Signed`] = Number(group._officialSignedFees[field].toFixed(2));
+      }
+      group.otherFeeSigned = group.cancellationFeeSigned;
+    }
     for (const field of ['saleFee','shippingFee','paymentFee','transferFee','cancellationFee','taxFee','adjustmentFee','bonusAmount']) group[field] = Number(group[field].toFixed(2));
     if (group._officialEntryCount) group.otherFee = group.cancellationFee;
     const totalCharges = group.saleFee + group.shippingFee + group.paymentFee + group.transferFee + group.cancellationFee + group.taxFee + group.adjustmentFee;
@@ -2342,7 +2350,7 @@ async function aggregatePackedOrders(rows) {
       : (group.financeIsOfficial && !group.billingCurrencyMismatch
         ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2)))
         : (group._hasFallbackNetAmount ? Math.max(0, Number(group._fallbackNetAmount.toFixed(2))) : null));
-    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees;
+    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees; delete group._officialSignedFees;
   }
   return [...groups.values()];
 }
