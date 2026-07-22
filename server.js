@@ -2916,7 +2916,7 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
     const product = await findScopedStoreProduct(req.authUser, itemId);
     if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
     if (product.status === 'under_review') {
-      return res.status(409).json({ code: 409, message: '该商品正在美客多审核中，平台暂时禁止修改；请等待审核完成后再更新' });
+      return res.status(409).json({ code: 409, message: '美客多平台规定审核期间禁止更新商品，因此图片、重量、尺寸、标题等内容都无法保存。' });
     }
     const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
     const token = await getStoreAuthorizationToken(auth);
@@ -2966,7 +2966,7 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
   } catch (e) {
     const platformMessage = e.response?.data?.message || e.message;
     const message = /Cannot update item .*status:under_review/i.test(String(platformMessage))
-      ? '该商品正在美客多审核中，平台暂时禁止修改；请等待审核完成后再更新'
+      ? '美客多平台规定审核期间禁止更新商品，因此图片、重量、尺寸、标题等内容都无法保存。'
       : platformMessage;
     res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message });
   }
