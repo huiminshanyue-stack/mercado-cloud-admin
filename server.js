@@ -2303,6 +2303,10 @@ async function aggregatePackedOrders(rows) {
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
     group.items.push(...(Array.isArray(row.items) ? row.items : []));
+    if (row.reputationImpact === true) group.reputationImpact = true;
+    if (row.reputationReason && !String(group.reputationReason || '').includes(row.reputationReason)) {
+      group.reputationReason = [group.reputationReason, row.reputationReason].filter(Boolean).join('；');
+    }
     for (const field of ['paidAmount','totalAmount','saleFee','shippingFee','otherFee','refundAmount','productCost']) group[field] += Number(row[field] || 0);
     if (row.netAmount !== null && row.netAmount !== undefined) {
       group._fallbackNetAmount += Number(row.netAmount || 0);
@@ -2341,6 +2345,27 @@ async function aggregatePackedOrders(rows) {
     delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees;
   }
   return [...groups.values()];
+}
+
+function extractReputationInfo(rawData) {
+  const raw = rawData && typeof rawData === 'object' ? rawData : {};
+  const values = [
+    raw.affects_reputation,
+    raw.reputation_affected,
+    raw.reputation?.affected,
+    raw.reputation?.affects,
+    raw.feedback?.affects_reputation,
+    raw.feedback?.sale?.affects_reputation
+  ];
+  const explicit = values.find(value => typeof value === 'boolean');
+  const rating = String(raw.feedback?.sale?.rating || raw.feedback?.rating || '').toLowerCase();
+  const impact = explicit === true || ['negative', 'neutral'].includes(rating)
+    ? true
+    : (explicit === false ? false : null);
+  const reason = raw.reputation?.reason || raw.reputation_reason ||
+    raw.feedback?.sale?.reason || raw.feedback?.reason ||
+    (rating === 'negative' ? 'negative_feedback' : (rating === 'neutral' ? 'neutral_feedback' : ''));
+  return { impact, reason: String(reason || '') };
 }
 
 app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
@@ -2553,10 +2578,16 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(DISTINCT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))::int AS total FROM ml_orders o ${clause}`, params);
   params.push(size, (page - 1) * size);
-  const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
+  const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
   const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId)]) : { rows: [] };
   const financeMap = new Map(financeRows.rows.map(row => [row.ml_order_id, row.billing_data]));
-  for (const row of rows.rows) row.billingData = financeMap.get(row.orderId) || {};
+  for (const row of rows.rows) {
+    row.billingData = financeMap.get(row.orderId) || {};
+    const reputation = extractReputationInfo(row.rawData);
+    row.reputationImpact = reputation.impact;
+    row.reputationReason = reputation.reason;
+    delete row.rawData;
+  }
   const packedRows = await aggregatePackedOrders(rows.rows);
   res.json({ code: 0, data: { items: packedRows, total: count.rows[0].total, page, size } });
 });
