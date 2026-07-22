@@ -2843,6 +2843,47 @@ async function findScopedStoreProduct(authUser, itemId) {
   return rows[0] || null;
 }
 
+function extractPackageDimensions(item, cachedItem = {}) {
+  const result = { length: null, width: null, height: null, weight: null, source: '' };
+  const sources = [item, cachedItem].filter(Boolean);
+  for (const source of sources) {
+    const raw = source?.shipping?.dimensions;
+    if (typeof raw === 'string') {
+      const match = raw.match(/^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?),(\d+(?:\.\d+)?)$/);
+      if (match) {
+        result.height = Number(match[1]); result.width = Number(match[2]);
+        result.length = Number(match[3]); result.weight = Number(match[4]); result.source = 'shipping.dimensions';
+        return result;
+      }
+    } else if (raw && typeof raw === 'object') {
+      result.height = Number(raw.height || raw.height_cm) || null;
+      result.width = Number(raw.width || raw.width_cm) || null;
+      result.length = Number(raw.length || raw.length_cm) || null;
+      result.weight = Number(raw.weight || raw.weight_g) || null;
+      if (result.length && result.width && result.height && result.weight) { result.source = 'shipping.dimensions'; return result; }
+    }
+  }
+  const attributes = sources.flatMap(source => [source?.attributes, source?.sale_terms]).filter(Array.isArray).flat();
+  const parseMeasure = (patterns, type) => {
+    const attribute = attributes.find(entry => patterns.some(pattern => pattern.test(String(entry?.id || '').toUpperCase())));
+    if (!attribute) return null;
+    const rawValue = attribute.value_struct?.number ?? attribute.value_name ?? attribute.value ?? attribute.values?.[0]?.name;
+    const number = Number(String(rawValue ?? '').replace(',', '.').match(/\d+(?:\.\d+)?/)?.[0]);
+    if (!(number > 0)) return null;
+    const unit = String(attribute.value_struct?.unit || attribute.value_name || '').toLowerCase();
+    if (type === 'weight') return unit.includes('kg') ? Math.round(number * 1000) : Math.round(number);
+    if (unit.includes('mm')) return Number((number / 10).toFixed(1));
+    if (unit.includes(' m') && !unit.includes('cm')) return Number((number * 100).toFixed(1));
+    return number;
+  };
+  result.length = parseMeasure([/SELLER_PACKAGE_LENGTH/,/PACKAGE_LENGTH/,/^LENGTH$/], 'dimension');
+  result.width = parseMeasure([/SELLER_PACKAGE_WIDTH/,/PACKAGE_WIDTH/,/^WIDTH$/], 'dimension');
+  result.height = parseMeasure([/SELLER_PACKAGE_HEIGHT/,/PACKAGE_HEIGHT/,/^HEIGHT$/], 'dimension');
+  result.weight = parseMeasure([/SELLER_PACKAGE_WEIGHT/,/PACKAGE_WEIGHT/,/^WEIGHT$/], 'weight');
+  if (result.length || result.width || result.height || result.weight) result.source = 'SELLER_PACKAGE attributes';
+  return result;
+}
+
 app.get('/api/store-products/:itemId/detail', requireAuth, async (req, res) => {
   try {
     const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
@@ -2850,11 +2891,20 @@ app.get('/api/store-products/:itemId/detail', requireAuth, async (req, res) => {
     const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
     const token = await getStoreAuthorizationToken(auth);
     if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
-    const [itemResponse, descriptionResponse] = await Promise.all([
+    const [itemResponse, marketplaceResponse, descriptionResponse] = await Promise.all([
       axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }),
+      String(product.item_id).startsWith('CBT')
+        ? axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(product.item_id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }).catch(() => null)
+        : Promise.resolve(null),
       axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}/description`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }).catch(() => ({ data: {} }))
     ]);
-    res.json({ code: 0, data: { ...itemResponse.data, description: descriptionResponse.data?.plain_text || '' } });
+    const marketplaceData = marketplaceResponse?.data?.body || marketplaceResponse?.data || {};
+    const itemData = { ...itemResponse.data, ...marketplaceData };
+    res.json({ code: 0, data: {
+      ...itemData,
+      description: descriptionResponse.data?.plain_text || '',
+      packageDimensions: extractPackageDimensions(itemData, product.raw_data || {})
+    } });
   } catch (e) {
     res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
   }
