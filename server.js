@@ -259,6 +259,51 @@ async function initOrderManagementTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_store ON ml_orders(store_user_id, date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_buyer ON ml_orders(buyer_nickname, date_created DESC)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
+  await pool.query(`CREATE TABLE IF NOT EXISTS ml_store_authorizations (
+    id BIGSERIAL PRIMARY KEY,
+    owner_username VARCHAR(120) NOT NULL,
+    ml_user_id VARCHAR(80) NOT NULL,
+    nickname VARCHAR(300),
+    site_id VARCHAR(20),
+    access_token_encrypted TEXT NOT NULL,
+    refresh_token_encrypted TEXT,
+    expires_at BIGINT,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(owner_username, ml_user_id)
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_store_auth_owner ON ml_store_authorizations(owner_username,enabled)');
+  await pool.query(`CREATE TABLE IF NOT EXISTS ml_oauth_states (
+    state VARCHAR(128) PRIMARY KEY,
+    owner_username VARCHAR(120) NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS ml_store_products (
+    id BIGSERIAL PRIMARY KEY,
+    owner_username VARCHAR(120) NOT NULL,
+    store_user_id VARCHAR(80) NOT NULL,
+    item_id VARCHAR(80) NOT NULL,
+    title TEXT,
+    status VARCHAR(50),
+    price NUMERIC(18,2),
+    currency VARCHAR(10),
+    available_quantity INTEGER,
+    sold_quantity INTEGER,
+    thumbnail TEXT,
+    permalink TEXT,
+    category_id VARCHAR(80),
+    listing_type_id VARCHAR(80),
+    condition VARCHAR(30),
+    health NUMERIC(8,4),
+    raw_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ml_updated_at TIMESTAMPTZ,
+    last_synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(owner_username,item_id)
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_store_products_owner_store ON ml_store_products(owner_username,store_user_id,status)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_store_products_updated ON ml_store_products(last_synced_at DESC)');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_alerts (
     id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
     title VARCHAR(300) NOT NULL, content TEXT, is_read BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1459,6 +1504,69 @@ async function getMLAccessToken() {
   }
 }
 
+async function saveStoreAuthorization(ownerUsername, tokenData) {
+  const accessToken = String(tokenData.access_token || '');
+  const refreshToken = String(tokenData.refresh_token || '');
+  if (!ownerUsername || !accessToken) throw new Error('店铺授权数据不完整');
+  const account = await axios.get('https://api.mercadolibre.com/users/me', {
+    headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
+  });
+  const me = account.data || {};
+  const mlUserId = String(tokenData.user_id || me.id || '');
+  if (!mlUserId) throw new Error('无法识别授权店铺');
+  await pool.query(`INSERT INTO ml_store_authorizations
+    (owner_username,ml_user_id,nickname,site_id,access_token_encrypted,refresh_token_encrypted,expires_at,updated_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,NOW())
+    ON CONFLICT(owner_username,ml_user_id) DO UPDATE SET
+      nickname=EXCLUDED.nickname,site_id=EXCLUDED.site_id,
+      access_token_encrypted=EXCLUDED.access_token_encrypted,
+      refresh_token_encrypted=CASE WHEN EXCLUDED.refresh_token_encrypted<>'' THEN EXCLUDED.refresh_token_encrypted ELSE ml_store_authorizations.refresh_token_encrypted END,
+      expires_at=EXCLUDED.expires_at,enabled=TRUE,updated_at=NOW()`, [
+    ownerUsername, mlUserId, me.nickname || '', me.site_id || '',
+    encryptErpCredential(accessToken), refreshToken ? encryptErpCredential(refreshToken) : '',
+    Date.now() + Number(tokenData.expires_in || 21600) * 1000 - 60000
+  ]);
+  await pool.query(`INSERT INTO ml_stores(ml_user_id,nickname,site_id,updated_at) VALUES($1,$2,$3,NOW())
+    ON CONFLICT(ml_user_id) DO UPDATE SET nickname=EXCLUDED.nickname,site_id=EXCLUDED.site_id,updated_at=NOW()`,
+    [mlUserId, me.nickname || '', me.site_id || '']);
+  return { mlUserId, nickname: me.nickname || '', siteId: me.site_id || '' };
+}
+
+async function getStoreAuthorizationToken(row) {
+  if (!row) return null;
+  if (Number(row.expires_at || 0) > Date.now()) return decryptErpCredential(row.access_token_encrypted);
+  const refreshToken = decryptErpCredential(row.refresh_token_encrypted || '');
+  if (!refreshToken) return null;
+  const response = await axios.post('https://api.mercadolibre.com/oauth/token', null, {
+    params: { grant_type: 'refresh_token', client_id: ML_CLIENT_ID, client_secret: ML_CLIENT_SECRET, refresh_token: refreshToken },
+    timeout: 15000
+  });
+  await saveStoreAuthorization(row.owner_username, response.data || {});
+  return response.data?.access_token || null;
+}
+
+async function findScopedStoreAuthorization(authUser, storeUserId) {
+  const params = [String(storeUserId)];
+  let where = 'ml_user_id=$1 AND enabled=TRUE';
+  if (authUser.role !== 'admin') {
+    params.push(authUser.username);
+    where += ` AND owner_username=$${params.length}`;
+  }
+  const { rows } = await pool.query(`SELECT * FROM ml_store_authorizations WHERE ${where} ORDER BY updated_at DESC LIMIT 1`, params);
+  return rows[0] || null;
+}
+
+app.post('/api/store-products/oauth-link', requireAuth, async (req, res) => {
+  if (!ML_CLIENT_ID || !ML_CLIENT_SECRET) return res.status(503).json({ code: 503, message: 'Mercado Libre OAuth 尚未配置' });
+  const state = crypto.randomBytes(32).toString('hex');
+  await pool.query('DELETE FROM ml_oauth_states WHERE expires_at<NOW()');
+  await pool.query('INSERT INTO ml_oauth_states(state,owner_username,expires_at) VALUES($1,$2,NOW()+INTERVAL \'10 minutes\')', [state, req.authUser.username]);
+  const url = 'https://global-selling.mercadolibre.com/authorization' +
+    `?response_type=code&client_id=${encodeURIComponent(ML_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(ML_REDIRECT_URI)}&state=${encodeURIComponent(state)}`;
+  res.json({ code: 0, data: { url } });
+});
+
 // OAuth 第一步：跳转到 ML 授权页
 app.get('/api/ml/oauth/start', (req, res) => {
   if (!ML_CLIENT_ID || !ML_CLIENT_SECRET) {
@@ -1506,10 +1614,19 @@ app.get('/api/ml/oauth/callback', async (req, res) => {
       [String(data.user_id)]
     );
 
+    let scopedStore = null;
+    if (req.query.state) {
+      const stateResult = await pool.query(
+        'DELETE FROM ml_oauth_states WHERE state=$1 AND expires_at>NOW() RETURNING owner_username',
+        [String(req.query.state)]
+      );
+      if (stateResult.rows[0]) scopedStore = await saveStoreAuthorization(stateResult.rows[0].owner_username, data);
+    }
+
     res.send(`
       <html><body style="font-family:sans-serif;text-align:center;padding:80px">
         <h2 style="color:#00a650">✅ Mercado Libre 授权成功！</h2>
-        <p>选品工具已可以正常使用，你可以关闭此页面了。</p>
+        <p>${scopedStore ? `店铺 ${scopedStore.nickname || scopedStore.mlUserId} 已绑定到商品管理。` : '选品工具已可以正常使用，你可以关闭此页面了。'}</p>
         <p><small>Refresh Token 已保存，6个月内无需再次授权。</small></p>
       </body></html>
     `);
@@ -2603,6 +2720,154 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
 app.get('/api/admin/order-stores', requireAdmin, async (req, res) => {
   const { rows } = await pool.query(`SELECT s.ml_user_id AS id,s.nickname,s.remark,COALESCE(NULLIF(s.remark,''),s.nickname,s.ml_user_id) AS "displayName",s.site_id AS "siteId",COUNT(o.id)::int AS "orderCount" FROM ml_stores s LEFT JOIN ml_orders o ON o.store_user_id=s.ml_user_id GROUP BY s.ml_user_id ORDER BY "displayName"`);
   res.json({ code: 0, data: rows });
+});
+
+async function ensureLegacyStoreAuthorization(authUser) {
+  const existing = await pool.query('SELECT * FROM ml_store_authorizations WHERE owner_username=$1 AND enabled=TRUE ORDER BY updated_at DESC LIMIT 1', [authUser.username]);
+  if (existing.rows[0] || authUser.role !== 'admin') return existing.rows[0] || null;
+  const accessToken = await getMLAccessToken();
+  if (!accessToken) return null;
+  const refreshToken = await getMLRefreshToken();
+  return saveStoreAuthorization(authUser.username, {
+    access_token: accessToken,
+    refresh_token: refreshToken || '',
+    expires_in: 3600
+  }).then(async store => {
+    const result = await pool.query('SELECT * FROM ml_store_authorizations WHERE owner_username=$1 AND ml_user_id=$2', [authUser.username, store.mlUserId]);
+    return result.rows[0] || null;
+  });
+}
+
+function mapStoreProduct(item, ownerUsername, storeUserId) {
+  return {
+    ownerUsername,
+    storeUserId,
+    itemId: String(item.id || ''),
+    title: item.title || '', status: item.status || '', price: Number(item.price || 0),
+    currency: item.currency_id || '', availableQuantity: Number(item.available_quantity || 0),
+    soldQuantity: Number(item.sold_quantity || 0), thumbnail: item.thumbnail || item.pictures?.[0]?.secure_url || item.pictures?.[0]?.url || '',
+    permalink: item.permalink || '', categoryId: item.category_id || '', listingTypeId: item.listing_type_id || '',
+    condition: item.condition || '', health: item.health == null ? null : Number(item.health),
+    mlUpdatedAt: item.last_updated || item.date_created || null, rawData: item
+  };
+}
+
+async function upsertStoreProduct(product) {
+  await pool.query(`INSERT INTO ml_store_products
+    (owner_username,store_user_id,item_id,title,status,price,currency,available_quantity,sold_quantity,thumbnail,permalink,category_id,listing_type_id,condition,health,raw_data,ml_updated_at,last_synced_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
+    ON CONFLICT(owner_username,item_id) DO UPDATE SET
+      store_user_id=EXCLUDED.store_user_id,title=EXCLUDED.title,status=EXCLUDED.status,price=EXCLUDED.price,
+      currency=EXCLUDED.currency,available_quantity=EXCLUDED.available_quantity,sold_quantity=EXCLUDED.sold_quantity,
+      thumbnail=EXCLUDED.thumbnail,permalink=EXCLUDED.permalink,category_id=EXCLUDED.category_id,
+      listing_type_id=EXCLUDED.listing_type_id,condition=EXCLUDED.condition,health=EXCLUDED.health,
+      raw_data=EXCLUDED.raw_data,ml_updated_at=EXCLUDED.ml_updated_at,last_synced_at=NOW()`, [
+    product.ownerUsername, product.storeUserId, product.itemId, product.title, product.status, product.price,
+    product.currency, product.availableQuantity, product.soldQuantity, product.thumbnail, product.permalink,
+    product.categoryId, product.listingTypeId, product.condition, product.health, product.rawData,
+    product.mlUpdatedAt
+  ]);
+}
+
+app.get('/api/store-products/stores', requireAuth, async (req, res) => {
+  await ensureLegacyStoreAuthorization(req.authUser);
+  const params = [], where = ['a.enabled=TRUE'];
+  if (req.authUser.role !== 'admin') { params.push(req.authUser.username); where.push(`a.owner_username=$${params.length}`); }
+  const { rows } = await pool.query(`SELECT a.ml_user_id AS id,a.owner_username AS owner,a.nickname,a.site_id AS "siteId",a.updated_at AS "authorizedAt",COUNT(p.id)::int AS "productCount",MAX(p.last_synced_at) AS "lastSyncedAt" FROM ml_store_authorizations a LEFT JOIN ml_store_products p ON p.owner_username=a.owner_username AND p.store_user_id=a.ml_user_id WHERE ${where.join(' AND ')} GROUP BY a.ml_user_id,a.owner_username,a.nickname,a.site_id,a.updated_at ORDER BY a.updated_at DESC`, params);
+  res.json({ code: 0, data: rows });
+});
+
+app.post('/api/store-products/sync', requireAuth, async (req, res) => {
+  try {
+    let auth = await findScopedStoreAuthorization(req.authUser, req.body?.storeId);
+    if (!auth) auth = await ensureLegacyStoreAuthorization(req.authUser);
+    if (!auth || (req.body?.storeId && String(auth.ml_user_id) !== String(req.body.storeId))) return res.status(404).json({ code: 404, message: '未找到该用户可访问的授权店铺' });
+    const token = await getStoreAuthorizationToken(auth);
+    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
+    const ids = [];
+    let scrollId = '', rounds = 0;
+    do {
+      const response = await axios.get(`https://api.mercadolibre.com/users/${auth.ml_user_id}/items/search`, {
+        params: scrollId ? { search_type: 'scan', scroll_id: scrollId, limit: 100 } : { search_type: 'scan', limit: 100 },
+        headers: { Authorization: `Bearer ${token}` }, timeout: 25000
+      });
+      const batch = response.data?.results || [];
+      ids.push(...batch.map(String));
+      scrollId = response.data?.scroll_id || '';
+      rounds++;
+      if (!batch.length || !scrollId || rounds >= 100) break;
+    } while (true);
+    let synced = 0, failed = 0;
+    for (let i = 0; i < ids.length; i += 10) {
+      const batch = await Promise.all(ids.slice(i, i + 10).map(async itemId => {
+        try {
+          const response = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
+            headers: { Authorization: `Bearer ${token}` }, timeout: 15000
+          });
+          await upsertStoreProduct(mapStoreProduct(response.data || {}, auth.owner_username, auth.ml_user_id));
+          return true;
+        } catch (error) { console.warn('[StoreProducts] 商品同步失败:', itemId, error.response?.status || error.message); return false; }
+      }));
+      synced += batch.filter(Boolean).length; failed += batch.filter(value => !value).length;
+    }
+    res.json({ code: 0, data: { discovered: ids.length, synced, failed, storeId: auth.ml_user_id } });
+  } catch (e) {
+    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
+  }
+});
+
+app.get('/api/store-products', requireAuth, async (req, res) => {
+  const page = Math.max(1, Number(req.query.page || 1)), size = Math.min(100, Math.max(10, Number(req.query.size || 20)));
+  const params = [], where = [];
+  if (req.authUser.role !== 'admin') { params.push(req.authUser.username); where.push(`p.owner_username=$${params.length}`); }
+  if (req.query.owner && req.authUser.role === 'admin') { params.push(String(req.query.owner)); where.push(`p.owner_username=$${params.length}`); }
+  if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`p.store_user_id=$${params.length}`); }
+  if (req.query.status) { params.push(String(req.query.status)); where.push(`p.status=$${params.length}`); }
+  if (req.query.keyword) { params.push(`%${String(req.query.keyword).trim()}%`); where.push(`(p.title ILIKE $${params.length} OR p.item_id ILIKE $${params.length})`); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const count = await pool.query(`SELECT COUNT(*)::int AS total,COUNT(*) FILTER(WHERE status='active')::int AS active,COUNT(*) FILTER(WHERE status='paused')::int AS paused,COUNT(*) FILTER(WHERE status='closed')::int AS closed FROM ml_store_products p ${clause}`, params);
+  const listParams = [...params, size, (page - 1) * size];
+  const { rows } = await pool.query(`SELECT p.item_id AS "itemId",p.owner_username AS owner,p.store_user_id AS "storeId",COALESCE(NULLIF(a.nickname,''),p.store_user_id) AS "storeName",p.title,p.status,p.price,p.currency,p.available_quantity AS "availableQuantity",p.sold_quantity AS "soldQuantity",p.thumbnail,p.permalink,p.category_id AS "categoryId",p.listing_type_id AS "listingTypeId",p.condition,p.health,p.ml_updated_at AS "mlUpdatedAt",p.last_synced_at AS "lastSyncedAt" FROM ml_store_products p LEFT JOIN ml_store_authorizations a ON a.owner_username=p.owner_username AND a.ml_user_id=p.store_user_id ${clause} ORDER BY p.ml_updated_at DESC NULLS LAST,p.item_id LIMIT $${listParams.length-1} OFFSET $${listParams.length}`, listParams);
+  res.json({ code: 0, data: { items: rows, page, size, ...count.rows[0] } });
+});
+
+app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
+  try {
+    const itemId = String(req.params.itemId);
+    const productParams = [itemId];
+    let productWhere = 'item_id=$1';
+    if (req.authUser.role !== 'admin') {
+      productParams.push(req.authUser.username);
+      productWhere += ` AND owner_username=$${productParams.length}`;
+    }
+    const productResult = await pool.query(`SELECT * FROM ml_store_products WHERE ${productWhere} ORDER BY last_synced_at DESC LIMIT 1`, productParams);
+    const product = productResult.rows[0];
+    if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
+    const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
+    const token = await getStoreAuthorizationToken(auth);
+    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
+    const update = {};
+    if (req.body?.price !== undefined) {
+      const price = Number(req.body.price); if (!(price > 0)) return res.status(400).json({ code: 400, message: '价格必须大于0' }); update.price = price;
+    }
+    if (req.body?.availableQuantity !== undefined) {
+      const quantity = Number(req.body.availableQuantity); if (!Number.isInteger(quantity) || quantity < 0) return res.status(400).json({ code: 400, message: '库存必须是大于等于0的整数' }); update.available_quantity = quantity;
+    }
+    if (req.body?.status !== undefined) {
+      const status = String(req.body.status); if (!['active','paused'].includes(status)) return res.status(400).json({ code: 400, message: '仅支持上架或暂停商品' }); update.status = status;
+    }
+    if (!Object.keys(update).length) return res.status(400).json({ code: 400, message: '没有可更新的商品字段' });
+    await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, update, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000
+    });
+    const fresh = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 15000
+    });
+    await upsertStoreProduct(mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id));
+    res.json({ code: 0, data: mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id) });
+  } catch (e) {
+    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
+  }
 });
 
 app.patch('/api/admin/order-stores/:id', requireAdmin, async (req, res) => {
