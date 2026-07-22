@@ -2298,12 +2298,16 @@ async function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
-    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
     const group = groups.get(groupId);
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
     group.items.push(...(Array.isArray(row.items) ? row.items : []));
     for (const field of ['paidAmount','totalAmount','saleFee','shippingFee','otherFee','refundAmount','productCost']) group[field] += Number(row[field] || 0);
+    if (row.netAmount !== null && row.netAmount !== undefined) {
+      group._fallbackNetAmount += Number(row.netAmount || 0);
+      group._hasFallbackNetAmount = true;
+    }
     group.financeIsOfficial ||= Boolean(row.financeIsOfficial);
     const parsed = parseOrderBilling(row.billingData, Number(row.paidAmount || 0));
     for (const entry of parsed?.entries || []) {
@@ -2331,8 +2335,10 @@ async function aggregatePackedOrders(rows) {
     const totalCharges = group.saleFee + group.shippingFee + group.paymentFee + group.transferFee + group.cancellationFee + group.taxFee + group.adjustmentFee;
     group.netAmount = group.status === 'cancelled'
       ? 0
-      : (group.financeIsOfficial && !group.billingCurrencyMismatch ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2))) : null);
-    delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees;
+      : (group.financeIsOfficial && !group.billingCurrencyMismatch
+        ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2)))
+        : (group._hasFallbackNetAmount ? Math.max(0, Number(group._fallbackNetAmount.toFixed(2))) : null));
+    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees;
   }
   return [...groups.values()];
 }
@@ -2487,7 +2493,7 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       const otherFee = officialFinance ? officialFinance.otherFee : null;
       const finalNetAmount = order.status === 'cancelled'
         ? 0
-        : (officialFinance ? officialFinance.netAmount : null);
+        : (officialFinance ? officialFinance.netAmount : (netAmount === null ? null : Math.max(0, Number(netAmount) - Number(refundAmount || 0))));
       const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1', [String(order.id)]);
       await pool.query(`
         INSERT INTO ml_orders
