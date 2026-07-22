@@ -304,6 +304,7 @@ async function initOrderManagementTables() {
   )`);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_store_products_owner_store ON ml_store_products(owner_username,store_user_id,status)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_store_products_updated ON ml_store_products(last_synced_at DESC)');
+  await pool.query('ALTER TABLE ml_store_products ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT FALSE');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_alerts (
     id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
     title VARCHAR(300) NOT NULL, content TEXT, is_read BOOLEAN NOT NULL DEFAULT FALSE,
@@ -2827,21 +2828,42 @@ app.get('/api/store-products', requireAuth, async (req, res) => {
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(*)::int AS total,COUNT(*) FILTER(WHERE status='active')::int AS active,COUNT(*) FILTER(WHERE status='paused')::int AS paused,COUNT(*) FILTER(WHERE status='closed')::int AS closed FROM ml_store_products p ${clause}`, params);
   const listParams = [...params, size, (page - 1) * size];
-  const { rows } = await pool.query(`SELECT p.item_id AS "itemId",p.owner_username AS owner,p.store_user_id AS "storeId",COALESCE(NULLIF(a.nickname,''),p.store_user_id) AS "storeName",p.title,p.status,p.price,p.currency,p.available_quantity AS "availableQuantity",p.sold_quantity AS "soldQuantity",p.thumbnail,p.permalink,p.category_id AS "categoryId",p.listing_type_id AS "listingTypeId",p.condition,p.health,p.ml_updated_at AS "mlUpdatedAt",p.last_synced_at AS "lastSyncedAt" FROM ml_store_products p LEFT JOIN ml_store_authorizations a ON a.owner_username=p.owner_username AND a.ml_user_id=p.store_user_id ${clause} ORDER BY p.ml_updated_at DESC NULLS LAST,p.item_id LIMIT $${listParams.length-1} OFFSET $${listParams.length}`, listParams);
+  const { rows } = await pool.query(`SELECT p.item_id AS "itemId",p.owner_username AS owner,p.store_user_id AS "storeId",COALESCE(NULLIF(a.nickname,''),p.store_user_id) AS "storeName",p.title,p.status,p.price,p.currency,p.available_quantity AS "availableQuantity",p.sold_quantity AS "soldQuantity",p.thumbnail,p.permalink,p.category_id AS "categoryId",p.listing_type_id AS "listingTypeId",p.condition,p.health,p.ignored,p.raw_data->'variations' AS variations,p.ml_updated_at AS "mlUpdatedAt",p.last_synced_at AS "lastSyncedAt" FROM ml_store_products p LEFT JOIN ml_store_authorizations a ON a.owner_username=p.owner_username AND a.ml_user_id=p.store_user_id ${clause} ORDER BY p.ml_updated_at DESC NULLS LAST,p.item_id LIMIT $${listParams.length-1} OFFSET $${listParams.length}`, listParams);
   res.json({ code: 0, data: { items: rows, page, size, ...count.rows[0] } });
+});
+
+async function findScopedStoreProduct(authUser, itemId) {
+  const params = [String(itemId)];
+  let where = 'item_id=$1';
+  if (authUser.role !== 'admin') {
+    params.push(authUser.username);
+    where += ` AND owner_username=$${params.length}`;
+  }
+  const { rows } = await pool.query(`SELECT * FROM ml_store_products WHERE ${where} ORDER BY last_synced_at DESC LIMIT 1`, params);
+  return rows[0] || null;
+}
+
+app.get('/api/store-products/:itemId/detail', requireAuth, async (req, res) => {
+  try {
+    const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
+    if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
+    const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
+    const token = await getStoreAuthorizationToken(auth);
+    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
+    const [itemResponse, descriptionResponse] = await Promise.all([
+      axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }),
+      axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}/description`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }).catch(() => ({ data: {} }))
+    ]);
+    res.json({ code: 0, data: { ...itemResponse.data, description: descriptionResponse.data?.plain_text || '' } });
+  } catch (e) {
+    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
+  }
 });
 
 app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
   try {
     const itemId = String(req.params.itemId);
-    const productParams = [itemId];
-    let productWhere = 'item_id=$1';
-    if (req.authUser.role !== 'admin') {
-      productParams.push(req.authUser.username);
-      productWhere += ` AND owner_username=$${productParams.length}`;
-    }
-    const productResult = await pool.query(`SELECT * FROM ml_store_products WHERE ${productWhere} ORDER BY last_synced_at DESC LIMIT 1`, productParams);
-    const product = productResult.rows[0];
+    const product = await findScopedStoreProduct(req.authUser, itemId);
     if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
     const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
     const token = await getStoreAuthorizationToken(auth);
@@ -2854,12 +2876,29 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
       const quantity = Number(req.body.availableQuantity); if (!Number.isInteger(quantity) || quantity < 0) return res.status(400).json({ code: 400, message: '库存必须是大于等于0的整数' }); update.available_quantity = quantity;
     }
     if (req.body?.status !== undefined) {
-      const status = String(req.body.status); if (!['active','paused'].includes(status)) return res.status(400).json({ code: 400, message: '仅支持上架或暂停商品' }); update.status = status;
+      const status = String(req.body.status); if (!['active','paused','closed'].includes(status)) return res.status(400).json({ code: 400, message: '仅支持上架、暂停或关闭商品' }); update.status = status;
     }
-    if (!Object.keys(update).length) return res.status(400).json({ code: 400, message: '没有可更新的商品字段' });
-    await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, update, {
+    if (req.body?.title !== undefined) update.title = String(req.body.title || '').trim().slice(0, 255);
+    if (req.body?.pictures !== undefined) {
+      if (!Array.isArray(req.body.pictures) || !req.body.pictures.length) return res.status(400).json({ code: 400, message: '至少保留一张商品图片' });
+      update.pictures = req.body.pictures.slice(0, 12).map(source => ({ source: String(source).trim() })).filter(picture => picture.source);
+    }
+    if (req.body?.variations !== undefined) {
+      if (!Array.isArray(req.body.variations)) return res.status(400).json({ code: 400, message: '变体数据格式不正确' });
+      update.variations = req.body.variations;
+    }
+    if (req.body?.weight !== undefined) {
+      const weight = String(req.body.weight || '').trim();
+      if (!/^\d+(?:\.\d+)?\s*(?:g|kg)$/i.test(weight)) return res.status(400).json({ code: 400, message: '重量格式示例：500 g 或 1.2 kg' });
+      update.attributes = [{ id: 'PACKAGE_WEIGHT', value_name: weight }];
+    }
+    if (!Object.keys(update).length && req.body?.description === undefined) return res.status(400).json({ code: 400, message: '没有可更新的商品字段' });
+    if (Object.keys(update).length) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, update, {
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000
     });
+    if (req.body?.description !== undefined) await axios.put(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}/description?api_version=2`, {
+      plain_text: String(req.body.description || '').slice(0, 50000)
+    }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
     const fresh = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`, {
       headers: { Authorization: `Bearer ${token}` }, timeout: 15000
     });
@@ -2868,6 +2907,49 @@ app.patch('/api/store-products/:itemId', requireAuth, async (req, res) => {
   } catch (e) {
     res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
   }
+});
+
+app.post('/api/store-products/:itemId/relist', requireAuth, async (req, res) => {
+  try {
+    const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
+    if (!product) return res.status(404).json({ code: 404, message: '商品不存在，请先同步' });
+    const auth = await findScopedStoreAuthorization(req.authUser, product.store_user_id);
+    const token = await getStoreAuthorizationToken(auth);
+    if (!token) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
+    if (product.status !== 'closed') return res.status(400).json({ code: 400, message: '只有已关闭且关闭未超过 60 天的商品可以重新发布' });
+    const raw = product.raw_data || {};
+    const relistBody = { listing_type_id: product.listing_type_id || raw.listing_type_id };
+    if (Array.isArray(raw.variations) && raw.variations.length) {
+      relistBody.variations = raw.variations.map(variation => ({
+        id: variation.id,
+        price: Number(variation.price || product.price),
+        quantity: Math.max(0, Number(variation.available_quantity || 0))
+      }));
+    } else {
+      relistBody.price = Number(product.price);
+      relistBody.quantity = Math.max(1, Number(product.available_quantity || 1));
+    }
+    const response = await axios.post(`https://api.mercadolibre.com/items/${encodeURIComponent(product.item_id)}/relist`, relistBody, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
+    const fresh = await axios.get(`https://api.mercadolibre.com/items/${encodeURIComponent(response.data?.id || product.item_id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+    await upsertStoreProduct(mapStoreProduct(fresh.data || {}, product.owner_username, product.store_user_id));
+    res.json({ code: 0, data: response.data });
+  } catch (e) {
+    res.status(e.response?.status || 500).json({ code: e.response?.status || 500, message: e.response?.data?.message || e.message });
+  }
+});
+
+app.patch('/api/store-products/:itemId/local', requireAuth, async (req, res) => {
+  const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
+  if (!product) return res.status(404).json({ code: 404, message: '商品不存在' });
+  await pool.query('UPDATE ml_store_products SET ignored=$1 WHERE id=$2', [Boolean(req.body?.ignored), product.id]);
+  res.json({ code: 0 });
+});
+
+app.delete('/api/store-products/:itemId/local', requireAuth, async (req, res) => {
+  const product = await findScopedStoreProduct(req.authUser, req.params.itemId);
+  if (!product) return res.status(404).json({ code: 404, message: '商品不存在' });
+  await pool.query('DELETE FROM ml_store_products WHERE id=$1', [product.id]);
+  res.json({ code: 0 });
 });
 
 app.patch('/api/admin/order-stores/:id', requireAdmin, async (req, res) => {
