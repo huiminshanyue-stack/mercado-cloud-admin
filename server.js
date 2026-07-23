@@ -3318,7 +3318,9 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
         suggestedPrice: Number(item.suggested_discounted_price || 0),
         stock: Number(detail.available_quantity || 0),
         offerId: item.offer_id || item.candidate_id || '',
-        netProceeds: item.net_proceeds || null
+        netProceeds: item.net_proceeds || null,
+        startDate: item.start_date || '',
+        endDate: item.end_date || item.finish_date || ''
       };
     });
     res.json({ code: 0, data: {
