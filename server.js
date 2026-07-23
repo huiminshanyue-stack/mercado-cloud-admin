@@ -2730,48 +2730,350 @@ app.get('/api/marketing/accounts', requireAuth, async (req, res) => {
   res.json({ code: 0, data: rows });
 });
 
+const marketingCache = new Map();
+const marketingItemCache = new Map();
+const MARKETING_CACHE_TTL = 60 * 1000;
+const MARKETING_ITEM_CACHE_TTL = 5 * 60 * 1000;
+
+function readTimedCache(cache, key, ttl) {
+  const entry = cache.get(key);
+  if (!entry || Date.now() - entry.time > ttl) {
+    if (entry) cache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function writeTimedCache(cache, key, data, maxEntries) {
+  cache.set(key, { data, time: Date.now() });
+  while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+  return data;
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function run() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, run));
+  return results;
+}
+
+function getPromotionHeaders(token) {
+  const headers = { Authorization: `Bearer ${token}`, version: 'v2' };
+  if (ML_CLIENT_ID) {
+    headers['X-Client-Id'] = ML_CLIENT_ID;
+    headers['X-Caller-Id'] = ML_CLIENT_ID;
+  }
+  return headers;
+}
+
+function extractAdvertiserUserId(advertiser) {
+  const match = String(advertiser?.account_name || '').match(/(?:ID\s*-\s*)?(\d+)\s*$/i);
+  return match?.[1] || '';
+}
+
+async function resolveMarketingAuthorization(authUser, storeId) {
+  let auth = await findScopedStoreAuthorization(authUser, storeId);
+  if (!auth) auth = await ensureLegacyStoreAuthorization(authUser);
+  if (!auth) {
+    const error = new Error('未找到已授权的美客多账号');
+    error.statusCode = 404;
+    throw error;
+  }
+  const token = await getStoreAuthorizationToken(auth);
+  if (!token) {
+    const error = new Error('账号授权已失效，请重新授权');
+    error.statusCode = 401;
+    throw error;
+  }
+  return { auth, token };
+}
+
+async function loadMarketingSites(auth, token, force = false) {
+  const cacheKey = `sites:${auth.ml_user_id}`;
+  if (!force) {
+    const cached = readTimedCache(marketingCache, cacheKey, MARKETING_CACHE_TTL);
+    if (cached) return cached;
+  }
+  const response = await axios.get('https://api.mercadolibre.com/advertising/advertisers', {
+    params: { product_id: 'PADS', type: 'SELLER' },
+    headers: { Authorization: `Bearer ${token}`, 'api-version': '1' },
+    timeout: 20000
+  });
+  const sites = (response.data?.advertisers || []).map(advertiser => ({
+    siteId: String(advertiser.site_id || ''),
+    userId: extractAdvertiserUserId(advertiser),
+    advertiserId: advertiser.advertiser_id,
+    advertiserName: advertiser.advertiser_name || '',
+    accountName: advertiser.account_name || ''
+  })).filter(site => site.siteId && site.userId);
+  return writeTimedCache(marketingCache, cacheKey, sites, 50);
+}
+
+async function loadSitePromotions(token, site, force = false) {
+  const cacheKey = `promotions:${site.userId}`;
+  if (!force) {
+    const cached = readTimedCache(marketingCache, cacheKey, MARKETING_CACHE_TTL);
+    if (cached) return cached;
+  }
+  const response = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/users/${encodeURIComponent(site.userId)}`, {
+    headers: getPromotionHeaders(token),
+    timeout: 20000
+  });
+  const promotions = Array.isArray(response.data?.results) ? response.data.results : [];
+  return writeTimedCache(marketingCache, cacheKey, promotions, 50);
+}
+
+function marketingApiError(error, fallback) {
+  const data = error.response?.data;
+  const cause = Array.isArray(data?.cause) ? data.cause.map(item => item?.message || item?.code).filter(Boolean).join('；') : '';
+  if (error.response?.status === 429) return '美客多接口请求过于频繁，请稍后重试';
+  return cause || data?.message || data?.error || error.message || fallback;
+}
+
 app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
   try {
-    let auth = await findScopedStoreAuthorization(req.authUser, req.query.storeId);
-    if (!auth) auth = await ensureLegacyStoreAuthorization(req.authUser);
-    if (!auth) return res.status(404).json({ code: 404, message: '未找到已授权的美客多账号' });
-    const token = await getStoreAuthorizationToken(auth);
-    if (!token) return res.status(401).json({ code: 401, message: '账号授权已失效，请重新授权' });
-    const headers = { Authorization: `Bearer ${token}` };
-    const [promotionResponse, advertiserResponse] = await Promise.all([
-      axios.get(`https://api.mercadolibre.com/seller-promotions/users/${encodeURIComponent(auth.ml_user_id)}`, {
-        params: { app_version: 'v2' }, headers, timeout: 20000
-      }).catch(error => error.response || { status: 500, data: { message: error.message } }),
-      axios.get('https://api.mercadolibre.com/advertising/advertisers', {
-        params: { product_id: 'PADS', type: 'SELLER' }, headers: { ...headers, 'api-version': '1' }, timeout: 20000
-      }).catch(error => error.response || { status: 500, data: { message: error.message } })
-    ]);
-    const advertisers = advertiserResponse.status === 200 && Array.isArray(advertiserResponse.data?.advertisers)
-      ? advertiserResponse.data.advertisers.map(advertiser => ({
-          advertiserId: advertiser.advertiser_id,
-          siteId: advertiser.site_id,
-          advertiserName: advertiser.advertiser_name,
-          accountName: advertiser.account_name
-        }))
-      : [];
-    const promotionsSupported = promotionResponse.status === 200;
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
+    const force = String(req.query.force || '') === '1';
+    const sites = await loadMarketingSites(auth, token, force);
+    const siteResults = await mapWithConcurrency(sites, 3, async site => {
+      try {
+        const promotions = await loadSitePromotions(token, site, force);
+        return { ...site, supported: true, promotions };
+      } catch (error) {
+        return { ...site, supported: false, message: marketingApiError(error, '活动接口不可用'), promotions: [] };
+      }
+    });
+    const promotions = siteResults.flatMap(site => site.promotions.map(promotion => ({
+      ...promotion,
+      siteId: site.siteId,
+      userId: site.userId
+    })));
+    const advertisers = siteResults.map(site => ({
+      advertiserId: site.advertiserId,
+      siteId: site.siteId,
+      advertiserName: site.advertiserName,
+      accountName: site.accountName
+    }));
     res.json({ code: 0, data: {
       account: { id: auth.ml_user_id, nickname: auth.nickname, siteId: auth.site_id },
       promotions: {
-        supported: promotionsSupported,
-        status: promotionResponse.status,
-        message: promotionsSupported ? '促销活动接口可用' : (promotionResponse.data?.message || '当前账号不支持促销活动接口'),
-        items: promotionsSupported ? (promotionResponse.data?.results || promotionResponse.data || []) : []
+        supported: siteResults.some(site => site.supported),
+        status: siteResults.some(site => site.supported) ? 200 : 403,
+        message: `已读取 ${siteResults.length} 个国家子店铺、${promotions.length} 个活动`,
+        items: promotions,
+        sites: siteResults.map(site => ({
+          siteId: site.siteId,
+          userId: site.userId,
+          supported: site.supported,
+          message: site.message || '',
+          promotionCount: site.promotions.length
+        }))
       },
       productAds: {
-        supported: advertiserResponse.status === 200,
-        status: advertiserResponse.status,
-        message: advertiserResponse.status === 200 ? `已读取 ${advertisers.length} 个广告账户` : (advertiserResponse.data?.message || '广告接口不可用'),
+        supported: true,
+        status: 200,
+        message: `已读取 ${advertisers.length} 个广告账户`,
         advertisers
       }
     } });
   } catch (error) {
-    res.status(error.response?.status || 500).json({ code: error.response?.status || 500, message: error.response?.data?.message || error.message });
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '营销接口读取失败') });
+  }
+});
+
+app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
+  try {
+    const promotionId = String(req.query.promotionId || '').trim();
+    const promotionType = String(req.query.promotionType || '').trim().toUpperCase();
+    const siteId = String(req.query.siteId || '').trim().toUpperCase();
+    const status = req.query.status === 'started' ? 'started' : 'candidate';
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const size = Math.min(30, Math.max(1, Number(req.query.size) || 20));
+    if (!promotionId || !promotionType || !siteId) return res.status(400).json({ code: 400, message: '请选择国家店铺和活动' });
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
+    const sites = await loadMarketingSites(auth, token);
+    const site = sites.find(item => item.siteId === siteId);
+    if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账号' });
+    const promotions = await loadSitePromotions(token, site);
+    if (!promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
+      return res.status(404).json({ code: 404, message: '活动不存在或已结束，请刷新活动列表' });
+    }
+    const response = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/promotions/${encodeURIComponent(promotionId)}/items`, {
+      params: {
+        user_id: site.userId,
+        promotion_type: promotionType,
+        status,
+        limit: size,
+        offset: (page - 1) * size
+      },
+      headers: getPromotionHeaders(token),
+      timeout: 25000
+    });
+    const rawItems = Array.isArray(response.data?.results) ? response.data.results : [];
+    const items = await mapWithConcurrency(rawItems, 4, async item => {
+      const cacheKey = `item:${item.id}`;
+      let detail = readTimedCache(marketingItemCache, cacheKey, MARKETING_ITEM_CACHE_TTL);
+      if (!detail) {
+        try {
+          const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(item.id)}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            timeout: 15000
+          });
+          detail = writeTimedCache(marketingItemCache, cacheKey, detailResponse.data || {}, 500);
+        } catch (error) {
+          detail = {};
+        }
+      }
+      return {
+        itemId: item.id,
+        cbtItemId: detail.cbt_item_id || '',
+        title: detail.title || item.id,
+        thumbnail: detail.secure_thumbnail || detail.thumbnail || '',
+        siteId,
+        userId: site.userId,
+        status: item.status || status,
+        currentPrice: Number(item.original_price ?? detail.price ?? 0),
+        activityPrice: Number(item.price || 0),
+        currency: item.currency_id || detail.currency_id || 'USD',
+        minPrice: Number(item.min_discounted_price || 0),
+        maxPrice: Number(item.max_discounted_price || 0),
+        suggestedPrice: Number(item.suggested_discounted_price || 0),
+        stock: Number(detail.available_quantity || 0),
+        offerId: item.offer_id || item.candidate_id || '',
+        netProceeds: item.net_proceeds || null
+      };
+    });
+    res.json({ code: 0, data: {
+      items,
+      total: Number(response.data?.paging?.total || items.length),
+      page,
+      size,
+      searchAfter: response.data?.paging?.searchAfter || ''
+    } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '活动商品读取失败') });
+  }
+});
+
+function buildPromotionEnrollmentBody(promotionType, promotionId, item) {
+  const dealPrice = Number(item.dealPrice);
+  const originalPrice = Number(item.originalPrice);
+  const offerId = String(item.offerId || '').trim();
+  if (['DEAL', 'SELLER_CAMPAIGN'].includes(promotionType)) {
+    if (!(dealPrice > 0)) throw new Error('请填写有效活动价');
+    const body = { promotion_id: promotionId, promotion_type: promotionType, deal_price: dealPrice };
+    if (Number(item.topDealPrice) > 0) body.top_deal_price = Number(item.topDealPrice);
+    return body;
+  }
+  if (['SMART', 'PRICE_MATCHING', 'PRE_NEGOTIATED', 'UNHEALTHY_STOCK'].includes(promotionType)) {
+    if (!offerId) throw new Error('平台未返回该商品的报名凭证，请刷新候选商品');
+    return { promotion_id: promotionId, promotion_type: promotionType, offer_id: offerId };
+  }
+  if (['MARKETPLACE_CAMPAIGN', 'VOLUME'].includes(promotionType)) {
+    return { promotion_id: promotionId, promotion_type: promotionType };
+  }
+  if (['LIGHTNING', 'DOD'].includes(promotionType)) {
+    if (!(dealPrice > 0) || !(originalPrice > 0)) throw new Error('请填写有效活动价');
+    const body = { deal_id: promotionId, promotion_type: promotionType, deal_price: dealPrice, original_price: originalPrice };
+    if (promotionType === 'LIGHTNING') {
+      const stock = Math.floor(Number(item.stock));
+      if (!(stock > 0)) throw new Error('闪购活动必须填写有效活动库存');
+      body.stock = stock;
+    }
+    return body;
+  }
+  throw new Error(`暂不支持 ${promotionType} 类型的接口报名`);
+}
+
+async function validatePromotionRequest(authUser, body) {
+  const promotionId = String(body.promotionId || '').trim();
+  const promotionType = String(body.promotionType || '').trim().toUpperCase();
+  const siteId = String(body.siteId || '').trim().toUpperCase();
+  const { auth, token } = await resolveMarketingAuthorization(authUser, body.storeId);
+  const sites = await loadMarketingSites(auth, token);
+  const site = sites.find(item => item.siteId === siteId);
+  if (!site) throw Object.assign(new Error('该国家店铺不属于当前授权账号'), { statusCode: 403 });
+  const promotions = await loadSitePromotions(token, site);
+  if (!promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
+    throw Object.assign(new Error('活动不存在或已结束，请刷新活动列表'), { statusCode: 404 });
+  }
+  const items = Array.isArray(body.items) ? body.items.slice(0, 30) : [];
+  if (!items.length) throw Object.assign(new Error('请至少选择一个商品'), { statusCode: 400 });
+  return { auth, token, site, promotionId, promotionType, items };
+}
+
+app.post('/api/marketing/promotions/enroll-batch', requireAuth, async (req, res) => {
+  try {
+    const context = await validatePromotionRequest(req.authUser, req.body || {});
+    const headers = { ...getPromotionHeaders(context.token), 'Content-Type': 'application/json' };
+    const results = await mapWithConcurrency(context.items, 3, async item => {
+      const itemId = String(item.itemId || '').trim().toUpperCase();
+      if (!itemId.startsWith(context.site.siteId)) return { itemId, success: false, message: '商品不属于所选国家店铺' };
+      try {
+        const payload = buildPromotionEnrollmentBody(context.promotionType, context.promotionId, item);
+        await axios.post(`https://api.mercadolibre.com/marketplace/seller-promotions/items/${encodeURIComponent(itemId)}`, payload, {
+          params: { user_id: context.site.userId }, headers, timeout: 25000
+        });
+        marketingItemCache.delete(`item:${itemId}`);
+        return { itemId, success: true, message: '报名成功' };
+      } catch (error) {
+        return { itemId, success: false, message: marketingApiError(error, '报名失败') };
+      }
+    });
+    marketingCache.delete(`promotions:${context.site.userId}`);
+    res.json({ code: 0, data: {
+      successCount: results.filter(item => item.success).length,
+      failedCount: results.filter(item => !item.success).length,
+      results
+    } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '批量报名失败') });
+  }
+});
+
+app.post('/api/marketing/promotions/exit-batch', requireAuth, async (req, res) => {
+  try {
+    const context = await validatePromotionRequest(req.authUser, req.body || {});
+    const headers = getPromotionHeaders(context.token);
+    const offerRequired = ['SMART', 'PRICE_MATCHING', 'PRE_NEGOTIATED', 'UNHEALTHY_STOCK', 'MARKETPLACE_CAMPAIGN'].includes(context.promotionType);
+    const results = await mapWithConcurrency(context.items, 3, async item => {
+      const itemId = String(item.itemId || '').trim().toUpperCase();
+      if (!itemId.startsWith(context.site.siteId)) return { itemId, success: false, message: '商品不属于所选国家店铺' };
+      try {
+        const offerId = context.promotionType === 'SELLER_CAMPAIGN' ? context.site.userId : String(item.offerId || '').trim();
+        if (offerRequired && !offerId) throw new Error('平台未返回该商品的活动凭证，请刷新已参加商品');
+        const params = {
+          user_id: context.site.userId,
+          promotion_type: context.promotionType,
+          promotion_id: context.promotionId
+        };
+        if (offerId) params.offer_id = offerId;
+        await axios.delete(`https://api.mercadolibre.com/marketplace/seller-promotions/items/${encodeURIComponent(itemId)}`, {
+          params, headers, timeout: 25000
+        });
+        marketingItemCache.delete(`item:${itemId}`);
+        return { itemId, success: true, message: '退出成功' };
+      } catch (error) {
+        return { itemId, success: false, message: marketingApiError(error, '退出失败') };
+      }
+    });
+    res.json({ code: 0, data: {
+      successCount: results.filter(item => item.success).length,
+      failedCount: results.filter(item => !item.success).length,
+      results
+    } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '批量退出失败') });
   }
 });
 
