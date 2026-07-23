@@ -3014,7 +3014,10 @@ app.get('/api/marketing/product-ads/overview', requireAuth, async (req, res) => 
             name: campaign.name || '',
             status: campaign.status || '',
             budget: Number(campaign.budget || 0),
+            currencyId: campaign.currency_id || 'USD',
             strategy: campaign.strategy || '',
+            roasTarget: Number(campaign.roas_target || 0),
+            lastUpdated: campaign.last_updated || '',
             metrics: finalizeAdMetrics(metrics)
           };
         });
@@ -3080,6 +3083,67 @@ app.get('/api/marketing/product-ads/products', requireAuth, async (req, res) => 
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
     res.status(status).json({ code: status, message: marketingApiError(error, '广告商品读取失败') });
+  }
+});
+
+app.patch('/api/marketing/product-ads/campaigns/:campaignId', requireAuth, async (req, res) => {
+  try {
+    const campaignId = String(req.params.campaignId || '').trim();
+    const siteId = String(req.body?.siteId || '').trim().toUpperCase();
+    if (!campaignId || !siteId) return res.status(400).json({ code: 400, message: '请选择需要修改的广告活动' });
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.body?.storeId);
+    const sites = await loadMarketingSites(auth, token);
+    const site = sites.find(item => item.siteId === siteId);
+    if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
+
+    const changes = req.body?.changes || {};
+    const payload = {};
+    if (Object.prototype.hasOwnProperty.call(changes, 'name')) {
+      const name = String(changes.name || '').trim();
+      if (!name || name.length > 200) return res.status(400).json({ code: 400, message: '广告活动名称不能为空且不能超过 200 个字符' });
+      payload.name = name;
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, 'budget')) {
+      const budget = Number(changes.budget);
+      if (!Number.isFinite(budget) || budget <= 0) return res.status(400).json({ code: 400, message: '每日预算必须大于 0' });
+      payload.budget = Number(budget.toFixed(2));
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, 'status')) {
+      const status = String(changes.status || '').toLowerCase();
+      if (!['active', 'paused'].includes(status)) return res.status(400).json({ code: 400, message: '投放状态只能设置为投放中或已暂停' });
+      payload.status = status;
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, 'roasTarget')) {
+      const roasTarget = Number(changes.roasTarget);
+      if (!Number.isFinite(roasTarget) || roasTarget < 1 || roasTarget > 35) return res.status(400).json({ code: 400, message: '目标 ROAS 必须在 1 至 35 之间' });
+      payload.roas_target = Number(roasTarget.toFixed(2));
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, 'strategy')) {
+      const strategy = String(changes.strategy || '').toLowerCase();
+      if (!['profitability', 'increase', 'visibility'].includes(strategy)) return res.status(400).json({ code: 400, message: '请选择平台支持的投放策略' });
+      payload.strategy = strategy;
+    }
+    if (!Object.keys(payload).length) return res.status(400).json({ code: 400, message: '没有需要保存的修改' });
+
+    const url = `https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/campaigns/${encodeURIComponent(campaignId)}`;
+    const response = await axios.put(url, payload, { headers: { ...getProductAdsHeaders(token), 'Content-Type': 'application/json' }, timeout: 25000 });
+    for (const key of productAdsCache.keys()) {
+      if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
+    }
+    const campaign = response.data || {};
+    res.json({ code: 0, message: '广告活动已更新并由美客多确认', data: {
+      id: campaign.id || campaignId,
+      name: campaign.name || payload.name || '',
+      status: campaign.status || payload.status || '',
+      budget: Number(campaign.budget ?? payload.budget ?? 0),
+      currencyId: campaign.currency_id || '',
+      strategy: campaign.strategy || payload.strategy || '',
+      roasTarget: Number(campaign.roas_target ?? payload.roas_target ?? 0),
+      lastUpdated: campaign.last_updated || new Date().toISOString()
+    } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '广告活动更新失败') });
   }
 });
 
