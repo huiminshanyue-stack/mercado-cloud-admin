@@ -2732,8 +2732,24 @@ app.get('/api/marketing/accounts', requireAuth, async (req, res) => {
 
 const marketingCache = new Map();
 const marketingItemCache = new Map();
+const promotionNameTranslationCache = new Map();
 const MARKETING_CACHE_TTL = 60 * 1000;
 const MARKETING_ITEM_CACHE_TTL = 5 * 60 * 1000;
+const PROMOTION_NAME_ZH_OVERRIDES = new Map([
+  ['AON Home Industries', '家居行业全场优惠'],
+  ['Best Shared Offers Jul!', '7月精选共享优惠'],
+  ['Cyber Days', '网络购物节'],
+  ['DD 8/8 Mega Ofertas', '8·8超级优惠'],
+  ['Best Shared Offers Ago!', '8月精选共享优惠'],
+  ['8.8 e Dia dos Pais', '8·8及父亲节优惠'],
+  ['Activa Tus Descuentos', '开启你的折扣'],
+  ['Shared Offers Jul Massive', '7月全场共享优惠'],
+  ['T2 OFERTAZOS JULIO 2026', '2026年7月第二期超级优惠'],
+  ['DIA DEL NINO 2026', '2026儿童节优惠'],
+  ['Liqui moda invierno 2026', '2026冬季时尚清仓'],
+  ['Dia de la ninez 2026', '2026儿童节优惠'],
+  ['Black week julio 2026', '2026年7月黑色促销周']
+]);
 
 function readTimedCache(cache, key, ttl) {
   const entry = cache.get(key);
@@ -2761,6 +2777,36 @@ async function mapWithConcurrency(items, limit, worker) {
   }
   await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, run));
   return results;
+}
+
+async function translatePromotionName(name) {
+  const original = String(name || '').trim();
+  if (!original || /[\u3400-\u9fff]/.test(original)) return original;
+  if (PROMOTION_NAME_ZH_OVERRIDES.has(original)) return PROMOTION_NAME_ZH_OVERRIDES.get(original);
+  const cached = readTimedCache(promotionNameTranslationCache, original, 30 * 24 * 60 * 60 * 1000);
+  if (cached) return cached;
+  try {
+    const response = await axios.get('https://translate.googleapis.com/translate_a/single', {
+      params: { client: 'gtx', sl: 'auto', tl: 'zh-CN', dt: 't', q: original },
+      timeout: 8000
+    });
+    const translated = Array.isArray(response.data?.[0])
+      ? response.data[0].map(part => part?.[0] || '').join('').trim()
+      : '';
+    const result = translated || original;
+    writeTimedCache(promotionNameTranslationCache, original, result, 1000);
+    return result;
+  } catch (error) {
+    console.warn('[Marketing] 活动名称翻译失败:', original, error.message);
+    return original;
+  }
+}
+
+async function addChinesePromotionNames(promotions) {
+  return mapWithConcurrency(promotions, 3, async promotion => ({
+    ...promotion,
+    nameZh: await translatePromotionName(promotion.name)
+  }));
 }
 
 function getPromotionHeaders(token) {
@@ -2843,7 +2889,7 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
     const sites = await loadMarketingSites(auth, token, force);
     const siteResults = await mapWithConcurrency(sites, 3, async site => {
       try {
-        const promotions = await loadSitePromotions(token, site, force);
+        const promotions = await addChinesePromotionNames(await loadSitePromotions(token, site, force));
         return { ...site, supported: true, promotions };
       } catch (error) {
         return { ...site, supported: false, message: marketingApiError(error, '活动接口不可用'), promotions: [] };
