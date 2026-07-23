@@ -2916,7 +2916,18 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
       headers: getPromotionHeaders(token),
       timeout: 25000
     });
-    const rawItems = Array.isArray(response.data?.results) ? response.data.results : [];
+    const responseItems = Array.isArray(response.data?.results) ? response.data.results : [];
+    const startedItemIds = new Set(responseItems
+      .filter(item => item?.status === 'started')
+      .map(item => String(item.id || '')));
+    const seenItemIds = new Set();
+    const rawItems = responseItems.filter(item => {
+      const itemId = String(item?.id || '');
+      if (!itemId || item.status !== status || seenItemIds.has(itemId)) return false;
+      if (status === 'candidate' && startedItemIds.has(itemId)) return false;
+      seenItemIds.add(itemId);
+      return true;
+    });
     const items = await mapWithConcurrency(rawItems, 4, async item => {
       const cacheKey = `item:${item.id}`;
       let detail = readTimedCache(marketingItemCache, cacheKey, MARKETING_ITEM_CACHE_TTL);
