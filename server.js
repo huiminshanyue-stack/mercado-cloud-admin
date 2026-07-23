@@ -2733,6 +2733,7 @@ app.get('/api/marketing/accounts', requireAuth, async (req, res) => {
 const marketingCache = new Map();
 const marketingItemCache = new Map();
 const promotionNameTranslationCache = new Map();
+const productAdsCache = new Map();
 const MARKETING_CACHE_TTL = 60 * 1000;
 const MARKETING_ITEM_CACHE_TTL = 5 * 60 * 1000;
 const PROMOTION_NAME_ZH_OVERRIDES = new Map([
@@ -2816,6 +2817,54 @@ function getPromotionHeaders(token) {
     headers['X-Caller-Id'] = ML_CLIENT_ID;
   }
   return headers;
+}
+
+function getProductAdsHeaders(token) {
+  return { Authorization: `Bearer ${token}`, 'api-version': '2' };
+}
+
+function getAdvertisingCenterUrl(siteId) {
+  return ({
+    MCO: 'https://www.mercadolibre.com.co/publicidad',
+    MLB: 'https://www.mercadolivre.com.br/publicidade',
+    MLM: 'https://www.mercadolibre.com.mx/publicidad',
+    MLA: 'https://www.mercadolibre.com.ar/publicidad',
+    MLC: 'https://www.mercadolibre.cl/publicidad'
+  })[siteId] || 'https://www.mercadolibre.com/';
+}
+
+function productAdsDateRange(days) {
+  const dateTo = new Date();
+  const dateFrom = new Date(dateTo.getTime() - (days - 1) * 86400000);
+  return { dateFrom: dateFrom.toISOString().slice(0, 10), dateTo: dateTo.toISOString().slice(0, 10) };
+}
+
+function normalizeAdMetrics(metrics = {}) {
+  return {
+    impressions: Number(metrics.prints || 0),
+    clicks: Number(metrics.clicks || 0),
+    cost: Number(metrics.cost || 0),
+    sales: Number(metrics.total_amount || 0),
+    units: Number(metrics.units_quantity || 0)
+  };
+}
+
+function addAdMetrics(target, metrics) {
+  target.impressions += metrics.impressions;
+  target.clicks += metrics.clicks;
+  target.cost += metrics.cost;
+  target.sales += metrics.sales;
+  target.units += metrics.units;
+}
+
+function finalizeAdMetrics(metrics) {
+  return {
+    ...metrics,
+    ctr: metrics.impressions ? metrics.clicks / metrics.impressions * 100 : 0,
+    cpc: metrics.clicks ? metrics.cost / metrics.clicks : 0,
+    acos: metrics.sales ? metrics.cost / metrics.sales * 100 : 0,
+    roas: metrics.cost ? metrics.sales / metrics.cost : 0
+  };
 }
 
 function extractAdvertiserUserId(advertiser) {
@@ -2931,6 +2980,106 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
     res.status(status).json({ code: status, message: marketingApiError(error, '营销接口读取失败') });
+  }
+});
+
+app.get('/api/marketing/product-ads/overview', requireAuth, async (req, res) => {
+  try {
+    const days = [7, 30, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 30;
+    const force = String(req.query.force || '') === '1';
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
+    const cacheKey = `product-ads-overview:${auth.ml_user_id}:${days}`;
+    if (!force) {
+      const cached = readTimedCache(productAdsCache, cacheKey, MARKETING_CACHE_TTL);
+      if (cached) return res.json({ code: 0, data: cached });
+    }
+    const sites = await loadMarketingSites(auth, token, force);
+    const { dateFrom, dateTo } = productAdsDateRange(days);
+    const metricNames = 'clicks,prints,cost,ctr,cpc,acos,roas,total_amount,units_quantity';
+    const accounts = await mapWithConcurrency(sites, 2, async site => {
+      const base = `https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(site.siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads`;
+      try {
+        const params = { limit: 50, offset: 0, date_from: dateFrom, date_to: dateTo, metrics: metricNames };
+        const [campaignResponse, productResponse] = await Promise.all([
+          axios.get(`${base}/campaigns/search`, { params, headers: getProductAdsHeaders(token), timeout: 25000 }),
+          axios.get(`${base}/ads/search`, { params: { ...params, limit: 1 }, headers: getProductAdsHeaders(token), timeout: 25000 })
+        ]);
+        const rawCampaigns = Array.isArray(campaignResponse.data?.results) ? campaignResponse.data.results : [];
+        const totals = { impressions: 0, clicks: 0, cost: 0, sales: 0, units: 0 };
+        const campaigns = rawCampaigns.map(campaign => {
+          const metrics = normalizeAdMetrics(campaign.metrics);
+          addAdMetrics(totals, metrics);
+          return {
+            id: campaign.id,
+            name: campaign.name || '',
+            status: campaign.status || '',
+            budget: Number(campaign.budget || 0),
+            strategy: campaign.strategy || '',
+            metrics: finalizeAdMetrics(metrics)
+          };
+        });
+        return {
+          ...site,
+          available: true,
+          advertisingUrl: getAdvertisingCenterUrl(site.siteId),
+          campaignTotal: Number(campaignResponse.data?.paging?.total || campaigns.length),
+          activeCampaigns: campaigns.filter(item => item.status === 'active').length,
+          pausedCampaigns: campaigns.filter(item => item.status === 'paused').length,
+          productTotal: Number(productResponse.data?.paging?.total || 0),
+          metrics: finalizeAdMetrics(totals),
+          campaigns
+        };
+      } catch (error) {
+        return { ...site, available: false, advertisingUrl: getAdvertisingCenterUrl(site.siteId), message: marketingApiError(error, '广告数据读取失败'), campaignTotal: 0, activeCampaigns: 0, pausedCampaigns: 0, productTotal: 0, metrics: finalizeAdMetrics({ impressions: 0, clicks: 0, cost: 0, sales: 0, units: 0 }), campaigns: [] };
+      }
+    });
+    const summaryBase = { impressions: 0, clicks: 0, cost: 0, sales: 0, units: 0 };
+    accounts.forEach(account => addAdMetrics(summaryBase, account.metrics));
+    const result = {
+      dateFrom, dateTo,
+      summary: {
+        accountTotal: accounts.length,
+        campaignTotal: accounts.reduce((sum, item) => sum + item.campaignTotal, 0),
+        activeCampaigns: accounts.reduce((sum, item) => sum + item.activeCampaigns, 0),
+        productTotal: accounts.reduce((sum, item) => sum + item.productTotal, 0),
+        metrics: finalizeAdMetrics(summaryBase)
+      },
+      accounts
+    };
+    writeTimedCache(productAdsCache, cacheKey, result, 50);
+    res.json({ code: 0, data: result });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '广告数据读取失败') });
+  }
+});
+
+app.get('/api/marketing/product-ads/products', requireAuth, async (req, res) => {
+  try {
+    const siteId = String(req.query.siteId || '').trim().toUpperCase();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const size = Math.min(50, Math.max(1, Number(req.query.size) || 20));
+    const days = [7, 30, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 30;
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
+    const sites = await loadMarketingSites(auth, token);
+    const site = sites.find(item => item.siteId === siteId);
+    if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
+    const { dateFrom, dateTo } = productAdsDateRange(days);
+    const base = `https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(site.siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads`;
+    const response = await axios.get(`${base}/ads/search`, {
+      params: { limit: size, offset: (page - 1) * size, date_from: dateFrom, date_to: dateTo, metrics: 'clicks,prints,cost,ctr,cpc,acos,roas,total_amount,units_quantity' },
+      headers: getProductAdsHeaders(token), timeout: 25000
+    });
+    const products = (response.data?.results || []).map(item => ({
+      itemId: item.item_id || '', campaignId: item.campaign_id || '', adGroupId: item.ad_group_id || '',
+      title: item.title || item.item_id || '', status: item.status || '', thumbnail: item.thumbnail || '',
+      permalink: item.permalink || '', price: Number(item.price_usd ?? item.price ?? 0),
+      metrics: finalizeAdMetrics(normalizeAdMetrics(item.metrics))
+    }));
+    res.json({ code: 0, data: { products, total: Number(response.data?.paging?.total || products.length), page, size } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '广告商品读取失败') });
   }
 });
 
