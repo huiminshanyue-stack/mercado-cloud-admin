@@ -3072,11 +3072,33 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
     const cacheKey = `marketing-products:${auth.ml_user_id}:${siteId}:${page}:${size}`;
     let workspace = force ? null : readTimedCache(marketingProductsCache, cacheKey, MARKETING_CACHE_TTL);
     if (!workspace) {
-      const searchResponse = await axios.get(`https://api.mercadolibre.com/users/${encodeURIComponent(site.userId)}/items/search`, {
-        params: { status: 'active', limit: size, offset: (page - 1) * size },
-        headers: { Authorization: `Bearer ${token}` }, timeout: 25000
-      });
-      const itemIds = Array.isArray(searchResponse.data?.results) ? searchResponse.data.results.map(String) : [];
+      let itemIds = [];
+      let itemTotal = 0;
+      let source = 'online-items';
+      try {
+        const searchResponse = await axios.get(`https://api.mercadolibre.com/users/${encodeURIComponent(site.userId)}/items/search`, {
+          params: { status: 'active', limit: size, offset: (page - 1) * size },
+          headers: { Authorization: `Bearer ${token}` }, timeout: 25000
+        });
+        itemIds = Array.isArray(searchResponse.data?.results) ? searchResponse.data.results.map(String) : [];
+        itemTotal = Number(searchResponse.data?.paging?.total || itemIds.length);
+      } catch (searchError) {
+        if (![401, 403, 404].includes(Number(searchError.response?.status))) throw searchError;
+        source = 'marketing-opportunities';
+        const promotions = await loadSitePromotions(token, site, force);
+        const promotionItems = await mapWithConcurrency(promotions.slice(0, 20), 3, async promotion => {
+          try {
+            const response = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/promotions/${encodeURIComponent(promotion.id)}/items`, {
+              params: { user_id: site.userId, promotion_type: promotion.type, limit: 50 },
+              headers: getPromotionHeaders(token), timeout: 20000
+            });
+            return (response.data?.results || []).map(item => String(item.id || '')).filter(Boolean);
+          } catch { return []; }
+        });
+        const allIds = [...new Set(promotionItems.flat())];
+        itemTotal = allIds.length;
+        itemIds = allIds.slice((page - 1) * size, page * size);
+      }
       const products = await mapWithConcurrency(itemIds, 4, async itemId => {
         const detailKey = `item:${itemId}`;
         let detail = readTimedCache(marketingItemCache, detailKey, MARKETING_ITEM_CACHE_TTL);
@@ -3123,7 +3145,7 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
           console.warn('[Marketing] 商品广告状态读取失败:', error.message);
         }
       }
-      workspace = { products, total: Number(searchResponse.data?.paging?.total || itemIds.length), page, size, siteId, advertisingUrl: getAdvertisingCenterUrl(siteId) };
+      workspace = { products, total: itemTotal, page, size, siteId, source, advertisingUrl: getAdvertisingCenterUrl(siteId) };
       writeTimedCache(marketingProductsCache, cacheKey, workspace, 100);
     }
     const filtered = keyword
