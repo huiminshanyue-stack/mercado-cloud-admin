@@ -940,7 +940,7 @@ app.get('/api/admin/agent/rule', requireAuth, async (req, res) => {
   if (req.authUser.role !== 'agent' && req.authUser.role !== 'admin') {
     return res.json(jsonFail('无权操作'));
   }
-  const limit = getAgentMaxValidUntil();
+  const limit = getAgentMaxValidUntil(req.authUser.username);
   res.json(jsonOk(limit));
 });
 
@@ -1041,8 +1041,14 @@ app.put('/api/admin/users/:username', requireAdmin, async (req, res) => {
 // ========== 代理/管理员 客户开户接口 ==========
 
 // 计算代理可开设的最大有效期
-function getAgentMaxValidUntil() {
+function getAgentMaxValidUntil(agentUsername = '') {
   const now = new Date();
+  // CNTORO 代理仅允许开通最长 3 天体验账号。
+  if (String(agentUsername).trim().toUpperCase() === 'CNTORO') {
+    const maxDays = 3;
+    const maxDate = new Date(now.getTime() + maxDays * 24 * 60 * 60 * 1000);
+    return { maxDays, maxDate, rule: 'CNTORO 代理体验账号最长可开通3天' };
+  }
   const aug1 = new Date(2026, 7, 1); // 2026-08-01 00:00 GMT+8
   // 当前北京时间
   const beijingOffset = 8 * 60 * 60 * 1000;
@@ -1075,7 +1081,7 @@ app.post('/api/admin/agent/user', requireAuth, async (req, res) => {
   const authUser = req.authUser;
 
   if (authUser.role === 'agent') {
-    const limit = getAgentMaxValidUntil();
+    const limit = getAgentMaxValidUntil(authUser.username);
     let finalValidUntil = validUntil ? new Date(validUntil) : new Date(Date.now() + limit.maxDays * 24 * 60 * 60 * 1000);
 
     if (finalValidUntil.getTime() > limit.maxDate.getTime()) {
