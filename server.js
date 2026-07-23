@@ -3137,19 +3137,18 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
         };
       });
       if (itemIds.length) {
-        try {
-          const adResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads/ad_groups/search`, {
-            params: { 'filters[item_ids]': itemIds.join(','), limit: 50, offset: 0 },
-            headers: getProductAdsHeaders(token), timeout: 20000
-          });
-          const adsByItem = new Map((adResponse.data?.results || []).map(ad => [String(ad.ad_group_external_id || ''), ad]));
-          products.forEach(product => {
-            const ad = adsByItem.get(product.itemId);
-            if (ad) product.ad = { id: ad.id, campaignId: ad.campaign_id, status: String(ad.status || '').toLowerCase() };
-          });
-        } catch (error) {
-          console.warn('[Marketing] 商品广告状态读取失败:', error.message);
-        }
+        await mapWithConcurrency(products, 5, async product => {
+          try {
+            const adResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads/ad_groups/search`, {
+              params: { 'filters[item_ids]': product.itemId, limit: 10, offset: 0 },
+              headers: getProductAdsHeaders(token), timeout: 12000
+            });
+            const ad = adResponse.data?.results?.[0];
+            if (ad) product.ad = { id: ad.id, campaignId: ad.campaign_id || null, status: String(ad.status || 'idle').toLowerCase() };
+          } catch (error) {
+            console.warn('[Marketing] 商品广告状态读取失败:', product.itemId, error.message);
+          }
+        });
       }
       workspace = { products, total: itemTotal, page, size, siteId, source, advertisingUrl: getAdvertisingCenterUrl(siteId) };
       writeTimedCache(marketingProductsCache, cacheKey, workspace, 100);
@@ -3161,6 +3160,36 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
     res.status(status).json({ code: status, message: marketingApiError(error, '店铺营销商品读取失败') });
+  }
+});
+
+app.put('/api/marketing/product-ads/ad-groups/:adGroupId', requireAuth, async (req, res) => {
+  try {
+    const adGroupId = String(req.params.adGroupId || '').trim();
+    const siteId = String(req.body?.siteId || '').trim().toUpperCase();
+    const status = String(req.body?.status || '').trim().toLowerCase();
+    const campaignId = String(req.body?.campaignId || '').trim();
+    if (!adGroupId || !siteId || !campaignId) return res.status(400).json({ code: 400, message: '请选择商品、国家和广告活动' });
+    if (!['active', 'paused'].includes(status)) return res.status(400).json({ code: 400, message: '广告状态只能设置为投放中或暂停' });
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.body?.storeId);
+    const sites = await loadMarketingSites(auth, token);
+    const site = sites.find(item => item.siteId === siteId);
+    if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
+    const campaignResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads/campaigns/search`, {
+      params: { limit: 50, offset: 0 }, headers: getProductAdsHeaders(token), timeout: 20000
+    });
+    if (!(campaignResponse.data?.results || []).some(item => String(item.id) === campaignId)) {
+      return res.status(400).json({ code: 400, message: '所选广告活动不存在或不属于该国家账户' });
+    }
+    const response = await axios.put(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/ad_groups/${encodeURIComponent(adGroupId)}`, {
+      status, campaign_id: Number(campaignId)
+    }, { headers: { ...getProductAdsHeaders(token), 'Content-Type': 'application/json' }, timeout: 25000 });
+    for (const key of productAdsCache.keys()) if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
+    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${auth.ml_user_id}:${siteId}:`)) marketingProductsCache.delete(key);
+    res.json({ code: 0, message: '商品广告已由美客多确认更新', data: { adGroupId, status: response.data?.status || status, campaignId: response.data?.campaign_id || Number(campaignId) } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '商品广告更新失败') });
   }
 });
 
