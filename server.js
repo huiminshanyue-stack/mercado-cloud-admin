@@ -2982,7 +2982,7 @@ async function loadPromotionSites(auth, token, force = false) {
 }
 
 async function loadSitePromotions(token, site, force = false) {
-  const cacheKey = `promotions:${site.userId}`;
+  const cacheKey = `promotions:${site.siteId}:${site.userId}`;
   if (!force) {
     const cached = readTimedCache(marketingCache, cacheKey, MARKETING_CACHE_TTL);
     if (cached) return cached;
@@ -2992,12 +2992,11 @@ async function loadSitePromotions(token, site, force = false) {
     timeout: 20000
   });
   let promotions = Array.isArray(response.data?.results) ? response.data.results : [];
-  if (site.source === 'authorization-probe') {
-    promotions = promotions.filter(promotion => {
-      const promotionSite = String(promotion.id || '').match(/(?:^|-)(MLM|MLB|MLC|MCO|MLA)(?:\d|$)/)?.[1];
-      return !promotionSite || promotionSite === site.siteId;
-    });
-  }
+  promotions = promotions.filter(promotion => {
+    const promotionSite = String(promotion.id || '').toUpperCase().match(/(?:^|-)(MLM|MLB|MLC|MCO|MLA)(?:\d|$)/)?.[1];
+    if (promotionSite) return promotionSite === site.siteId;
+    return site.source !== 'authorization-probe';
+  });
   return writeTimedCache(marketingCache, cacheKey, promotions, 50);
 }
 
@@ -3734,7 +3733,7 @@ app.post('/api/marketing/promotions/enroll-batch', requireAuth, async (req, res)
         return { itemId, success: false, message: marketingApiError(error, '报名失败') };
       }
     });
-    marketingCache.delete(`promotions:${context.site.userId}`);
+    marketingCache.delete(`promotions:${context.site.siteId}:${context.site.userId}`);
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
     for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${context.auth.ml_user_id}:${context.site.siteId}:`)) marketingProductsCache.delete(key);
@@ -3775,6 +3774,7 @@ app.post('/api/marketing/promotions/exit-batch', requireAuth, async (req, res) =
         return { itemId, success: false, message: marketingApiError(error, '退出失败') };
       }
     });
+    marketingCache.delete(`promotions:${context.site.siteId}:${context.site.userId}`);
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
     for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${context.auth.ml_user_id}:${context.site.siteId}:`)) marketingProductsCache.delete(key);
