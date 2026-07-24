@@ -709,6 +709,16 @@ function requireOrderAccess(req, res, next) {
   });
 }
 
+function requireMarketingAccess(req, res, next) {
+  requireAuth(req, res, () => {
+    const username = String(req.authUser.username || '').trim().toUpperCase();
+    if (req.authUser.role !== 'admin' && !ORDER_TEST_USERNAMES.has(username)) {
+      return res.status(403).json({ code: 403, message: '营销中心目前仅向管理员及指定内测账号开放' });
+    }
+    next();
+  });
+}
+
 function requireSyncKey(req, res, next) {
   if (!SYNC_API_KEY) {
     return res.status(503).json({ code: 503, message: '同步服务未配置' });
@@ -1667,8 +1677,8 @@ async function getOrderMarketplaceSellerIds(ownerUsername, storeUserId) {
   return [...new Set([String(storeUserId),...rows.map(row=>String(row.id || '')).filter(Boolean)])];
 }
 
-// 营销中心仅管理员可见且仅管理员可调用，避免普通用户绕过前端直接访问接口。
-app.use('/api/marketing', requireAdmin);
+// 营销中心仅管理员和指定内测账号可调用，避免其他用户绕过前端直接访问接口。
+app.use('/api/marketing', requireMarketingAccess);
 
 app.post('/api/marketing/oauth-link', requireAuth, async (req, res) => {
   if (!ML_CLIENT_ID || !ML_CLIENT_SECRET) return res.status(503).json({ code: 503, message: 'Mercado Libre OAuth 尚未配置' });
@@ -2705,7 +2715,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.10',
+    version: '2026-07-24.11',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2717,7 +2727,8 @@ app.get('/api/health/order-management', (req, res) => {
     perItemMinimumEnrollmentDiscount: true,
     pagedEnrollmentWithPause: true,
     cntoroOrderTestAccess: true,
-    adminOnlyMarketingCenter: true,
+    adminOnlyMarketingCenter: false,
+    cntoroMarketingTestAccess: true,
     userIsolation: true,
     officialPayoutOnly: true,
     multiStoreSync: true,
