@@ -2929,18 +2929,26 @@ async function loadPromotionSites(auth, token, force = false) {
   const searchPaths = [`users/${encodeURIComponent(auth.ml_user_id)}/items/search`, `marketplace/users/${encodeURIComponent(auth.ml_user_id)}/items/search`];
   for (const path of searchPaths) {
     try {
-      const response = await axios.get(`https://api.mercadolibre.com/${path}`, { params: { status: 'active', limit: 50, offset: 0 }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
-      const ids = (response.data?.results || []).map(String).filter(Boolean);
-      await mapWithConcurrency(ids.slice(0, 30), 4, async itemId => {
+      const representatives = new Map();
+      for (let offset = 0; offset < 500 && representatives.size < 5; offset += 50) {
+        const response = await axios.get(`https://api.mercadolibre.com/${path}`, { params: { status: 'active', limit: 50, offset }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+        const ids = (response.data?.results || []).map(String).filter(Boolean);
+        for (const itemId of ids) {
+          const siteId = itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1];
+          if (siteId && !representatives.has(siteId)) representatives.set(siteId, itemId);
+        }
+        const total = Number(response.data?.paging?.total || ids.length);
+        if (!ids.length || offset + ids.length >= total) break;
+      }
+      await mapWithConcurrency([...representatives.entries()], 3, async ([siteId, itemId]) => {
         try {
           const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
           const detail = detailResponse.data || {};
-          const siteId = String(detail.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
           const userId = String(detail.seller_id || detail.seller?.id || '');
-          if (['MLM', 'MLB', 'MLC', 'MCO', 'MLA'].includes(siteId) && userId) discovered.set(siteId, { siteId, userId, source: 'store-items' });
+          if (userId) discovered.set(siteId, { siteId, userId, source: 'store-items' });
         } catch {}
       });
-      if (discovered.size) break;
+      if (representatives.size) break;
     } catch {}
   }
   try {
