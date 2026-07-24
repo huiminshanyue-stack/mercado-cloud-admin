@@ -3553,6 +3553,74 @@ app.delete('/api/marketing/product-ads/campaigns/:campaignId/ad-groups/:adGroupI
   }
 });
 
+app.post('/api/marketing/promotion-items/match-selected', requireAuth, async (req, res) => {
+  try {
+    const promotionId = String(req.body?.promotionId || '').trim();
+    const promotionType = String(req.body?.promotionType || '').trim().toUpperCase();
+    const siteId = String(req.body?.siteId || '').trim().toUpperCase();
+    const itemIds = [...new Set((Array.isArray(req.body?.itemIds) ? req.body.itemIds : []).map(value => String(value || '').trim().toUpperCase()).filter(Boolean))].slice(0, 30);
+    if (!promotionId || !promotionType || !siteId || !itemIds.length) return res.status(400).json({ code: 400, message: '请选择活动和需要核对的商品' });
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.body?.storeId);
+    const sites = await loadPromotionSites(auth, token);
+    const resolved = await resolvePromotionSite(sites, token, siteId, promotionId, promotionType);
+    const site = resolved.site;
+    if (!site || !resolved.promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
+      return res.status(404).json({ code: 404, message: '活动不存在或已结束，请刷新活动列表' });
+    }
+    const rows = await mapWithConcurrency(itemIds, 4, async itemId => {
+      if (!itemId.startsWith(siteId)) return { itemId, matched: false, reason: '商品不属于所选国家店铺' };
+      try {
+        const promotionResponse = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/items/${encodeURIComponent(itemId)}`, {
+          params: { user_id: site.userId }, headers: getPromotionHeaders(token), timeout: 15000
+        });
+        const promotion = (Array.isArray(promotionResponse.data) ? promotionResponse.data : []).find(item =>
+          String(item?.id) === promotionId && String(item?.type || '').toUpperCase() === promotionType && String(item?.status || '').toLowerCase() === 'candidate'
+        );
+        if (!promotion) return { itemId, matched: false, reason: '平台未将该商品列为此活动候选' };
+        const offer = Array.isArray(promotion.offers) ? (promotion.offers.find(entry => entry?.status === 'candidate') || promotion.offers[0] || {}) : {};
+        const detailKey = `item:${itemId}`;
+        let detail = readTimedCache(marketingItemCache, detailKey, MARKETING_ITEM_CACHE_TTL);
+        if (!hasMarketingItemPresentation(detail)) {
+          try {
+            const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, {
+              headers: { Authorization: `Bearer ${token}` }, timeout: 15000
+            });
+            detail = writeTimedCache(marketingItemCache, detailKey, detailResponse.data || {}, 500);
+          } catch { detail = detail || {}; }
+        }
+        return {
+          matched: true,
+          itemId,
+          cbtItemId: detail?.cbt_item_id || '',
+          title: detail?.title || itemId,
+          thumbnail: marketingItemThumbnail(detail),
+          currentPrice: Number(promotion.original_price ?? detail?.price ?? 0),
+          activityPrice: Number(promotion.price || promotion.deal_price || offer.price || offer.deal_price || offer.new_price || offer.suggested_discounted_price || 0),
+          platformDiscountPercent: Number(promotion.discount_percentage || offer.discount_percentage || offer.discount_percent || 0),
+          currency: promotion.currency_id || detail?.currency_id || 'USD',
+          minPrice: Number(promotion.min_discounted_price || offer.min_discounted_price || 0),
+          maxPrice: Number(promotion.max_discounted_price || offer.max_discounted_price || 0),
+          suggestedPrice: Number(promotion.suggested_discounted_price || offer.suggested_discounted_price || 0),
+          stock: Number(detail?.available_quantity || 0),
+          offerId: promotion.offer_id || promotion.candidate_id || offer.id || '',
+          subType: promotion.sub_type || ''
+        };
+      } catch (error) {
+        return { itemId, matched: false, reason: marketingApiError(error, '候选资格读取失败') };
+      }
+    });
+    res.json({ code: 0, data: {
+      items: rows.filter(item => item.matched),
+      unmatched: rows.filter(item => !item.matched),
+      selectedCount: itemIds.length,
+      matchedCount: rows.filter(item => item.matched).length
+    } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '所选商品活动资格核对失败') });
+  }
+});
+
 app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
   try {
     const promotionId = String(req.query.promotionId || '').trim();
