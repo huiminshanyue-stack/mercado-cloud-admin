@@ -368,6 +368,23 @@ async function initOrderManagementTables() {
     WHERE o.store_user_id=a.ml_user_id AND o.owner_username IS NULL`);
   await pool.query(`UPDATE order_alerts a SET owner_username=o.owner_username FROM ml_orders o
     WHERE a.order_id=o.ml_order_id AND a.owner_username IS NULL`);
+  // 预计发货时效统一为：周一至周四 72 小时；周五、周六 120 小时；周日 96 小时。
+  // 迁移只执行一次且仅调整系统估算值，不覆盖 Mercado Libre 官方返回的 handling deadline。
+  const deadlineRuleVersion = '2026-07-24-72h-v1';
+  const deadlineRuleSetting = await pool.query("SELECT value FROM settings WHERE key='order_deadline_rule_version'");
+  if (deadlineRuleSetting.rows[0]?.value !== deadlineRuleVersion) {
+    await pool.query(`UPDATE ml_orders SET handling_deadline=date_created + CASE EXTRACT(DOW FROM
+      COALESCE(NULLIF(LEFT(raw_data->>'date_created',10),'')::date,(date_created AT TIME ZONE 'Asia/Shanghai')::date))
+      WHEN 5 THEN INTERVAL '120 hours'
+      WHEN 6 THEN INTERVAL '120 hours'
+      WHEN 0 THEN INTERVAL '96 hours'
+      ELSE INTERVAL '72 hours' END,updated_at=NOW()
+      WHERE deadline_is_estimated=TRUE AND date_created IS NOT NULL`);
+    await pool.query(`UPDATE order_alerts SET is_read=TRUE
+      WHERE alert_type='deadline' AND event_key LIKE 'deadline:%'`);
+    await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_deadline_rule_version',$1,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [deadlineRuleVersion]);
+  }
   await pool.query(`UPDATE erp_connectors SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
   await pool.query(`UPDATE fulfillment_services SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
   await pool.query(`UPDATE fulfillment_submissions SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
@@ -2596,7 +2613,8 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.1',
+    version: '2026-07-24.2',
+    dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     userIsolation: true,
     officialPayoutOnly: true,
     multiStoreSync: true,
@@ -2744,8 +2762,14 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       let handlingDeadline = officialHandlingDeadline;
       if (!handlingDeadline && order.date_created) {
         const created = new Date(order.date_created);
-        const extraDays = created.getDay() === 5 ? 2 : ([0, 6].includes(created.getDay()) ? 1 : 0);
-        handlingDeadline = new Date(created.getTime() + (48 + extraDays * 24) * 3600000).toISOString();
+        const sourceCalendarDate = String(order.date_created).match(/^\d{4}-\d{2}-\d{2}/)?.[0];
+        const createdWeekday = sourceCalendarDate
+          ? new Date(`${sourceCalendarDate}T12:00:00Z`).getUTCDay()
+          : created.getUTCDay();
+        const dispatchHours = createdWeekday === 5 || createdWeekday === 6
+          ? 120
+          : (createdWeekday === 0 ? 96 : 72);
+        handlingDeadline = new Date(created.getTime() + dispatchHours * 3600000).toISOString();
       }
       const cancelActor = order.cancel_detail?.group || order.cancel_detail?.initiated_by ||
         order.cancel_detail?.responsible || order.cancellation?.initiated_by ||
@@ -2825,8 +2849,11 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       const old = previous.rows[0];
       if (!old) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'new_order','收到新订单',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
       if (order.status === 'cancelled' && old?.status !== 'cancelled') await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'cancelled','订单已取消',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'}订单已被取消`, `cancelled:${order.id}`]);
-      if (handlingDeadline && !refundAmount && new Date(handlingDeadline).getTime() > Date.now() && new Date(handlingDeadline).getTime() - Date.now() <= 86400000 && !['shipped','delivered','cancelled'].includes(shipment.status)) {
-        await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'deadline','订单即将延误',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `官方待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
+      const deadlineFinished = refundAmount > 0 || ['cancelled','refunded'].includes(order.status) || ['shipped','delivered','cancelled'].includes(shipment.status);
+      if (deadlineFinished) await pool.query(`UPDATE order_alerts SET is_read=TRUE
+        WHERE owner_username=$1 AND order_id=$2 AND alert_type='deadline'`, [req.authUser.username,String(order.id)]);
+      if (handlingDeadline && !deadlineFinished && new Date(handlingDeadline).getTime() > Date.now() && new Date(handlingDeadline).getTime() - Date.now() <= 86400000) {
+        await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'deadline','订单即将延误',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${officialHandlingDeadline ? '官方' : '预计'}待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
       }
       imported++;
     }
