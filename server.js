@@ -2691,12 +2691,14 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.6',
+    version: '2026-07-24.7',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
     shippingActionsHorizontal: true,
     officialClaimReputation: true,
+    cbtShipmentLabelPath: true,
+    directLabelPrint: true,
     userIsolation: true,
     officialPayoutOnly: true,
     multiStoreSync: true,
@@ -4547,22 +4549,30 @@ app.get('/api/admin/orders/:orderId/label', requireAdmin, async (req, res) => {
     if (!rows.length) return res.status(404).json({ code: 404, message: '订单不存在或不属于当前账号' });
     const shipmentIds = [...new Set(rows.map(row => row.shipping_id).filter(Boolean))];
     if (!shipmentIds.length) return res.status(404).json({ code: 404, message: '该订单暂无国际运单，无法下载面单' });
+    const requestedShipmentId = String(req.query.shipmentId || '').trim();
+    const targetShipmentId = requestedShipmentId && shipmentIds.includes(requestedShipmentId)
+      ? requestedShipmentId : shipmentIds[0];
     audit = { storeUserId: rows[0].store_user_id, shipmentIds };
     const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
     if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效，请重新授权后下载' });
     let pdfResponse;
     let lastOfficialError;
-    for (const path of ['shipment_labels', 'marketplace/shipment_labels']) {
+    const labelRequests = [
+      { url: `https://api.mercadolibre.com/marketplace/shipments/${encodeURIComponent(targetShipmentId)}/labels`, params: undefined },
+      { url: 'https://api.mercadolibre.com/marketplace/shipment_labels', params: { shipment_ids: targetShipmentId, response_type: 'pdf' } },
+      { url: 'https://api.mercadolibre.com/shipment_labels', params: { shipment_ids: targetShipmentId, response_type: 'pdf' } }
+    ];
+    for (const request of labelRequests) {
       try {
-        pdfResponse = await axios.get(`https://api.mercadolibre.com/${path}`, {
-          params: { shipment_ids: shipmentIds.join(','), response_type: 'pdf' },
+        pdfResponse = await axios.get(request.url, {
+          params: request.params,
           headers: { Authorization: `Bearer ${context.token}`, Accept: 'application/pdf' },
           responseType: 'arraybuffer', timeout: 30000
         });
         if (pdfResponse?.data) break;
       } catch (error) {
         lastOfficialError = error;
-        if (error.response?.status !== 404) throw error;
+        console.warn('[Orders] 面单兼容路径失败:', request.url, error.response?.status || error.message);
       }
     }
     if (!pdfResponse?.data) {
