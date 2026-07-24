@@ -2745,7 +2745,8 @@ const marketingProductsCache = new Map();
 const promotionPageCursorCache = new Map();
 const promotionItemsPageCache = new Map();
 const MARKETING_CACHE_TTL = 60 * 1000;
-const MARKETING_ITEM_CACHE_TTL = 5 * 60 * 1000;
+const MARKETING_ITEM_CACHE_TTL = 10 * 60 * 1000;
+const MARKETING_PRODUCTS_CACHE_TTL = 3 * 60 * 1000;
 const PROMOTION_NAME_ZH_OVERRIDES = new Map([
   ['AON Home Industries', '家居行业全场优惠'],
   ['Best Shared Offers Jul!', '7月精选共享优惠'],
@@ -3191,7 +3192,7 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
     const site = sites.find(item => item.siteId === siteId);
     if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账户' });
     const cacheKey = `marketing-products:${auth.ml_user_id}:${siteId}:${page}:${size}`;
-    let workspace = force ? null : readTimedCache(marketingProductsCache, cacheKey, MARKETING_CACHE_TTL);
+    let workspace = force ? null : readTimedCache(marketingProductsCache, cacheKey, MARKETING_PRODUCTS_CACHE_TTL);
     if (!workspace) {
       let itemIds = [];
       let itemTotal = 0;
@@ -3555,7 +3556,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
     const site = sites.find(item => item.siteId === siteId);
     if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账号' });
     const pageCacheKey = `${auth.ml_user_id}:${siteId}:${promotionId}:${promotionType}:${status}:${page}:${size}`;
-    const cachedPage = readTimedCache(promotionItemsPageCache, pageCacheKey, 2 * 60 * 1000);
+    const cachedPage = readTimedCache(promotionItemsPageCache, pageCacheKey, 5 * 60 * 1000);
     if (cachedPage) return res.json({ code: 0, data: cachedPage });
     const promotions = await loadSitePromotions(token, site);
     if (!promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
@@ -3736,6 +3737,7 @@ app.post('/api/marketing/promotions/enroll-batch', requireAuth, async (req, res)
     marketingCache.delete(`promotions:${context.site.userId}`);
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
+    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${context.auth.ml_user_id}:${context.site.siteId}:`)) marketingProductsCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
@@ -3775,6 +3777,7 @@ app.post('/api/marketing/promotions/exit-batch', requireAuth, async (req, res) =
     });
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
+    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${context.auth.ml_user_id}:${context.site.siteId}:`)) marketingProductsCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
