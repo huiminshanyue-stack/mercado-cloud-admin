@@ -2929,97 +2929,39 @@ async function loadPromotionSites(auth, token, force = false) {
     const cached = readTimedCache(marketingCache, cacheKey, 5 * 60 * 1000);
     if (cached) return cached;
   }
-  const discovered = new Map();
-  if (auth.site_id && auth.site_id !== 'CBT') discovered.set(auth.site_id, { siteId: auth.site_id, userId: String(auth.ml_user_id), source: 'authorization' });
-  const searchPaths = [`users/${encodeURIComponent(auth.ml_user_id)}/items/search`, `marketplace/users/${encodeURIComponent(auth.ml_user_id)}/items/search`];
-  for (const path of searchPaths) {
-    try {
-      const representatives = new Map();
-      const cbtItems = [];
-      for (let offset = 0; offset < 500 && representatives.size < 5; offset += 50) {
-        const response = await axios.get(`https://api.mercadolibre.com/${path}`, { params: { status: 'active', limit: 50, offset }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
-        const ids = (response.data?.results || []).map(String).filter(Boolean);
-        for (const itemId of ids) {
-          const siteId = itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1];
-          if (siteId && !representatives.has(siteId)) representatives.set(siteId, itemId);
-          if (/^CBT\d+$/i.test(itemId)) cbtItems.push(itemId);
-        }
-        const total = Number(response.data?.paging?.total || ids.length);
-        if (!ids.length || offset + ids.length >= total) break;
-      }
-      await mapWithConcurrency([...representatives.entries()], 3, async ([siteId, itemId]) => {
-        try {
-          const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
-          const detail = detailResponse.data || {};
-          const userId = String(detail.seller_id || detail.seller?.id || '');
-          if (userId) discovered.set(siteId, { siteId, userId, source: 'store-items' });
-        } catch {}
-      });
-      const sampleStep = Math.max(1, Math.floor(cbtItems.length / 20));
-      const cbtSamples = cbtItems.filter((_, index) => index % sampleStep === 0).slice(0, 20);
-      await mapWithConcurrency(cbtSamples, 4, async itemId => {
-        try {
-          const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
-          const walk = value => {
-            if (!value || typeof value !== 'object') return;
-            const rawId = String(value.item_id || value.id || '');
-            const siteId = String(value.site_id || rawId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
-            const userId = String(value.seller_id || value.seller?.id || value.user_id || '');
-            if (['MLM', 'MLB', 'MLC', 'MCO', 'MLA'].includes(siteId) && userId) discovered.set(siteId, { siteId, userId, source: 'cbt-item-mapping' });
-            for (const child of Object.values(value)) if (child && typeof child === 'object') walk(child);
-          };
-          walk(detailResponse.data);
-        } catch {}
-      });
-      if (representatives.size) break;
-    } catch {}
+  const supportedSiteIds = new Set(['MLM', 'MLB', 'MLC', 'MCO', 'MLA']);
+  const discovered = [];
+  const directSiteId = String(auth.site_id || '').toUpperCase();
+  if (directSiteId && directSiteId !== 'CBT') {
+    discovered.push({ siteId: directSiteId, userId: String(auth.ml_user_id), source: 'authorization', logisticType: '', pricingModel: '' });
   }
-  await mapWithConcurrency(['MLM', 'MLB', 'MLC', 'MCO', 'MLA'].filter(siteId => !discovered.has(siteId)), 2, async siteId => {
-    for (const path of searchPaths) {
-      try {
-        const response = await axios.get(`https://api.mercadolibre.com/${path}`, {
-          params: { status: 'active', site_id: siteId, limit: 20, offset: 0 },
-          headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-        });
-        const ids = (response.data?.results || []).map(String).filter(Boolean);
-        for (const itemId of ids) {
-          try {
-            const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
-            const detail = detailResponse.data || {};
-            const directSite = String(detail.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
-            const directUser = String(detail.seller_id || detail.seller?.id || '');
-            if (directSite === siteId && directUser) {
-              discovered.set(siteId, { siteId, userId: directUser, source: 'country-filtered-items' });
-              return;
-            }
-            let mappedUser = '';
-            const walk = value => {
-              if (!value || typeof value !== 'object' || mappedUser) return;
-              const rawId = String(value.item_id || value.id || '');
-              const mappedSite = String(value.site_id || rawId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
-              const userId = String(value.seller_id || value.seller?.id || value.user_id || '');
-              if (mappedSite === siteId && userId) mappedUser = userId;
-              else for (const child of Object.values(value)) if (child && typeof child === 'object') walk(child);
-            };
-            walk(detail);
-            if (mappedUser) {
-              discovered.set(siteId, { siteId, userId: mappedUser, source: 'country-filtered-cbt-mapping' });
-              return;
-            }
-          } catch {}
-        }
-      } catch {}
+  if (directSiteId === 'CBT') {
+    const response = await axios.get(`https://api.mercadolibre.com/marketplace/users/${encodeURIComponent(auth.ml_user_id)}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    });
+    for (const marketplace of Array.isArray(response.data?.marketplaces) ? response.data.marketplaces : []) {
+      const siteId = String(marketplace.site_id || '').toUpperCase();
+      const userId = String(marketplace.user_id || '');
+      if (!supportedSiteIds.has(siteId) || !/^\d+$/.test(userId)) continue;
+      discovered.push({
+        siteId,
+        userId,
+        source: 'marketplace-identity',
+        logisticType: String(marketplace.logistic_type || ''),
+        pricingModel: String(marketplace.pricing_model || ''),
+        businessModel: String(marketplace.business_model || '')
+      });
     }
-  });
-  try {
-    for (const site of await loadMarketingSites(auth, token, force)) {
-      if (!discovered.has(site.siteId)) discovered.set(site.siteId, { siteId: site.siteId, userId: site.userId, source: 'account-identity-fallback' });
-    }
-  } catch {}
-  for (const siteId of ['MLM', 'MLB', 'MLC', 'MCO', 'MLA']) {
-    if (!discovered.has(siteId)) discovered.set(siteId, { siteId, userId: String(auth.ml_user_id), source: 'authorization-probe' });
   }
-  return writeTimedCache(marketingCache, cacheKey, [...discovered.values()], 50);
+  const unique = [...new Map(discovered.map(site => [`${site.siteId}:${site.userId}`, site])).values()]
+    .sort((a, b) => {
+      const order = ['MLM', 'MLB', 'MLC', 'MCO', 'MLA'];
+      const siteOrder = order.indexOf(a.siteId) - order.indexOf(b.siteId);
+      if (siteOrder) return siteOrder;
+      if (a.logisticType === b.logisticType) return 0;
+      return a.logisticType === 'remote' ? -1 : 1;
+    });
+  return writeTimedCache(marketingCache, cacheKey, unique, 50);
 }
 
 async function loadSitePromotions(token, site, force = false) {
@@ -3036,14 +2978,25 @@ async function loadSitePromotions(token, site, force = false) {
   promotions = promotions.filter(promotion => {
     const promotionSite = String(promotion.id || '').toUpperCase().match(/(?:^|-)(MLM|MLB|MLC|MCO|MLA)(?:\d|$)/)?.[1];
     if (promotionSite) return promotionSite === site.siteId;
-    return site.source !== 'authorization-probe';
+    return true;
   });
   return writeTimedCache(marketingCache, cacheKey, promotions, 50);
 }
 
+async function resolvePromotionSite(sites, token, siteId, promotionId, promotionType) {
+  const matchingSites = sites.filter(site => site.siteId === siteId);
+  for (const site of matchingSites) {
+    try {
+      const promotions = await loadSitePromotions(token, site);
+      if (promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) return { site, promotions };
+    } catch {}
+  }
+  return { site: matchingSites[0] || null, promotions: [] };
+}
+
 function marketingApiError(error, fallback) {
   const data = error.response?.data;
-  if (error.response?.status === 404 || /^(not_found|not found)$/i.test(String(data?.message || data?.error || ''))) return '美客多未找到该授权店铺对应的营销或广告资源；这与 ERP 代理角色无关，请确认店铺已开通营销/商品广告，并尝试重新授权店铺';
+  if (error.response?.status === 404 || /^(not_found|not found)$/i.test(String(data?.message || data?.error || ''))) return '美客多未找到对应资源。活动报名与广告账户相互独立；请刷新国家店铺身份和活动列表后重试';
   if (/ad group with status hold can'?t be updated/i.test(String(data?.message || data?.error || ''))) return '该广告组处于平台锁定（HOLD）状态，暂时不能激活、暂停或调整活动；请等待美客多解除限制后再操作';
   if (/target campaign not allowed/i.test(String(data?.message || data?.error || ''))) return '美客多不允许该广告组执行目标活动操作；请先刷新真实归属，若仍失败可暂停广告但不能从该受保护活动移除';
   const cause = Array.isArray(data?.cause) ? data.cause.map(item => item?.message || item?.code).filter(Boolean).join('；') : '';
@@ -3067,9 +3020,25 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
     const promotions = siteResults.flatMap(site => site.promotions.map(promotion => ({
       ...promotion,
       siteId: site.siteId,
-      userId: site.userId
+      userId: site.userId,
+      logisticType: site.logisticType || '',
+      pricingModel: site.pricingModel || ''
     })));
-    const connectedSites = siteResults.filter(site => site.supported && site.source !== 'authorization-probe');
+    const countrySites = [...new Set(siteResults.map(site => site.siteId))];
+    const connectedSites = [...new Set(siteResults.filter(site => site.supported).map(site => site.siteId))];
+    const groupedSites = countrySites.map(siteId => {
+      const accounts = siteResults.filter(site => site.siteId === siteId);
+      const working = accounts.filter(site => site.supported);
+      return {
+        siteId,
+        userId: (working[0] || accounts[0])?.userId || '',
+        supported: working.length > 0,
+        message: working.length ? '' : accounts.map(site => site.message).filter(Boolean)[0] || '',
+        source: 'marketplace-identity',
+        accountCount: accounts.length,
+        promotionCount: new Set(accounts.flatMap(site => site.promotions.map(promotion => `${promotion.id}:${promotion.type}`))).size
+      };
+    });
     let advertisingSites = [];
     try { advertisingSites = await loadMarketingSites(auth, token, force); } catch {}
     const advertisers = advertisingSites.map(site => ({
@@ -3083,16 +3052,9 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
       promotions: {
         supported: siteResults.some(site => site.supported),
         status: siteResults.some(site => site.supported) ? 200 : 403,
-        message: `已连接 ${connectedSites.length} 个国家子店铺、读取 ${promotions.length} 个活动${connectedSites.length < siteResults.length ? `；另有 ${siteResults.length - connectedSites.length} 个国家尚未识别子卖家ID` : ''}`,
+        message: `已识别 ${connectedSites.length} 个国家子店铺，读取 ${promotions.length} 个活动；活动权限与广告账户完全独立`,
         items: promotions,
-        sites: siteResults.map(site => ({
-          siteId: site.siteId,
-          userId: site.userId,
-          supported: site.supported,
-          message: site.message || '',
-          source: site.source || '',
-          promotionCount: site.promotions.length
-        }))
+        sites: groupedSites
       },
       productAds: {
         supported: advertisers.length > 0,
@@ -3231,38 +3193,34 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
     const force = String(req.query.force || '') === '1';
     const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
     const sites = await loadPromotionSites(auth, token, force);
-    const site = sites.find(item => item.siteId === siteId);
-    if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账户' });
+    const siteAccounts = sites.filter(item => item.siteId === siteId);
+    if (!siteAccounts.length) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账户' });
     const cacheKey = `marketing-products:${auth.ml_user_id}:${siteId}:${page}:${size}`;
     let workspace = force ? null : readTimedCache(marketingProductsCache, cacheKey, MARKETING_PRODUCTS_CACHE_TTL);
     if (!workspace) {
       let itemIds = [];
       let itemTotal = 0;
-      let source = 'online-items';
-      try {
-        const searchResponse = await axios.get(`https://api.mercadolibre.com/users/${encodeURIComponent(site.userId)}/items/search`, {
-          params: { status: 'active', limit: size, offset: (page - 1) * size },
-          headers: { Authorization: `Bearer ${token}` }, timeout: 25000
-        });
-        itemIds = Array.isArray(searchResponse.data?.results) ? searchResponse.data.results.map(String) : [];
-        itemTotal = Number(searchResponse.data?.paging?.total || itemIds.length);
-      } catch (searchError) {
-        if (![401, 403, 404].includes(Number(searchError.response?.status))) throw searchError;
-        source = 'marketing-opportunities';
-        const promotions = await loadSitePromotions(token, site, force);
-        const promotionItems = await mapWithConcurrency(promotions.slice(0, 20), 3, async promotion => {
-          try {
-            const response = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/promotions/${encodeURIComponent(promotion.id)}/items`, {
-              params: { user_id: site.userId, promotion_type: promotion.type, limit: 50 },
-              headers: getPromotionHeaders(token), timeout: 20000
-            });
-            return (response.data?.results || []).map(item => String(item.id || '')).filter(Boolean);
-          } catch { return []; }
-        });
-        const allIds = [...new Set(promotionItems.flat())];
-        itemTotal = allIds.length;
-        itemIds = allIds.slice((page - 1) * size, page * size);
-      }
+      const source = 'marketplace-online-items';
+      const accountStats = await mapWithConcurrency(siteAccounts, 2, async account => {
+        try {
+          const response = await axios.get(`https://api.mercadolibre.com/marketplace/users/${encodeURIComponent(account.userId)}/items/search`, {
+            params: { status: 'active', limit: 1, offset: 0 },
+            headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+          });
+          return { account, total: Number(response.data?.paging?.total || 0) };
+        } catch (error) {
+          return { account, total: -1, error };
+        }
+      });
+      const bestAccount = accountStats.sort((a, b) => b.total - a.total)[0];
+      if (!bestAccount || bestAccount.total < 0) throw bestAccount?.error || new Error('无法读取国家店铺商品');
+      const site = bestAccount.account;
+      const searchResponse = await axios.get(`https://api.mercadolibre.com/marketplace/users/${encodeURIComponent(site.userId)}/items/search`, {
+        params: { status: 'active', limit: size, offset: (page - 1) * size },
+        headers: { Authorization: `Bearer ${token}` }, timeout: 25000
+      });
+      itemIds = Array.isArray(searchResponse.data?.results) ? searchResponse.data.results.map(String) : [];
+      itemTotal = Number(searchResponse.data?.paging?.total || itemIds.length);
       const products = await mapWithConcurrency(itemIds, 4, async itemId => {
         const detailKey = `item:${itemId}`;
         let detail = readTimedCache(marketingItemCache, detailKey, MARKETING_ITEM_CACHE_TTL);
@@ -3297,10 +3255,12 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
           ad: null
         };
       });
-      if (itemIds.length) {
+      let advertisingSite = null;
+      try { advertisingSite = (await loadMarketingSites(auth, token, force)).find(item => item.siteId === siteId) || null; } catch {}
+      if (itemIds.length && advertisingSite) {
         await mapWithConcurrency(products, 5, async product => {
           try {
-            const adResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads/ad_groups/search`, {
+            const adResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/advertisers/${encodeURIComponent(advertisingSite.advertiserId)}/product_ads/ad_groups/search`, {
               params: { 'filters[item_ids]': product.itemId, limit: 10, offset: 0 },
               headers: getProductAdsHeaders(token), timeout: 12000
             });
@@ -3595,13 +3555,13 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
     if (!promotionId || !promotionType || !siteId) return res.status(400).json({ code: 400, message: '请选择国家店铺和活动' });
     const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
     const sites = await loadPromotionSites(auth, token);
-    const site = sites.find(item => item.siteId === siteId);
+    const resolved = await resolvePromotionSite(sites, token, siteId, promotionId, promotionType);
+    const site = resolved.site;
     if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账号' });
     const pageCacheKey = `${auth.ml_user_id}:${siteId}:${promotionId}:${promotionType}:${status}:${page}:${size}`;
     const cachedPage = readTimedCache(promotionItemsPageCache, pageCacheKey, 5 * 60 * 1000);
     if (cachedPage) return res.json({ code: 0, data: cachedPage });
-    const promotions = await loadSitePromotions(token, site);
-    if (!promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
+    if (!resolved.promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
       return res.status(404).json({ code: 404, message: '活动不存在或已结束，请刷新活动列表' });
     }
     const pagingKey = `${auth.ml_user_id}:${siteId}:${promotionId}:${promotionType}:${status}:${size}`;
@@ -3747,10 +3707,10 @@ async function validatePromotionRequest(authUser, body) {
   const siteId = String(body.siteId || '').trim().toUpperCase();
   const { auth, token } = await resolveMarketingAuthorization(authUser, body.storeId);
   const sites = await loadPromotionSites(auth, token);
-  const site = sites.find(item => item.siteId === siteId);
+  const resolved = await resolvePromotionSite(sites, token, siteId, promotionId, promotionType);
+  const site = resolved.site;
   if (!site) throw Object.assign(new Error('该国家店铺不属于当前授权账号'), { statusCode: 403 });
-  const promotions = await loadSitePromotions(token, site);
-  if (!promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
+  if (!resolved.promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
     throw Object.assign(new Error('活动不存在或已结束，请刷新活动列表'), { statusCode: 404 });
   }
   const items = Array.isArray(body.items) ? body.items.slice(0, 30) : [];
