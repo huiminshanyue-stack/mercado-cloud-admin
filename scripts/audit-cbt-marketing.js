@@ -16,7 +16,27 @@ function decrypt(value) {
   const { rows } = await pool.query("SELECT * FROM ml_store_authorizations WHERE enabled=TRUE AND nickname ILIKE '%TONRON%' ORDER BY updated_at DESC LIMIT 1");
   const auth = rows[0], token = decrypt(rows[0].access_token_encrypted);
   const authHeader = { Authorization: `Bearer ${token}` };
-  const output = { root: auth.ml_user_id, searches: [], advertisers: [], samples: [], promotionProbes: [] };
+  const output = { root: auth.ml_user_id, searches: [], advertisers: [], samples: [], promotionProbes: [], identityProbes: [] };
+  const identityPaths = [
+    `users/${auth.ml_user_id}`,
+    `marketplace/users/${auth.ml_user_id}`,
+    `marketplace/users/${auth.ml_user_id}/sites`,
+    `marketplace/users/${auth.ml_user_id}/marketplaces`,
+    `marketplace/users/${auth.ml_user_id}/children`,
+    `marketplace/users/${auth.ml_user_id}/channels`,
+    `marketplace/users/${auth.ml_user_id}/accounts`,
+    'marketplace/users/me',
+    'marketplace/accounts'
+  ];
+  for (const path of identityPaths) {
+    try {
+      const response = await axios.get(`https://api.mercadolibre.com/${path}`, { headers: authHeader, timeout: 15000 });
+      const data = response.data;
+      output.identityProbes.push({ path, status: 200, data: JSON.parse(JSON.stringify(data, (key, value) => /email|phone|address|name|token/i.test(key) ? undefined : value)) });
+    } catch (error) {
+      output.identityProbes.push({ path, error: error.response?.status || error.message, body: error.response?.data?.message || error.response?.data?.error || '' });
+    }
+  }
   for (const base of ['users', 'marketplace/users']) {
     for (const siteId of ['', 'MLM', 'MLB', 'MLC', 'MCO', 'MLA']) {
       try {
