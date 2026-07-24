@@ -2613,8 +2613,9 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.2',
+    version: '2026-07-24.3',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
+    onlineDeadlineRule: 'handling-deadline-plus-24h',
     userIsolation: true,
     officialPayoutOnly: true,
     multiStoreSync: true,
@@ -4363,31 +4364,84 @@ app.post('/api/admin/order-alerts/:id/read', requireAdmin, async (req, res) => {
   res.json({ code: 0 });
 });
 
+function decodeOfficialLabelError(error) {
+  const status = Number(error.response?.status || 502);
+  let raw = error.response?.data;
+  if (Buffer.isBuffer(raw)) raw = raw.toString('utf8');
+  else if (raw instanceof ArrayBuffer) raw = Buffer.from(raw).toString('utf8');
+  else if (ArrayBuffer.isView(raw)) raw = Buffer.from(raw.buffer,raw.byteOffset,raw.byteLength).toString('utf8');
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch (_) { parsed = raw.trim(); }
+  }
+  const causes = Array.isArray(parsed?.cause)
+    ? parsed.cause.map(item => item?.message || item?.description || item?.code).filter(Boolean).join('；')
+    : '';
+  const officialCode = parsed?.error || parsed?.code || '';
+  const reason = parsed?.message || parsed?.description || causes || '';
+  const message = reason
+    ? `${officialCode ? `${officialCode}：` : ''}${reason}`
+    : `美客多面单接口返回 HTTP ${status}`;
+  const auditData = parsed && typeof parsed === 'object'
+    ? parsed
+    : { message: String(parsed || message).slice(0,4000) };
+  return { status, message, auditData };
+}
+
 app.get('/api/admin/orders/:orderId/label', requireAdmin, async (req, res) => {
+  let audit = { storeUserId: '', shipmentIds: [] };
   try {
     const { rows } = await pool.query('SELECT shipping_id,store_user_id FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [req.params.orderId,req.authUser.username]);
+    if (!rows.length) return res.status(404).json({ code: 404, message: '订单不存在或不属于当前账号' });
     const shipmentIds = [...new Set(rows.map(row => row.shipping_id).filter(Boolean))];
-    if (!shipmentIds.length) return res.status(404).json({ code: 404, message: '该订单暂无可下载面单' });
+    if (!shipmentIds.length) return res.status(404).json({ code: 404, message: '该订单暂无国际运单，无法下载面单' });
+    audit = { storeUserId: rows[0].store_user_id, shipmentIds };
     const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
-    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效' });
-    const token = context.token;
+    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效，请重新授权后下载' });
     let pdfResponse;
+    let lastOfficialError;
     for (const path of ['shipment_labels', 'marketplace/shipment_labels']) {
       try {
         pdfResponse = await axios.get(`https://api.mercadolibre.com/${path}`, {
           params: { shipment_ids: shipmentIds.join(','), response_type: 'pdf' },
-          headers: { Authorization: `Bearer ${token}`, Accept: 'application/pdf' }, responseType: 'arraybuffer', timeout: 30000
+          headers: { Authorization: `Bearer ${context.token}`, Accept: 'application/pdf' },
+          responseType: 'arraybuffer', timeout: 30000
         });
         if (pdfResponse?.data) break;
-      } catch (error) { if (error.response?.status !== 404) throw error; }
+      } catch (error) {
+        lastOfficialError = error;
+        if (error.response?.status !== 404) throw error;
+      }
     }
-    if (!pdfResponse?.data) return res.status(404).json({ code: 404, message: '美客多暂未生成该订单面单' });
+    if (!pdfResponse?.data) {
+      if (lastOfficialError) throw lastOfficialError;
+      return res.status(404).json({ code: 404, message: '美客多暂未生成该订单面单' });
+    }
+    const pdf = Buffer.from(pdfResponse.data);
+    if (pdf.subarray(0,5).toString('ascii') !== '%PDF-') {
+      const invalidPdfError = new Error('美客多未返回有效的 PDF 面单');
+      invalidPdfError.response = { status: 502, data: pdf };
+      throw invalidPdfError;
+    }
+    await saveOrderApiAudit(req.authUser.username,audit.storeUserId,req.params.orderId,'shipment_label',req.params.orderId,
+      { success: true, shipmentIds, contentType: pdfResponse.headers?.['content-type'] || 'application/pdf', size: pdf.length });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="mercado-label-${req.params.orderId}.pdf"`);
-    res.send(Buffer.from(pdfResponse.data));
-  } catch (e) {
-    const status = e.response?.status || 502;
-    res.status(status).json({ code: status, message: e.response?.data?.message || e.message });
+    const safeOrderId = String(req.params.orderId).replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,80) || 'order';
+    res.setHeader('Content-Disposition', `attachment; filename="mercado-label-${safeOrderId}.pdf"`);
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(pdf);
+  } catch (error) {
+    if (!error.response) {
+      console.error('[Orders] 面单下载失败:', error.message);
+      return res.status(500).json({ code: 500, message: '面单下载失败，请稍后重试' });
+    }
+    const official = decodeOfficialLabelError(error);
+    await saveOrderApiAudit(req.authUser.username,audit.storeUserId,req.params.orderId,'shipment_label',req.params.orderId,
+      { success: false, shipmentIds: audit.shipmentIds, status: official.status, officialError: official.auditData }).catch(() => {});
+    res.status(official.status).json({ code: official.status, message: `美客多官方返回：${official.message}` });
   }
 });
 
