@@ -2933,6 +2933,7 @@ async function loadSitePromotions(token, site, force = false) {
 
 function marketingApiError(error, fallback) {
   const data = error.response?.data;
+  if (/target campaign not allowed/i.test(String(data?.message || data?.error || ''))) return '美客多不允许该广告组执行目标活动操作；请先刷新真实归属，若仍失败可暂停广告但不能从该受保护活动移除';
   const cause = Array.isArray(data?.cause) ? data.cause.map(item => item?.message || item?.code).filter(Boolean).join('；') : '';
   if (error.response?.status === 429) return '美客多接口请求过于频繁，请稍后重试';
   return cause || data?.message || data?.error || error.message || fallback;
@@ -3222,6 +3223,52 @@ app.get('/api/marketing/product-ads/products', requireAuth, async (req, res) => 
   }
 });
 
+app.get('/api/marketing/product-ads/campaign-products', requireAuth, async (req, res) => {
+  try {
+    const siteId = String(req.query.siteId || '').trim().toUpperCase();
+    const campaignId = String(req.query.campaignId || '').trim();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const size = Math.min(50, Math.max(1, Number(req.query.size) || 20));
+    const days = [7, 30, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 30;
+    if (!siteId || !campaignId) return res.status(400).json({ code: 400, message: '请选择广告活动' });
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
+    const sites = await loadMarketingSites(auth, token);
+    const site = sites.find(item => item.siteId === siteId);
+    if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
+    const { dateFrom, dateTo } = productAdsDateRange(days);
+    const groupResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads/ad_groups/search`, {
+      params: { 'filters[campaign_id]': campaignId, limit: size, offset: (page - 1) * size },
+      headers: getProductAdsHeaders(token), timeout: 25000
+    });
+    const groups = (groupResponse.data?.results || []).filter(group => String(group.campaign_id || '') === campaignId);
+    const groupProducts = await mapWithConcurrency(groups, 4, async group => {
+      try {
+        const response = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/ad_groups/${encodeURIComponent(group.id)}/ads`, {
+          params: { date_from: dateFrom, date_to: dateTo, metrics: 'clicks,prints,cost,acos,roas,total_amount' },
+          headers: getProductAdsHeaders(token), timeout: 20000
+        });
+        const ads = Array.isArray(response.data?.results) ? response.data.results : [];
+        if (!ads.length) return [{ itemId: group.ad_group_external_id || '', title: group.title || `广告组 ${group.id}`, status: String(group.status || '').toLowerCase(), thumbnail: '', permalink: '', price: 0, adGroupId: group.id, campaignId: Number(campaignId), adGroupType: group.ad_group_type || '', variantCount: 0, metrics: finalizeAdMetrics({ impressions: 0, clicks: 0, cost: 0, sales: 0, units: 0 }) }];
+        return ads.map(ad => ({
+          itemId: ad.item_id || ad.user_product_id || String(group.ad_group_external_id || ''),
+          title: ad.title || ad.user_product_name || group.title || '',
+          status: String(group.status || ad.status || '').toLowerCase(),
+          thumbnail: ad.thumbnail || '', permalink: ad.permalink || '', price: Number(ad.price || 0),
+          adGroupId: group.id, campaignId: Number(group.campaign_id || campaignId), adGroupType: group.ad_group_type || '',
+          variantCount: ads.length, metrics: finalizeAdMetrics(normalizeAdMetrics(ad.metrics))
+        }));
+      } catch (error) {
+        return [{ itemId: group.ad_group_external_id || '', title: group.title || `广告组 ${group.id}`, status: String(group.status || '').toLowerCase(), thumbnail: '', permalink: '', price: 0, adGroupId: group.id, campaignId: Number(campaignId), adGroupType: group.ad_group_type || '', variantCount: 0, message: marketingApiError(error, '组内商品读取失败'), metrics: finalizeAdMetrics({ impressions: 0, clicks: 0, cost: 0, sales: 0, units: 0 }) }];
+      }
+    });
+    const products = groupProducts.flat();
+    res.json({ code: 0, data: { products, total: Number(groupResponse.data?.paging?.total || groups.length), groupTotal: groups.length, page, size, campaignId } });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '广告活动商品读取失败') });
+  }
+});
+
 app.patch('/api/marketing/product-ads/campaigns/:campaignId', requireAuth, async (req, res) => {
   try {
     const campaignId = String(req.params.campaignId || '').trim();
@@ -3321,8 +3368,13 @@ app.delete('/api/marketing/product-ads/campaigns/:campaignId/ad-groups/:adGroupI
     const sites = await loadMarketingSites(auth, token);
     const site = sites.find(item => item.siteId === siteId);
     if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
-    await axios.delete(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/campaigns/${encodeURIComponent(campaignId)}/ad_groups/${encodeURIComponent(adGroupId)}`, {
-      headers: getProductAdsHeaders(token), timeout: 25000
+    const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/ad_groups/${encodeURIComponent(adGroupId)}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    });
+    const actualCampaignId = String(detailResponse.data?.campaign_id || '').trim();
+    if (!actualCampaignId) return res.status(409).json({ code: 409, message: '该广告组当前未加入任何广告活动，无需移除' });
+    await axios.delete(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/campaigns/${encodeURIComponent(actualCampaignId)}/ad_groups/${encodeURIComponent(adGroupId)}`, {
+      headers: { Authorization: `Bearer ${token}` }, timeout: 25000
     });
     for (const key of productAdsCache.keys()) if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
     for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${auth.ml_user_id}:${siteId}:`)) marketingProductsCache.delete(key);
