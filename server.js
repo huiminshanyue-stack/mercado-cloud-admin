@@ -2740,6 +2740,7 @@ const marketingCache = new Map();
 const marketingItemCache = new Map();
 const promotionNameTranslationCache = new Map();
 const productAdsCache = new Map();
+const productAdsAnalyticsCache = new Map();
 const marketingProductsCache = new Map();
 const MARKETING_CACHE_TTL = 60 * 1000;
 const MARKETING_ITEM_CACHE_TTL = 5 * 60 * 1000;
@@ -3063,6 +3064,47 @@ app.get('/api/marketing/product-ads/overview', requireAuth, async (req, res) => 
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
     res.status(status).json({ code: status, message: marketingApiError(error, '广告数据读取失败') });
+  }
+});
+
+app.get('/api/marketing/product-ads/analytics', requireAuth, async (req, res) => {
+  try {
+    const days = [7, 30, 90].includes(Number(req.query.days)) ? Number(req.query.days) : 30;
+    const siteId = String(req.query.siteId || '').trim().toUpperCase();
+    const campaignId = String(req.query.campaignId || '').trim();
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
+    const cacheKey = `product-ads-analytics:${auth.ml_user_id}:${siteId || 'all'}:${campaignId || 'all'}:${days}`;
+    const cached = readTimedCache(productAdsAnalyticsCache, cacheKey, 5 * 60 * 1000);
+    if (cached) return res.json({ code: 0, data: cached });
+    const sites = (await loadMarketingSites(auth, token)).filter(site => !siteId || site.siteId === siteId);
+    if (!sites.length) return res.status(404).json({ code: 404, message: '未找到对应国家广告账户' });
+    const step = days === 90 ? 7 : 1;
+    const end = new Date();
+    const ranges = [];
+    for (let offset = days - 1; offset >= 0; offset -= step) {
+      const from = new Date(end.getTime() - offset * 86400000);
+      const to = new Date(Math.min(end.getTime(), from.getTime() + (step - 1) * 86400000));
+      ranges.push({ dateFrom: from.toISOString().slice(0, 10), dateTo: to.toISOString().slice(0, 10) });
+    }
+    const points = await mapWithConcurrency(ranges, 3, async range => {
+      const totals = { impressions: 0, clicks: 0, cost: 0, sales: 0, units: 0 };
+      await mapWithConcurrency(sites, 2, async site => {
+        try {
+          const base = `https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(site.siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads/campaigns/search`;
+          const response = await axios.get(base, { params: { limit: 50, offset: 0, date_from: range.dateFrom, date_to: range.dateTo, metrics: 'clicks,prints,cost,total_amount,units_quantity' }, headers: getProductAdsHeaders(token), timeout: 25000 });
+          for (const campaign of response.data?.results || []) {
+            if (!campaignId || String(campaign.id) === campaignId) addAdMetrics(totals, normalizeAdMetrics(campaign.metrics));
+          }
+        } catch (error) { console.warn('[Marketing] 广告趋势数据读取失败:', site.siteId, range.dateFrom, error.message); }
+      });
+      return { date: range.dateFrom, dateTo: range.dateTo, ...finalizeAdMetrics(totals) };
+    });
+    const result = { days, step, siteId: siteId || null, campaignId: campaignId || null, points };
+    writeTimedCache(productAdsAnalyticsCache, cacheKey, result, 100);
+    res.json({ code: 0, data: result });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '广告趋势报告读取失败') });
   }
 });
 
