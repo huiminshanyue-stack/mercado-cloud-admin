@@ -211,15 +211,18 @@ async function initInternationalProductTable() {
 async function initOrderManagementTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS ml_stores (
     ml_user_id VARCHAR(80) PRIMARY KEY,
+    owner_username VARCHAR(120),
     nickname VARCHAR(300),
     remark VARCHAR(300),
     site_id VARCHAR(20),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await pool.query('ALTER TABLE ml_stores ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ml_orders (
       id BIGSERIAL PRIMARY KEY,
       ml_order_id VARCHAR(80) UNIQUE NOT NULL,
+      owner_username VARCHAR(120),
       status VARCHAR(80),
       date_created TIMESTAMPTZ,
       date_closed TIMESTAMPTZ,
@@ -240,6 +243,7 @@ async function initOrderManagementTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_date ON ml_orders(date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_status ON ml_orders(status, push_status)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS site_id VARCHAR(10)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS country VARCHAR(10)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_status VARCHAR(50)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_substatus VARCHAR(100)');
@@ -254,6 +258,9 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS sale_fee NUMERIC(18,2)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_fee NUMERIC(18,2)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS net_amount NUMERIC(18,2)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS gross_amount_usd NUMERIC(18,2)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS net_amount_usd NUMERIC(18,2)');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS refund_amount_usd NUMERIC(18,2)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS refund_amount NUMERIC(18,2) NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS product_cost NUMERIC(18,2) NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS cost_note VARCHAR(500)');
@@ -262,6 +269,7 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_is_official BOOLEAN NOT NULL DEFAULT FALSE');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_synced_at TIMESTAMPTZ');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_store ON ml_orders(store_user_id, date_created DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_owner_date ON ml_orders(owner_username,date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_buyer ON ml_orders(buyer_nickname, date_created DESC)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
   await pool.query(`CREATE TABLE IF NOT EXISTS ml_store_authorizations (
@@ -286,14 +294,16 @@ async function initOrderManagementTables() {
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await pool.query(`CREATE TABLE IF NOT EXISTS order_alerts (
-    id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
+    id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120), order_id VARCHAR(80), alert_type VARCHAR(50) NOT NULL,
     title VARCHAR(300) NOT NULL, content TEXT, is_read BOOLEAN NOT NULL DEFAULT FALSE,
     event_key VARCHAR(300) UNIQUE NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await pool.query('ALTER TABLE order_alerts ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_order_alerts_unread ON order_alerts(is_read, created_at DESC)');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS erp_connectors (
       id BIGSERIAL PRIMARY KEY,
+      owner_username VARCHAR(120),
       name VARCHAR(120) NOT NULL,
       endpoint TEXT NOT NULL,
       auth_header VARCHAR(120),
@@ -303,9 +313,11 @@ async function initOrderManagementTables() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query('ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS erp_push_logs (
       id BIGSERIAL PRIMARY KEY,
+      owner_username VARCHAR(120),
       order_id VARCHAR(80) NOT NULL,
       connector_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
       success BOOLEAN NOT NULL,
@@ -314,15 +326,52 @@ async function initOrderManagementTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query('ALTER TABLE erp_push_logs ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_services (
-    id BIGSERIAL PRIMARY KEY, name VARCHAR(120) NOT NULL, code VARCHAR(100), description VARCHAR(500), enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120), name VARCHAR(120) NOT NULL, code VARCHAR(100), description VARCHAR(500), enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query('ALTER TABLE fulfillment_services ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
+  await pool.query(`CREATE TABLE IF NOT EXISTS logistics_companies (
+    id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120) NOT NULL,
+    name VARCHAR(120) NOT NULL, code VARCHAR(100), enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(owner_username,name)
   )`);
   await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_submissions (
-    id BIGSERIAL PRIMARY KEY, order_id VARCHAR(80) NOT NULL, warehouse_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
+    id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120), order_id VARCHAR(80) NOT NULL, warehouse_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
     carrier VARCHAR(200) NOT NULL, tracking_number VARCHAR(300) NOT NULL, service_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
     status VARCHAR(30) NOT NULL DEFAULT 'pending', request_data JSONB NOT NULL DEFAULT '{}'::jsonb, response_text TEXT,
+    failure_reason TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(order_id)
   )`);
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS failure_reason TEXT');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0');
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_message_reads (
+    owner_username VARCHAR(120) NOT NULL, thread_type VARCHAR(30) NOT NULL,
+    thread_id VARCHAR(120) NOT NULL, last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(owner_username,thread_type,thread_id)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_api_audits (
+    id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120) NOT NULL,
+    store_user_id VARCHAR(80), order_id VARCHAR(80), api_type VARCHAR(50) NOT NULL,
+    external_id VARCHAR(160) NOT NULL, raw_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(owner_username,api_type,external_id)
+  )`);
+
+  // 将升级前的存量数据归属到其已授权用户；无法确定归属的数据保持不可见，避免跨用户泄露。
+  await pool.query(`UPDATE ml_stores s SET owner_username=a.owner_username
+    FROM (SELECT DISTINCT ON (ml_user_id) ml_user_id,owner_username FROM ml_store_authorizations ORDER BY ml_user_id,updated_at DESC) a
+    WHERE s.ml_user_id=a.ml_user_id AND s.owner_username IS NULL`);
+  await pool.query(`UPDATE ml_orders o SET owner_username=a.owner_username
+    FROM (SELECT DISTINCT ON (ml_user_id) ml_user_id,owner_username FROM ml_store_authorizations ORDER BY ml_user_id,updated_at DESC) a
+    WHERE o.store_user_id=a.ml_user_id AND o.owner_username IS NULL`);
+  await pool.query(`UPDATE order_alerts a SET owner_username=o.owner_username FROM ml_orders o
+    WHERE a.order_id=o.ml_order_id AND a.owner_username IS NULL`);
+  await pool.query(`UPDATE erp_connectors SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
+  await pool.query(`UPDATE fulfillment_services SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
+  await pool.query(`UPDATE fulfillment_submissions SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
+  await pool.query(`UPDATE erp_push_logs SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
 }
 
 async function seedDashboardData() {
@@ -602,20 +651,20 @@ async function getAuthUser(req) {
 
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.json({ code: 401, message: '未登录或登录已过期' });
+  if (!token) return res.status(401).json({ code: 401, message: '未登录或登录已过期' });
 
   const { rows } = await pool.query(
     "SELECT username, role, validuntil, created_at FROM user_sessions WHERE token = $1 AND created_at >= NOW() - ($2 * INTERVAL '1 day')",
     [token, SESSION_MAX_AGE_DAYS]
   );
-  if (rows.length === 0) return res.json({ code: 401, message: '未登录或登录已过期' });
+  if (rows.length === 0) return res.status(401).json({ code: 401, message: '未登录或登录已过期' });
 
   const user = { username: rows[0].username, role: rows[0].role, validUntil: rows[0].validuntil };
 
   // 检查账号是否到期
   if (isUserExpired(user)) {
     await pool.query('DELETE FROM user_sessions WHERE token = $1', [token]);
-    return res.json({ code: 403, message: '账号已到期，请联系管理员' });
+    return res.status(403).json({ code: 403, message: '账号已到期，请联系管理员' });
   }
 
   req.authUser = user;
@@ -1515,9 +1564,11 @@ async function saveStoreAuthorization(ownerUsername, tokenData) {
     encryptErpCredential(accessToken), refreshToken ? encryptErpCredential(refreshToken) : '',
     Date.now() + Number(tokenData.expires_in || 21600) * 1000 - 60000
   ]);
-  await pool.query(`INSERT INTO ml_stores(ml_user_id,nickname,site_id,updated_at) VALUES($1,$2,$3,NOW())
-    ON CONFLICT(ml_user_id) DO UPDATE SET nickname=EXCLUDED.nickname,site_id=EXCLUDED.site_id,updated_at=NOW()`,
-    [mlUserId, me.nickname || '', me.site_id || '']);
+  await pool.query(`INSERT INTO ml_stores(ml_user_id,owner_username,nickname,site_id,updated_at) VALUES($1,$2,$3,$4,NOW())
+    ON CONFLICT(ml_user_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,nickname=EXCLUDED.nickname,site_id=EXCLUDED.site_id,updated_at=NOW()`,
+    [mlUserId, ownerUsername, me.nickname || '', me.site_id || '']);
+  await pool.query('UPDATE ml_orders SET owner_username=$1 WHERE store_user_id=$2 AND owner_username IS NULL',[ownerUsername,mlUserId]);
+  await pool.query(`UPDATE order_alerts a SET owner_username=$1 FROM ml_orders o WHERE a.order_id=o.ml_order_id AND o.store_user_id=$2 AND a.owner_username IS NULL`,[ownerUsername,mlUserId]);
   return { mlUserId, nickname: me.nickname || '', siteId: me.site_id || '' };
 }
 
@@ -1535,14 +1586,57 @@ async function getStoreAuthorizationToken(row) {
 }
 
 async function findScopedStoreAuthorization(authUser, storeUserId) {
-  const params = [String(storeUserId)];
-  let where = 'ml_user_id=$1 AND enabled=TRUE';
-  if (authUser.role !== 'admin') {
-    params.push(authUser.username);
-    where += ` AND owner_username=$${params.length}`;
-  }
+  const params = [String(storeUserId), authUser.username];
+  const where = 'ml_user_id=$1 AND owner_username=$2 AND enabled=TRUE';
   const { rows } = await pool.query(`SELECT * FROM ml_store_authorizations WHERE ${where} ORDER BY updated_at DESC LIMIT 1`, params);
   return rows[0] || null;
+}
+
+async function listOrderStoreAuthorizations(authUser, requestedStoreId = '') {
+  const params = [authUser.username], where = ['owner_username=$1', 'enabled=TRUE'];
+  if (requestedStoreId) { params.push(String(requestedStoreId)); where.push(`ml_user_id=$${params.length}`); }
+  let { rows } = await pool.query(`SELECT * FROM ml_store_authorizations WHERE ${where.join(' AND ')} ORDER BY updated_at DESC`, params);
+
+  // 兼容升级前仅保存于 settings 的管理员授权。首次使用时迁入用户隔离授权表。
+  if (!rows.length && authUser.role === 'admin' && !requestedStoreId) {
+    const legacyToken = await getMLAccessToken();
+    if (legacyToken) {
+      const legacyRefreshToken = await getMLRefreshToken();
+      const account = await axios.get('https://api.mercadolibre.com/users/me', {
+        headers: { Authorization: `Bearer ${legacyToken}` }, timeout: 15000
+      });
+      const me = account.data || {};
+      await saveStoreAuthorization(authUser.username, {
+        access_token: legacyToken,
+        refresh_token: legacyRefreshToken || '',
+        user_id: me.id,
+        expires_in: 3600
+      });
+      ({ rows } = await pool.query(`SELECT * FROM ml_store_authorizations WHERE owner_username=$1 AND enabled=TRUE ORDER BY updated_at DESC`, [authUser.username]));
+    }
+  }
+  return rows;
+}
+
+async function getOrderStoreContext(authUser, storeUserId) {
+  const authorization = await findScopedStoreAuthorization(authUser, storeUserId);
+  if (!authorization) return null;
+  const token = await getStoreAuthorizationToken(authorization);
+  if (!token) return null;
+  return { authorization, token, sellerId: String(authorization.ml_user_id) };
+}
+
+async function resolveOrderStoreContext(authUser, requestedStoreId = '') {
+  if (requestedStoreId) return getOrderStoreContext(authUser, requestedStoreId);
+  const authorizations = await listOrderStoreAuthorizations(authUser);
+  if (!authorizations.length) return null;
+  return getOrderStoreContext(authUser, authorizations[0].ml_user_id);
+}
+
+async function getOrderMarketplaceSellerIds(ownerUsername, storeUserId) {
+  const { rows } = await pool.query(`SELECT DISTINCT COALESCE(NULLIF(raw_data->'seller'->>'id',''),store_user_id) AS id
+    FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 LIMIT 20`,[ownerUsername,String(storeUserId)]);
+  return [...new Set([String(storeUserId),...rows.map(row=>String(row.id || '')).filter(Boolean)])];
 }
 
 app.post('/api/marketing/oauth-link', requireAuth, async (req, res) => {
@@ -2347,8 +2441,14 @@ function parseOrderBilling(detail, grossAmount) {
   const explicitShipping = Number(detail.shipping_info?.sender_shipping_cost ?? detail.shipping_cost ?? 0);
   if (!saleFee && explicitSaleFee) saleFee = Math.abs(explicitSaleFee);
   if (!shippingFee && explicitShipping) shippingFee = Math.abs(explicitShipping);
-  const officialNet = Math.max(0, Number(grossAmount || 0) - totalCharges + totalBonuses);
-  return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, netAmount: officialNet, entries };
+  const netCandidates = [
+    detail.net_received_amount, detail.net_amount, detail.total_net_amount,
+    detail.settlement_amount, detail.amount_to_receive,
+    detail.amounts?.net, detail.amounts?.net_amount, detail.summary?.net_amount
+  ];
+  const officialNetValue = netCandidates.find(value => value !== undefined && value !== null && Number.isFinite(Number(value)));
+  return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses,
+    netAmount: officialNetValue === undefined ? null : Number(officialNetValue), entries };
 }
 
 const billingFxCache = new Map();
@@ -2358,8 +2458,7 @@ async function getBillingFxRate(fromCurrency, toCurrency) {
   const key = `${from}:${to}`, cached = billingFxCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.rate;
   try {
-    const token = await getMLAccessToken();
-    const response = await axios.get('https://api.mercadolibre.com/currency_conversions/search', { params: { from, to }, headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
+    const response = await axios.get('https://api.mercadolibre.com/currency_conversions/search', { params: { from, to }, timeout: 12000 });
     const rate = Number(response.data?.ratio || response.data?.rate || 0);
     if (rate > 0) { billingFxCache.set(key, { rate, expiresAt: Date.now() + 6 * 3600000 }); return rate; }
   } catch (error) { console.warn('[Orders] 账单币种换算失败:', from, to, error.response?.status || error.message); }
@@ -2404,7 +2503,7 @@ async function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
-    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, grossAmountUsd: 0, netAmountUsd: 0, refundAmountUsd: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _hasGrossAmountUsd: false, _hasNetAmountUsd: false, _hasRefundAmountUsd: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
     const group = groups.get(groupId);
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
@@ -2414,6 +2513,9 @@ async function aggregatePackedOrders(rows) {
       group.reputationReason = [group.reputationReason, row.reputationReason].filter(Boolean).join('；');
     }
     for (const field of ['paidAmount','totalAmount','saleFee','shippingFee','otherFee','refundAmount','productCost']) group[field] += Number(row[field] || 0);
+    for (const [field, flag] of [['grossAmountUsd','_hasGrossAmountUsd'],['netAmountUsd','_hasNetAmountUsd'],['refundAmountUsd','_hasRefundAmountUsd']]) {
+      if (row[field] !== null && row[field] !== undefined) { group[field] += Number(row[field] || 0); group[flag] = true; }
+    }
     if (row.netAmount !== null && row.netAmount !== undefined) {
       group._fallbackNetAmount += Number(row.netAmount || 0);
       group._hasFallbackNetAmount = true;
@@ -2450,20 +2552,23 @@ async function aggregatePackedOrders(rows) {
     }
     for (const field of ['saleFee','shippingFee','paymentFee','transferFee','cancellationFee','taxFee','adjustmentFee','bonusAmount']) group[field] = Number(group[field].toFixed(2));
     if (group._officialEntryCount) group.otherFee = group.cancellationFee;
-    const totalCharges = group.saleFee + group.shippingFee + group.paymentFee + group.transferFee + group.cancellationFee + group.taxFee + group.adjustmentFee;
-    group.netAmount = group.status === 'cancelled'
-      ? 0
-      : (group.financeIsOfficial && !group.billingCurrencyMismatch
-        ? Math.max(0, Number((group.paidAmount - totalCharges + group.bonusAmount).toFixed(2)))
-        : (group._hasFallbackNetAmount ? Math.max(0, Number(group._fallbackNetAmount.toFixed(2))) : null));
-    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees; delete group._officialSignedFees;
+    group.netAmount = group._hasFallbackNetAmount ? Number(group._fallbackNetAmount.toFixed(2)) : null;
+    group.grossAmountUsd = group._hasGrossAmountUsd ? Number(group.grossAmountUsd.toFixed(2)) : null;
+    group.netAmountUsd = group._hasNetAmountUsd ? Number(group.netAmountUsd.toFixed(2)) : null;
+    group.refundAmountUsd = group._hasRefundAmountUsd ? Number(group.refundAmountUsd.toFixed(2)) : null;
+    group.payoutIsOfficial = group.netAmountUsd !== null;
+    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees; delete group._officialSignedFees;
   }
   return [...groups.values()];
 }
 
 function extractReputationInfo(rawData) {
   const raw = rawData && typeof rawData === 'object' ? rawData : {};
+  const official = raw._official_reputation && typeof raw._official_reputation === 'object' ? raw._official_reputation : {};
   const values = [
+    official.affects_reputation,
+    official.reputation_affected,
+    official.sale?.affects_reputation,
     raw.affects_reputation,
     raw.reputation_affected,
     raw.reputation?.affected,
@@ -2472,34 +2577,65 @@ function extractReputationInfo(rawData) {
     raw.feedback?.sale?.affects_reputation
   ];
   const explicit = values.find(value => typeof value === 'boolean');
-  const rating = String(raw.feedback?.sale?.rating || raw.feedback?.rating || '').toLowerCase();
+  const rating = String(official.sale?.rating || official.rating || raw.feedback?.sale?.rating || raw.feedback?.rating || '').toLowerCase();
   const impact = explicit === true || ['negative', 'neutral'].includes(rating)
     ? true
     : (explicit === false ? false : null);
-  const reason = raw.reputation?.reason || raw.reputation_reason ||
+  const reason = official.reputation?.reason || official.reason || official.sale?.reason || raw.reputation?.reason || raw.reputation_reason ||
     raw.feedback?.sale?.reason || raw.feedback?.reason ||
     (rating === 'negative' ? 'negative_feedback' : (rating === 'neutral' ? 'neutral_feedback' : ''));
-  return { impact, reason: String(reason || '') };
+  return {
+    impact,
+    reason: String(reason || ''),
+    feedback: String(official.message || official.feedback || official.sale?.message || ''),
+    responsibility: String(official.responsible_party || official.reputation?.responsible_party || ''),
+    advice: String(official.recommendation || official.reputation?.recommendation || ''),
+    source: Object.keys(official).length ? 'official_feedback' : (explicit !== undefined ? 'order' : '')
+  };
+}
+
+app.get('/api/health/order-management', (req, res) => {
+  res.json({ code: 0, data: {
+    version: '2026-07-24.1',
+    userIsolation: true,
+    officialPayoutOnly: true,
+    multiStoreSync: true,
+    fulfillmentAudit: true,
+    commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
+  } });
+});
+
+async function saveOrderApiAudit(ownerUsername, storeUserId, orderId, apiType, externalId, rawData) {
+  if (!ownerUsername || !apiType || !externalId) return;
+  await pool.query(`INSERT INTO order_api_audits(owner_username,store_user_id,order_id,api_type,external_id,raw_data,fetched_at)
+    VALUES($1,$2,$3,$4,$5,$6::jsonb,NOW()) ON CONFLICT(owner_username,api_type,external_id)
+    DO UPDATE SET store_user_id=EXCLUDED.store_user_id,order_id=EXCLUDED.order_id,raw_data=EXCLUDED.raw_data,fetched_at=NOW()`,
+    [ownerUsername,String(storeUserId || ''),String(orderId || ''),String(apiType),String(externalId),JSON.stringify(rawData || {})]);
 }
 
 app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
   try {
-    const accessToken = await getMLAccessToken();
-    if (!accessToken) return res.status(401).json({ code: 401, message: '美客多应用尚未授权或授权已失效' });
-    const sellerId = await getMLSellerId(accessToken);
+    const requestedStoreId = String(req.body?.storeId || '').trim();
+    const authorizations = await listOrderStoreAuthorizations(req.authUser, requestedStoreId);
+    if (!authorizations.length) return res.status(401).json({ code: 401, message: '当前账号尚未授权可同步的美客多店铺' });
+    const selectedAuthorization = authorizations[0];
+    const accessToken = await getStoreAuthorizationToken(selectedAuthorization);
+    if (!accessToken) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
+    const sellerId = String(selectedAuthorization.ml_user_id);
     const [accountResponse, listingsResponse] = await Promise.all([
       axios.get('https://api.mercadolibre.com/users/me', { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }),
       axios.get(`https://api.mercadolibre.com/users/${sellerId}/items/search`, { params: { limit: 1 }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }).catch(() => null)
     ]);
     const me = accountResponse.data || {};
-    await pool.query(`INSERT INTO ml_stores(ml_user_id,nickname,site_id,updated_at) VALUES($1,$2,$3,NOW())
-      ON CONFLICT(ml_user_id) DO UPDATE SET nickname=EXCLUDED.nickname,site_id=EXCLUDED.site_id,updated_at=NOW()`,
-      [String(me.id || sellerId), me.nickname || '', me.site_id || '']);
+    await pool.query(`INSERT INTO ml_stores(ml_user_id,owner_username,nickname,site_id,updated_at) VALUES($1,$2,$3,$4,NOW())
+      ON CONFLICT(ml_user_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,nickname=EXCLUDED.nickname,site_id=EXCLUDED.site_id,updated_at=NOW()`,
+      [String(me.id || sellerId), req.authUser.username, me.nickname || '', me.site_id || '']);
     const limit = Math.min(50, Math.max(1, Number(req.body?.limit) || 50));
+    const offset = Math.min(5000,Math.max(0,Number(req.body?.offset)||0));
     let response, sourceOrders;
     if (me.site_id === 'CBT') {
       response = await axios.get('https://api.mercadolibre.com/marketplace/orders/search', {
-        params: { sort: 'date_desc', limit }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+        params: { sort: 'date_desc', limit, offset }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
       });
       const orderIds = [...new Set((response.data?.results || []).flatMap(pack =>
         (pack.orders || []).map(order => order.id).filter(Boolean)
@@ -2532,7 +2668,7 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       }
     } else {
       response = await axios.get('https://api.mercadolibre.com/orders/search', {
-        params: { seller: sellerId, sort: 'date_desc', limit, offset: 0 },
+        params: { seller: sellerId, sort: 'date_desc', limit, offset },
         headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
       });
       sourceOrders = response.data?.results || [];
@@ -2580,6 +2716,18 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           console.warn('[Orders] 官方对账明细读取失败:', localSellerId, error.response?.status || error.message);
         }
       }
+    }
+    // 官方评价/声誉反馈优先于取消原因推断；不支持的站点静默保留为空。
+    for (let i = 0; i < sourceOrders.length; i += 5) {
+      await Promise.all(sourceOrders.slice(i,i+5).map(async order => {
+        for (const path of [`orders/${order.id}/feedback`,`marketplace/orders/${order.id}/feedback`]) {
+          try {
+            const feedbackResponse = await axios.get(`https://api.mercadolibre.com/${path}`, { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 12000 });
+            order._official_reputation = feedbackResponse.data || {};
+            break;
+          } catch (error) { if (![403,404].includes(error.response?.status)) break; }
+        }
+      }));
     }
     let imported = 0;
     for (const order of sourceOrders) {
@@ -2630,15 +2778,21 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       const finalSaleFee = officialFinance ? officialFinance.saleFee : saleFee;
       const finalShippingFee = officialFinance ? officialFinance.shippingFee : shippingFee;
       const otherFee = officialFinance ? officialFinance.otherFee : null;
-      const finalNetAmount = order.status === 'cancelled'
-        ? 0
-        : (officialFinance ? officialFinance.netAmount : (netAmount === null ? null : Math.max(0, Number(netAmount) - Number(refundAmount || 0))));
-      const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1', [String(order.id)]);
+      // 应回款只接受官方明确返回的净额；不能用销售额减费用伪造，也不能因取消直接强制归零。
+      const paymentOfficialNet = netParts.length ? netParts.reduce((sum, value) => sum + Number(value || 0), 0) : null;
+      const hasReversal = order.status === 'cancelled' || Number(refundAmount || 0) > 0;
+      const finalNetAmount = officialFinance?.netAmount ?? (hasReversal ? null : paymentOfficialNet) ?? null;
+      const orderCurrency = String(order.currency_id || '').toUpperCase();
+      const usdRate = await getBillingFxRate(orderCurrency, 'USD');
+      const grossAmountUsd = usdRate === null ? null : Number((grossAmount * usdRate).toFixed(2));
+      const refundAmountUsd = usdRate === null ? null : Number((Number(refundAmount || 0) * usdRate).toFixed(2));
+      const finalNetAmountUsd = finalNetAmount === null || usdRate === null ? null : Number((Number(finalNetAmount) * usdRate).toFixed(2));
+      const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
       await pool.query(`
         INSERT INTO ml_orders
           (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,
-           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,cancellation_reason,shipment_data,store_user_id,sale_fee,shipping_fee,net_amount,refund_amount,other_fee,billing_data,finance_is_official,finance_synced_at,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,$25,$26,$27,$28,$29,$30,$31::jsonb,$32,CASE WHEN $32 THEN NOW() ELSE NULL END,NOW())
+           site_id,country,shipment_status,shipment_substatus,tracking_number,tracking_method,logistic_type,pack_id,handling_deadline,deadline_is_estimated,cancellation_reason,shipment_data,store_user_id,sale_fee,shipping_fee,net_amount,refund_amount,other_fee,billing_data,finance_is_official,finance_synced_at,owner_username,gross_amount_usd,net_amount_usd,refund_amount_usd,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,$25,$26,$27,$28,$29,$30,$31::jsonb,$32,CASE WHEN $32 THEN NOW() ELSE NULL END,$33,$34,$35,$36,NOW())
         ON CONFLICT (ml_order_id) DO UPDATE SET
           status=EXCLUDED.status,date_closed=EXCLUDED.date_closed,buyer_id=EXCLUDED.buyer_id,
           buyer_nickname=EXCLUDED.buyer_nickname,currency=EXCLUDED.currency,total_amount=EXCLUDED.total_amount,
@@ -2652,7 +2806,9 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           store_user_id=EXCLUDED.store_user_id,sale_fee=EXCLUDED.sale_fee,shipping_fee=EXCLUDED.shipping_fee,
           net_amount=EXCLUDED.net_amount,refund_amount=EXCLUDED.refund_amount,other_fee=EXCLUDED.other_fee,
           billing_data=EXCLUDED.billing_data,finance_is_official=EXCLUDED.finance_is_official,
-          finance_synced_at=EXCLUDED.finance_synced_at,updated_at=NOW()`,
+          finance_synced_at=EXCLUDED.finance_synced_at,owner_username=EXCLUDED.owner_username,
+          gross_amount_usd=EXCLUDED.gross_amount_usd,net_amount_usd=EXCLUDED.net_amount_usd,
+          refund_amount_usd=EXCLUDED.refund_amount_usd,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
@@ -2660,17 +2816,21 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
           shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
           order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, !officialHandlingDeadline,
           String(cancellationReason).slice(0, 500), JSON.stringify(shipment), String(me.id || sellerId),
-          finalSaleFee, finalShippingFee, finalNetAmount, refundAmount, otherFee, JSON.stringify(billingDetail || {}), Boolean(billingDetail)]
+          finalSaleFee, finalShippingFee, finalNetAmount, refundAmount, otherFee, JSON.stringify(billingDetail || {}), Boolean(billingDetail),
+          req.authUser.username, grossAmountUsd, finalNetAmountUsd, refundAmountUsd]
       );
+      if (billingDetail) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'billing',String(order.id),billingDetail);
+      if (Object.keys(shipment).length) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'shipment',String(order.shipping?.id || order.id),shipment);
+      if (order._official_reputation) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'reputation',String(order.id),order._official_reputation);
       const old = previous.rows[0];
-      if (!old) await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'new_order','收到新订单',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
-      if (order.status === 'cancelled' && old?.status !== 'cancelled') await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'cancelled','订单已取消',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `${country || '未知站点'}订单已被取消`, `cancelled:${order.id}`]);
-      if (handlingDeadline && new Date(handlingDeadline).getTime() > Date.now() && new Date(handlingDeadline).getTime() - Date.now() <= 86400000 && !['shipped','delivered','cancelled'].includes(shipment.status)) {
-        await pool.query(`INSERT INTO order_alerts(order_id,alert_type,title,content,event_key) VALUES($1,'deadline','订单即将延误',$2,$3) ON CONFLICT(event_key) DO NOTHING`, [String(order.id), `官方待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
+      if (!old) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'new_order','收到新订单',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
+      if (order.status === 'cancelled' && old?.status !== 'cancelled') await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'cancelled','订单已取消',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'}订单已被取消`, `cancelled:${order.id}`]);
+      if (handlingDeadline && !refundAmount && new Date(handlingDeadline).getTime() > Date.now() && new Date(handlingDeadline).getTime() - Date.now() <= 86400000 && !['shipped','delivered','cancelled'].includes(shipment.status)) {
+        await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'deadline','订单即将延误',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `官方待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
       }
       imported++;
     }
-    res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId,
+    res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId, storeId: sellerId,
       account: { id: me.id, nickname: me.nickname || '', siteId: me.site_id || '', countryId: me.country_id || '',
         listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } } });
   } catch (e) {
@@ -2681,25 +2841,40 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
-  const params = [], where = [];
+  const params = [req.authUser.username], where = ['o.owner_username=$1'];
   if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
   if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`o.push_status = $${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country = $${params.length}`); }
-  if (req.query.shipmentStatus) { params.push(String(req.query.shipmentStatus)); where.push(`o.shipment_status = $${params.length}`); }
+  const fulfillmentStatus = String(req.query.fulfillmentStatus || req.query.shipmentStatus || '');
+  if (fulfillmentStatus === 'cancelled') where.push(`o.status='cancelled'`);
+  else if (fulfillmentStatus === 'refunded') where.push(`o.refund_amount>0`);
+  else if (fulfillmentStatus) { params.push(fulfillmentStatus); where.push(`o.shipment_status = $${params.length}`); }
   if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id = $${params.length}`); }
   if (req.query.buyer) { params.push(String(req.query.buyer)); where.push(`o.buyer_nickname = $${params.length}`); }
-  if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`(o.ml_order_id = $${params.length} OR o.pack_id = $${params.length})`); }
+  if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) = $${params.length}`); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateFrom || ''))) { params.push(String(req.query.dateFrom)); where.push(`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date >= $${params.length}::date`); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.dateTo || ''))) { params.push(String(req.query.dateTo)); where.push(`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date <= $${params.length}::date`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const count = await pool.query(`SELECT COUNT(DISTINCT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))::int AS total FROM ml_orders o ${clause}`, params);
   params.push(size, (page - 1) * size);
-  const rows = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`, params);
-  const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId)]) : { rows: [] };
+  const rows = await pool.query(`WITH page_groups AS (
+    SELECT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) AS display_id,MAX(o.date_created) AS group_date
+    FROM ml_orders o ${clause} GROUP BY COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)
+    ORDER BY group_date DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}
+  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote"
+    FROM page_groups pg JOIN ml_orders o ON COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)=pg.display_id AND o.owner_username=$1
+    LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ORDER BY pg.group_date DESC NULLS LAST,o.date_created`, params);
+  const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE owner_username=$2 AND ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId),req.authUser.username]) : { rows: [] };
   const financeMap = new Map(financeRows.rows.map(row => [row.ml_order_id, row.billing_data]));
   for (const row of rows.rows) {
     row.billingData = financeMap.get(row.orderId) || {};
     const reputation = extractReputationInfo(row.rawData);
     row.reputationImpact = reputation.impact;
     row.reputationReason = reputation.reason;
+    row.reputationFeedback = reputation.feedback;
+    row.reputationResponsibility = reputation.responsibility;
+    row.reputationAdvice = reputation.advice;
+    row.reputationSource = reputation.source;
     delete row.rawData;
   }
   const packedRows = await aggregatePackedOrders(rows.rows);
@@ -2707,7 +2882,14 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/admin/order-stores', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query(`SELECT s.ml_user_id AS id,s.nickname,s.remark,COALESCE(NULLIF(s.remark,''),s.nickname,s.ml_user_id) AS "displayName",s.site_id AS "siteId",COUNT(o.id)::int AS "orderCount" FROM ml_stores s LEFT JOIN ml_orders o ON o.store_user_id=s.ml_user_id GROUP BY s.ml_user_id ORDER BY "displayName"`);
+  await listOrderStoreAuthorizations(req.authUser);
+  const { rows } = await pool.query(`SELECT a.ml_user_id AS id,COALESCE(NULLIF(s.nickname,''),a.nickname) AS nickname,s.remark,
+    COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),NULLIF(a.nickname,''),a.ml_user_id) AS "displayName",
+    COALESCE(NULLIF(s.site_id,''),a.site_id) AS "siteId",COUNT(o.id)::int AS "orderCount"
+    FROM ml_store_authorizations a LEFT JOIN ml_stores s ON s.ml_user_id=a.ml_user_id
+    LEFT JOIN ml_orders o ON o.store_user_id=a.ml_user_id AND o.owner_username=a.owner_username
+    WHERE a.owner_username=$1 AND a.enabled=TRUE
+    GROUP BY a.ml_user_id,a.nickname,a.site_id,s.nickname,s.remark,s.site_id ORDER BY "displayName"`, [req.authUser.username]);
   res.json({ code: 0, data: rows });
 });
 
@@ -3871,13 +4053,13 @@ app.post('/api/marketing/promotions/exit-batch', requireAuth, async (req, res) =
 
 app.patch('/api/admin/order-stores/:id', requireAdmin, async (req, res) => {
   const remark = String(req.body?.remark || '').trim().slice(0, 300);
-  const { rowCount } = await pool.query('UPDATE ml_stores SET remark=$1,updated_at=NOW() WHERE ml_user_id=$2', [remark, req.params.id]);
+  const { rowCount } = await pool.query('UPDATE ml_stores SET remark=$1,updated_at=NOW() WHERE ml_user_id=$2 AND owner_username=$3', [remark, req.params.id,req.authUser.username]);
   if (!rowCount) return res.status(404).json({ code: 404, message: '店铺不存在' });
   res.json({ code: 0 });
 });
 
 app.get('/api/admin/order-buyers', requireAdmin, async (req, res) => {
-  const params = [], where = ["buyer_nickname IS NOT NULL", "buyer_nickname<>''"];
+  const params = [req.authUser.username], where = ["owner_username=$1", "buyer_nickname IS NOT NULL", "buyer_nickname<>''"];
   if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`store_user_id=$${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`country=$${params.length}`); }
   const { rows } = await pool.query(`SELECT buyer_nickname AS buyer,COUNT(*)::int AS "orderCount",MIN(date_created) AS "firstOrderAt",MAX(date_created) AS "lastOrderAt",ARRAY_REMOVE(ARRAY_AGG(DISTINCT country),NULL) AS countries FROM ml_orders WHERE ${where.join(' AND ')} GROUP BY buyer_nickname ORDER BY COUNT(*) DESC,MAX(date_created) DESC LIMIT 500`, params);
@@ -3885,7 +4067,10 @@ app.get('/api/admin/order-buyers', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/admin/order-buyers/:buyer', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query(`SELECT ml_order_id AS "orderId",date_created AS "dateCreated",country,currency,paid_amount AS "paidAmount",status,shipment_status AS "shipmentStatus",items,store_user_id AS "storeId" FROM ml_orders WHERE buyer_nickname=$1 ORDER BY date_created DESC LIMIT 200`, [req.params.buyer]);
+  const { rows } = await pool.query(`SELECT ml_order_id AS "orderId",COALESCE(NULLIF(pack_id,''),ml_order_id) AS "displayOrderId",date_created AS "dateCreated",country,currency,paid_amount AS "paidAmount",gross_amount_usd AS "grossAmountUsd",refund_amount AS "refundAmount",status,shipment_status AS "shipmentStatus",items,store_user_id AS "storeId" FROM ml_orders WHERE buyer_nickname=$1 AND owner_username=$2 ORDER BY date_created DESC LIMIT 200`, [req.params.buyer,req.authUser.username]);
+  const messageAudits = rows.length ? await pool.query(`SELECT order_id,COUNT(*)::int AS count,MAX(fetched_at) AS "lastMessageAt" FROM order_api_audits WHERE owner_username=$2 AND api_type IN ('order_messages','claim_messages') AND order_id=ANY($1::varchar[]) GROUP BY order_id`,[rows.map(row=>row.orderId),req.authUser.username]) : { rows: [] };
+  const messageMap = new Map(messageAudits.rows.map(item=>[String(item.order_id),item]));
+  for (const order of rows) { const message = messageMap.get(String(order.orderId)); order.messageCount = message?.count || 0; order.lastMessageAt = message?.lastMessageAt || null; }
   const totals = {};
   for (const order of rows) totals[order.currency || '-'] = Number((totals[order.currency || '-'] || 0) + Number(order.paidAmount || 0)).toFixed(2);
   res.json({ code: 0, data: { buyer: req.params.buyer, orders: rows, totals } });
@@ -3895,7 +4080,7 @@ app.patch('/api/admin/orders/:orderId/cost', requireAdmin, async (req, res) => {
   const cost = Number(req.body?.cost);
   if (!Number.isFinite(cost) || cost < 0) return res.status(400).json({ code: 400, message: '成本必须是大于等于0的数字' });
   const note = String(req.body?.note || '').trim().slice(0, 500);
-  const { rowCount } = await pool.query('UPDATE ml_orders SET product_cost=$1,cost_note=$2,updated_at=NOW() WHERE ml_order_id=$3', [cost, note, req.params.orderId]);
+  const { rowCount } = await pool.query('UPDATE ml_orders SET product_cost=$1,cost_note=$2,updated_at=NOW() WHERE ml_order_id=$3 AND owner_username=$4', [cost, note, req.params.orderId,req.authUser.username]);
   if (!rowCount) return res.status(404).json({ code: 404, message: '订单不存在' });
   res.json({ code: 0 });
 });
@@ -3927,46 +4112,51 @@ app.patch('/api/admin/order-exchange-rate', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/admin/order-profits', requireAdmin, async (req, res) => {
-  const params = [], where = [];
+  const params = [req.authUser.username], where = ['o.owner_username=$1'];
   if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id=$${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country=$${params.length}`); }
-  if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`(o.ml_order_id = $${params.length} OR o.pack_id = $${params.length})`); }
+  if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) = $${params.length}`); }
   const days = Number(req.query.days || 0);
   if ([1,3,7,15,30,90,180,365].includes(days)) { params.push(days); where.push(`o.date_created >= NOW() - ($${params.length}::int * INTERVAL '1 day')`); }
+  const dateFrom = String(req.query.dateFrom || ''), dateTo = String(req.query.dateTo || '');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) { params.push(dateFrom); where.push(`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date >= $${params.length}::date`); }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) { params.push(dateTo); where.push(`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date <= $${params.length}::date`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.shipment_status AS "shipmentStatus",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 500`, params);
-  const idRows = rows.length ? await pool.query('SELECT ml_order_id,pack_id,billing_data,shipping_id FROM ml_orders WHERE ml_order_id=ANY($1::varchar[])', [rows.map(row => row.orderId)]) : { rows: [] };
+  const { rows } = await pool.query(`SELECT o.ml_order_id AS "orderId",o.status,o.shipment_status AS "shipmentStatus",o.date_created AS "dateCreated",o.country,o.currency,o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.items,o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),s.nickname,o.store_user_id) AS "storeName" FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY o.date_created DESC LIMIT 10000`, params);
+  const idRows = rows.length ? await pool.query('SELECT ml_order_id,pack_id,billing_data,shipping_id FROM ml_orders WHERE owner_username=$2 AND ml_order_id=ANY($1::varchar[])', [rows.map(row => row.orderId),req.authUser.username]) : { rows: [] };
   const displayIdMap = new Map(idRows.rows.map(row => [row.ml_order_id, row.pack_id || row.ml_order_id]));
   const idDetailMap = new Map(idRows.rows.map(row => [row.ml_order_id, row]));
   for (const row of rows) { const detail = idDetailMap.get(row.orderId); row.packId = detail?.pack_id || row.orderId; row.shippingId = detail?.shipping_id || ''; row.billingData = detail?.billing_data || {}; }
   const packedProfitRows = await aggregatePackedOrders(rows);
   const exchangeRate = await getUsdCnyRate();
-  const summary = {};
+  const summary = { USD: { paidAmount: 0, netAmount: 0, refundAmount: 0, productCostCny: 0, profitCny: 0, orderCount: 0, pendingPayoutCount: 0 } };
   for (const row of packedProfitRows) {
-    const currency = row.currency || '-';
-    const payoutForProfit = row.financeIsOfficial
-      ? Number(row.netAmount ?? 0)
-      : Number(row.netAmount ?? row.paidAmount ?? 0) - Number(row.refundAmount || 0);
-    row.profitCny = currency === 'USD' && row.netAmount !== null ? payoutForProfit * exchangeRate - Number(row.productCost || 0) : null;
+    const payoutForProfit = row.netAmountUsd === null ? null : Number(row.netAmountUsd);
+    row.profitCny = payoutForProfit === null ? null : payoutForProfit * exchangeRate - Number(row.productCost || 0);
     row.profitBasis = 'net_payout';
-    summary[currency] ||= { paidAmount: 0, netAmount: 0, refundAmount: 0, productCostCny: 0, profitCny: 0, orderCount: 0 };
-    summary[currency].paidAmount += Number(row.paidAmount || 0); summary[currency].netAmount += Number(row.netAmount ?? row.paidAmount ?? 0);
-    summary[currency].refundAmount += Number(row.refundAmount || 0); summary[currency].productCostCny += Number(row.productCost || 0);
-    summary[currency].profitCny += Number(row.profitCny || 0); summary[currency].orderCount++;
+    summary.USD.paidAmount += Number(row.grossAmountUsd || 0); summary.USD.netAmount += Number(row.netAmountUsd || 0);
+    summary.USD.refundAmount += Number(row.refundAmountUsd || 0); summary.USD.productCostCny += Number(row.productCost || 0);
+    if (row.profitCny === null) summary.USD.pendingPayoutCount++;
+    else summary.USD.profitCny += Number(row.profitCny);
+    summary.USD.orderCount++;
   }
   res.json({ code: 0, data: { items: packedProfitRows, summary, exchangeRate } });
 });
 
 app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
   try {
-    const token = await getMLAccessToken();
-    const sellerId = await getMLSellerId(token);
-    const unreadResponse = await axios.get('https://api.mercadolibre.com/marketplace/messages/unread', {
-      params: { user_id: sellerId }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-    }).catch(() => ({ data: {} }));
-    const raw = unreadResponse.data || {};
-    const source = Array.isArray(raw) ? raw : (raw.results || raw.messages || raw.unread_messages || raw.data || []);
-    const list = Array.isArray(source) ? source : [];
+    const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
+    if (!context) return res.status(404).json({ code: 404, message: '当前账号没有可用的店铺授权' });
+    const { token, sellerId } = context;
+    const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
+    const unreadResponses = await Promise.all(marketplaceSellerIds.map(userId => axios.get('https://api.mercadolibre.com/marketplace/messages/unread', {
+      params: { user_id: userId }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    }).catch(() => ({ data: {} }))));
+    const list = unreadResponses.flatMap(unreadResponse => {
+      const raw = unreadResponse.data || {};
+      const source = Array.isArray(raw) ? raw : (raw.results || raw.messages || raw.unread_messages || raw.data || []);
+      return Array.isArray(source) ? source : [];
+    });
     const messageOrderRefs = item => {
       const direct = [
         item?.pack_id, item?.packId, item?.order_id, item?.orderId,
@@ -3981,10 +4171,11 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
     const packIds = [...new Set(list.flatMap(messageOrderRefs))];
     let unreadOrders = [];
     if (packIds.length) {
-      const result = await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE pack_id=ANY($1::varchar[]) OR ml_order_id=ANY($1::varchar[]) ORDER BY date_created DESC`, [packIds]);
+      const result = await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$2 AND store_user_id=$3 AND (pack_id=ANY($1::varchar[]) OR ml_order_id=ANY($1::varchar[])) ORDER BY date_created DESC`, [packIds,req.authUser.username,sellerId]);
       unreadOrders = result.rows;
     }
-    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const chinaNow = new Date(Date.now() + 8 * 3600000);
+    const todayStart = new Date(Date.UTC(chinaNow.getUTCFullYear(),chinaNow.getUTCMonth(),chinaNow.getUTCDate()) - 8 * 3600000);
     const todayItems = list.filter(item => {
       const value = item.message_date || item.date_created || item.created_at || item.last_updated;
       const date = value ? new Date(value) : null;
@@ -3994,7 +4185,7 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
     const matchedUnreadOrders = todayPackIds.size ? unreadOrders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : unreadOrders;
 
     // “今日咨询”必须包含已经被管理员点开、但今天确实收到过买家消息的订单，不能只依赖 unread。
-    const recentResult = await pool.query(`SELECT DISTINCT ON (COALESCE(NULLIF(pack_id,''),ml_order_id)) ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE date_created >= CURRENT_DATE - INTERVAL '1 day' ORDER BY COALESCE(NULLIF(pack_id,''),ml_order_id),date_created DESC LIMIT 40`);
+    const recentResult = await pool.query(`SELECT DISTINCT ON (COALESCE(NULLIF(pack_id,''),ml_order_id)) ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND date_created >= NOW() - INTERVAL '2 days' ORDER BY COALESCE(NULLIF(pack_id,''),ml_order_id),date_created DESC LIMIT 40`, [req.authUser.username,sellerId]);
     const conversationOrders = [];
     const conversationItems = [];
     for (let i = 0; i < recentResult.rows.length; i += 5) {
@@ -4008,7 +4199,7 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
           const messages = Array.isArray(payload) ? payload : (payload.messages || payload.results || payload.data?.messages || []);
           const buyerMessages = messages.filter(message => {
             const sender = String(message.from?.user_id || message.from || message.sender_id || '');
-            if (sender && sender === String(sellerId)) return false;
+            if (sender && marketplaceSellerIds.includes(sender)) return false;
             const rawDate = message.message_date || message.date_created || message.created_at;
             const date = rawDate ? new Date(rawDate) : null;
             return !date || Number.isNaN(date.getTime()) || date >= todayStart;
@@ -4025,6 +4216,13 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
     for (const order of [...matchedUnreadOrders, ...conversationOrders]) orderMap.set(String(order.packId || order.orderId), order);
     const itemMap = new Map();
     for (const item of [...todayItems, ...conversationItems]) itemMap.set(String(item.id || `${item.pack_id || item.order_id}:${item.message_date || item.date_created || ''}:${item.text || item.message || ''}`), item);
+    for (const [messageKey, item] of itemMap) {
+      const refs = messageOrderRefs(item);
+      const linkedOrder = [...orderMap.values()].find(order => refs.includes(String(order.packId)) || refs.includes(String(order.orderId)));
+      if (!linkedOrder) continue;
+      await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
+        [req.authUser.username,String(linkedOrder.orderId),`买家 ${linkedOrder.buyer || ''} 发来新的订单咨询`,`inquiry:${sellerId}:${messageKey}`]);
+    }
     res.json({ code: 0, data: { count: itemMap.size, items: [...itemMap.values()], orders: [...orderMap.values()] } });
   } catch (e) {
     const status = e.response?.status || 502;
@@ -4034,19 +4232,31 @@ app.get('/api/admin/order-inquiries', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
   try {
-    const token = await getMLAccessToken();
-    const sellerId = await getMLSellerId(token);
-    const response = await axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
-      params: { status: 'opened', seller_id: sellerId, sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-    });
-    const raw = response.data || {};
-    const claims = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
+    const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
+    if (!context) return res.status(404).json({ code: 404, message: '当前账号没有可用的店铺授权' });
+    const { token, sellerId } = context;
+    const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
+    const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId => axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
+      params: { status: 'opened', seller_id: localSellerId, sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    }).catch(error => ({ error }))));
+    if (claimResponses.every(response => response.error)) throw claimResponses[0].error;
+    const claims = [...new Map(claimResponses.flatMap(response => {
+      if (response.error) return [];
+      const raw = response.data || {};
+      const source = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
+      return Array.isArray(source) ? source : [];
+    }).map(claim=>[String(claim.id || `${claim.resource_id}:${claim.last_updated || ''}`),claim])).values()];
     const orderIds = [...new Set(claims.map(claim => String(claim.resource_id || claim.order_id || claim.resource?.split('/')?.pop() || '')).filter(Boolean))];
-    const orderResult = orderIds.length ? await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items FROM ml_orders WHERE ml_order_id=ANY($1::varchar[]) OR pack_id=ANY($1::varchar[])`, [orderIds]) : { rows: [] };
+    const orderResult = orderIds.length ? await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$2 AND store_user_id=$3 AND (ml_order_id=ANY($1::varchar[]) OR pack_id=ANY($1::varchar[]))`, [orderIds,req.authUser.username,sellerId]) : { rows: [] };
     const ordersById = new Map();
     for (const order of orderResult.rows) { ordersById.set(String(order.orderId), order); ordersById.set(String(order.packId), order); }
-    const items = claims.map(claim => ({ ...claim, order: ordersById.get(String(claim.resource_id || claim.order_id || claim.resource?.split('/')?.pop() || '')) || null }));
-    res.json({ code: 0, data: { count: Number(raw.paging?.total || raw.total || items.length), items, orders: items.map(item => item.order).filter(Boolean) } });
+    const items = claims.map(claim => ({ ...claim, storeId: sellerId, order: ordersById.get(String(claim.resource_id || claim.order_id || claim.resource?.split('/')?.pop() || '')) || null }));
+    for (const item of items) if (item.order) {
+      await saveOrderApiAudit(req.authUser.username,sellerId,item.order.orderId,'claim',String(item.id),item);
+      await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
+        [req.authUser.username,String(item.order.orderId),`订单 ${item.order.packId || item.order.orderId} 存在待处理售后申诉`,`claim:${sellerId}:${item.id}`]);
+    }
+    res.json({ code: 0, data: { count: items.length, items, orders: items.map(item => item.order).filter(Boolean) } });
   } catch (e) {
     const status = e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺暂不支持售后申诉接口' : (e.response?.data?.message || e.message) });
@@ -4055,8 +4265,13 @@ app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/order-claims/:claimId/messages', requireAdmin, async (req, res) => {
   try {
-    const token = await getMLAccessToken();
+    const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
+    if (!context) return res.status(404).json({ code: 404, message: '无法确定该售后线程所属店铺' });
+    const token = context.token;
     const response = await axios.get(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(req.params.claimId)}/messages`, { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+    const claimLink = await pool.query(`SELECT order_id FROM order_api_audits WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[req.authUser.username,String(req.params.claimId)]);
+    await saveOrderApiAudit(req.authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '','claim_messages',String(req.params.claimId),response.data);
+    if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[req.authUser.username,claimLink.rows[0].order_id]);
     res.json({ code: 0, data: response.data });
   } catch (e) { const status = e.response?.status || 502; res.status(status).json({ code: status, message: e.response?.data?.message || e.message }); }
 });
@@ -4065,7 +4280,9 @@ app.post('/api/admin/order-claims/:claimId/messages', requireAdmin, async (req, 
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ code: 400, message: '回复内容不能为空' });
   try {
-    const token = await getMLAccessToken();
+    const context = await resolveOrderStoreContext(req.authUser, String(req.body?.storeId || ''));
+    if (!context) return res.status(404).json({ code: 404, message: '无法确定该售后线程所属店铺' });
+    const token = context.token;
     const response = await axios.post(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(req.params.claimId)}/messages`, { receiver_role: 'complainant', message: text }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
     res.json({ code: 0, data: response.data });
   } catch (e) { const status = e.response?.status || 502; res.status(status).json({ code: status, message: e.response?.data?.message || e.message }); }
@@ -4093,33 +4310,40 @@ app.post('/api/admin/translate', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/admin/order-alerts', requireAdmin, async (req, res) => {
-  const params = [], where = [];
-  if (req.query.type) { params.push(String(req.query.type)); where.push(`alert_type=$${params.length}`); }
-  if (req.query.read === 'true' || req.query.read === 'false') { params.push(req.query.read === 'true'); where.push(`is_read=$${params.length}`); }
+  const page = Math.max(1,Number(req.query.page)||1), size = Math.min(100,Math.max(1,Number(req.query.size)||20));
+  const params = [req.authUser.username], where = ['a.owner_username=$1'];
+  if (req.query.type) { params.push(String(req.query.type)); where.push(`a.alert_type=$${params.length}`); }
+  if (req.query.read === 'true' || req.query.read === 'false') { params.push(req.query.read === 'true'); where.push(`a.is_read=$${params.length}`); }
+  if (req.query.storeId) { params.push(String(req.query.storeId)); where.push(`o.store_user_id=$${params.length}`); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const [{ rows }, unread] = await Promise.all([
-    pool.query(`SELECT a.id,a.order_id AS "orderId",COALESCE(NULLIF(o.pack_id,''),a.order_id) AS "displayOrderId",a.alert_type AS type,a.title,a.content,a.is_read AS "isRead",a.created_at AS "createdAt",o.country,COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'授权店铺') AS "storeName" FROM order_alerts a LEFT JOIN ml_orders o ON o.ml_order_id=a.order_id LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause ? clause.replaceAll('alert_type','a.alert_type').replaceAll('is_read','a.is_read') : ''} ORDER BY a.created_at DESC LIMIT 200`, params),
-    pool.query('SELECT COUNT(*)::int AS count FROM order_alerts WHERE is_read=FALSE')
+  const countParams = [...params];
+  params.push(size,(page-1)*size);
+  const [{ rows }, unread, total] = await Promise.all([
+    pool.query(`SELECT a.id,a.order_id AS "orderId",COALESCE(NULLIF(o.pack_id,''),a.order_id) AS "displayOrderId",a.alert_type AS type,a.title,a.content,a.is_read AS "isRead",a.created_at AS "createdAt",o.country,o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'授权店铺') AS "storeName" FROM order_alerts a LEFT JOIN ml_orders o ON o.ml_order_id=a.order_id AND o.owner_username=a.owner_username LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY a.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params),
+    pool.query('SELECT COUNT(*)::int AS count FROM order_alerts WHERE owner_username=$1 AND is_read=FALSE',[req.authUser.username]),
+    pool.query(`SELECT COUNT(*)::int AS count FROM order_alerts a LEFT JOIN ml_orders o ON o.ml_order_id=a.order_id AND o.owner_username=a.owner_username ${clause}`,countParams)
   ]);
-  res.json({ code: 0, data: { items: rows, unread: unread.rows[0].count } });
+  res.json({ code: 0, data: { items: rows, unread: unread.rows[0].count, total: total.rows[0].count, page, size } });
 });
 
 app.post('/api/admin/order-alerts/read-all', requireAdmin, async (req, res) => {
-  await pool.query('UPDATE order_alerts SET is_read=TRUE WHERE is_read=FALSE');
+  await pool.query('UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND is_read=FALSE',[req.authUser.username]);
   res.json({ code: 0 });
 });
 
 app.post('/api/admin/order-alerts/:id/read', requireAdmin, async (req, res) => {
-  await pool.query('UPDATE order_alerts SET is_read=TRUE WHERE id=$1', [req.params.id]);
+  await pool.query('UPDATE order_alerts SET is_read=TRUE WHERE id=$1 AND owner_username=$2', [req.params.id,req.authUser.username]);
   res.json({ code: 0 });
 });
 
 app.get('/api/admin/orders/:orderId/label', requireAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT shipping_id FROM ml_orders WHERE ml_order_id=$1 OR pack_id=$1 ORDER BY date_created', [req.params.orderId]);
+    const { rows } = await pool.query('SELECT shipping_id,store_user_id FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [req.params.orderId,req.authUser.username]);
     const shipmentIds = [...new Set(rows.map(row => row.shipping_id).filter(Boolean))];
     if (!shipmentIds.length) return res.status(404).json({ code: 404, message: '该订单暂无可下载面单' });
-    const token = await getMLAccessToken();
+    const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
+    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效' });
+    const token = context.token;
     let pdfResponse;
     for (const path of ['shipment_labels', 'marketplace/shipment_labels']) {
       try {
@@ -4142,13 +4366,18 @@ app.get('/api/admin/orders/:orderId/label', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/orders/:orderId/messages', requireAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT pack_id FROM ml_orders WHERE ml_order_id=$1', [req.params.orderId]);
+    const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [req.params.orderId,req.authUser.username]);
     if (!rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
-    const token = await getMLAccessToken();
+    const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
+    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效' });
+    const token = context.token;
     const packId = rows[0].pack_id || req.params.orderId;
     const response = await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
       headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     });
+    await saveOrderApiAudit(req.authUser.username,rows[0].store_user_id,req.params.orderId,'order_messages',String(packId),response.data);
+    await pool.query(`INSERT INTO order_message_reads(owner_username,thread_type,thread_id,last_read_at) VALUES($1,'inquiry',$2,NOW()) ON CONFLICT(owner_username,thread_type,thread_id) DO UPDATE SET last_read_at=NOW()`, [req.authUser.username,String(packId)]);
+    await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='buyer_inquiry'`,[req.authUser.username,req.params.orderId]);
     res.json({ code: 0, data: response.data });
   } catch (e) {
     const status = e.response?.status || 502;
@@ -4160,9 +4389,11 @@ app.post('/api/admin/orders/:orderId/messages', requireAdmin, async (req, res) =
   const text = String(req.body?.text || '').trim();
   if (!text) return res.status(400).json({ code: 400, message: '回复内容不能为空' });
   try {
-    const { rows } = await pool.query('SELECT pack_id FROM ml_orders WHERE ml_order_id=$1', [req.params.orderId]);
+    const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [req.params.orderId,req.authUser.username]);
     if (!rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
-    const token = await getMLAccessToken();
+    const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
+    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效' });
+    const token = context.token;
     const packId = rows[0].pack_id || req.params.orderId;
     const response = await axios.post(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
       text, text_translated: String(req.body?.textTranslated || '') || undefined, attachments: []
@@ -4175,19 +4406,40 @@ app.post('/api/admin/orders/:orderId/messages', requireAdmin, async (req, res) =
 });
 
 app.get('/api/admin/fulfillment-services', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,name,code,description,enabled FROM fulfillment_services ORDER BY id DESC');
+  const { rows } = await pool.query('SELECT id,name,code,description,enabled FROM fulfillment_services WHERE owner_username=$1 ORDER BY id DESC',[req.authUser.username]);
   res.json({ code: 0, data: rows });
 });
 
 app.post('/api/admin/fulfillment-services', requireAdmin, async (req, res) => {
   const name = String(req.body?.name || '').trim();
   if (!name) return res.status(400).json({ code: 400, message: '增值服务名称不能为空' });
-  const { rows } = await pool.query('INSERT INTO fulfillment_services(name,code,description) VALUES($1,$2,$3) RETURNING id', [name.slice(0,120), String(req.body?.code || '').trim().slice(0,100), String(req.body?.description || '').trim().slice(0,500)]);
+  const { rows } = await pool.query('INSERT INTO fulfillment_services(owner_username,name,code,description) VALUES($1,$2,$3,$4) RETURNING id', [req.authUser.username,name.slice(0,120), String(req.body?.code || '').trim().slice(0,100), String(req.body?.description || '').trim().slice(0,500)]);
   res.json({ code: 0, data: rows[0] });
 });
 
 app.delete('/api/admin/fulfillment-services/:id', requireAdmin, async (req, res) => {
-  await pool.query('DELETE FROM fulfillment_services WHERE id=$1', [req.params.id]);
+  await pool.query('DELETE FROM fulfillment_services WHERE id=$1 AND owner_username=$2', [req.params.id,req.authUser.username]);
+  res.json({ code: 0 });
+});
+
+app.get('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
+  const defaults = ['顺丰速运','中通快递','圆通速递','申通快递','韵达快递','极兔速递','邮政EMS','京东物流','菜鸟物流'];
+  const existing = await pool.query('SELECT COUNT(*)::int AS count FROM logistics_companies WHERE owner_username=$1',[req.authUser.username]);
+  if (!existing.rows[0].count) for (const name of defaults) await pool.query('INSERT INTO logistics_companies(owner_username,name) VALUES($1,$2) ON CONFLICT(owner_username,name) DO NOTHING',[req.authUser.username,name]);
+  const { rows } = await pool.query('SELECT id,name,code,enabled FROM logistics_companies WHERE owner_username=$1 ORDER BY name',[req.authUser.username]);
+  res.json({ code: 0, data: rows });
+});
+
+app.post('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
+  const name = String(req.body?.name || '').trim(), code = String(req.body?.code || '').trim();
+  if (!name) return res.status(400).json({ code: 400, message: '物流公司名称不能为空' });
+  const { rows } = await pool.query(`INSERT INTO logistics_companies(owner_username,name,code) VALUES($1,$2,$3)
+    ON CONFLICT(owner_username,name) DO UPDATE SET code=EXCLUDED.code,enabled=TRUE RETURNING id`,[req.authUser.username,name.slice(0,120),code.slice(0,100)]);
+  res.json({ code: 0, data: rows[0] });
+});
+
+app.delete('/api/admin/logistics-companies/:id', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM logistics_companies WHERE id=$1 AND owner_username=$2',[req.params.id,req.authUser.username]);
   res.json({ code: 0 });
 });
 
@@ -4196,24 +4448,27 @@ app.post('/api/admin/fulfillment/submit', requireAdmin, async (req, res) => {
   const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
   const trackingByOrder = req.body?.trackingByOrder || {}, serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
   if (!orderIds.length || !warehouseId || !carrier) return res.status(400).json({ code: 400, message: '请选择订单、仓库和物流公司' });
-  const connectorResult = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND enabled=TRUE', [warehouseId]);
+  const connectorResult = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND owner_username=$2 AND enabled=TRUE', [warehouseId,req.authUser.username]);
   if (!connectorResult.rows[0]) return res.status(404).json({ code: 404, message: '仓库不存在或已停用' });
-  const serviceResult = serviceIds.length ? await pool.query('SELECT id,name,code,description FROM fulfillment_services WHERE enabled=TRUE AND id=ANY($1::bigint[])', [serviceIds]) : { rows: [] };
+  const carrierResult = await pool.query('SELECT id FROM logistics_companies WHERE owner_username=$1 AND name=$2 AND enabled=TRUE',[req.authUser.username,carrier]);
+  if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
+  const serviceResult = serviceIds.length ? await pool.query('SELECT id,name,code,description FROM fulfillment_services WHERE owner_username=$2 AND enabled=TRUE AND id=ANY($1::bigint[])', [serviceIds,req.authUser.username]) : { rows: [] };
   const warehouse = connectorResult.rows[0], headers = { 'Content-Type': 'application/json' };
   if (warehouse.auth_header && warehouse.auth_value) headers[warehouse.auth_header] = decryptErpCredential(warehouse.auth_value);
   const results = [];
   for (const displayOrderId of orderIds) {
     const trackingNumber = String(trackingByOrder[displayOrderId] || '').trim();
     if (!trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少快递单号' }); continue; }
-    const orderResult = await pool.query('SELECT * FROM ml_orders WHERE ml_order_id=$1 OR pack_id=$1 ORDER BY date_created', [displayOrderId]);
+    const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [displayOrderId,req.authUser.username]);
     if (!orderResult.rows.length) { results.push({ orderId: displayOrderId, success: false, message: '订单不存在' }); continue; }
     const payload = { source: 'shanyue-erp', action: 'fulfillment_label', order_id: displayOrderId, carrier, tracking_number: trackingNumber, value_added_services: serviceResult.rows, orders: orderResult.rows.map(row => row.raw_data) };
     try {
       const pushed = await axios.post(warehouse.endpoint, payload, { headers, timeout: 30000, maxRedirects: 0 });
-      await pool.query(`INSERT INTO fulfillment_submissions(order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text) VALUES($1,$2,$3,$4,$5::jsonb,'success',$6::jsonb,$7) ON CONFLICT(order_id) DO UPDATE SET warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,updated_at=NOW()`, [displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed.data).slice(0,5000)]);
+      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed.data).slice(0,5000)]);
       results.push({ orderId: displayOrderId, success: true });
     } catch (error) {
-      await pool.query(`INSERT INTO fulfillment_submissions(order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text) VALUES($1,$2,$3,$4,$5::jsonb,'failed',$6::jsonb,$7) ON CONFLICT(order_id) DO UPDATE SET status='failed',response_text=EXCLUDED.response_text,updated_at=NOW()`, [displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000)]);
+      const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
+      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason,retry_count) VALUES($1,$2,$3,$4,$5,$6::jsonb,'failed',$7::jsonb,$8,$9,1) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,status='failed',response_text=EXCLUDED.response_text,failure_reason=EXCLUDED.failure_reason,retry_count=fulfillment_submissions.retry_count+1,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason]);
       results.push({ orderId: displayOrderId, success: false, message: error.response?.data?.message || error.message });
     }
   }
@@ -4221,8 +4476,35 @@ app.post('/api/admin/fulfillment/submit', requireAdmin, async (req, res) => {
   res.status(success ? 200 : 502).json({ code: success ? 0 : 502, data: { success, failed: results.length - success, results }, message: success ? '代贴单已提交' : '代贴单提交失败' });
 });
 
+app.get('/api/admin/fulfillment/submissions', requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.carrier,f.tracking_number AS "trackingNumber",f.status,
+    f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.created_at AS "createdAt",f.updated_at AS "updatedAt",
+    c.name AS "warehouseName" FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
+    WHERE f.owner_username=$1 ORDER BY f.updated_at DESC LIMIT 200`, [req.authUser.username]);
+  res.json({ code: 0, data: rows });
+});
+
+app.post('/api/admin/fulfillment/submissions/:id/retry', requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(`SELECT f.*,c.endpoint,c.auth_header,c.auth_value FROM fulfillment_submissions f
+    JOIN erp_connectors c ON c.id=f.warehouse_id AND c.owner_username=f.owner_username
+    WHERE f.id=$1 AND f.owner_username=$2`, [req.params.id,req.authUser.username]);
+  const submission = rows[0];
+  if (!submission) return res.status(404).json({ code: 404, message: '代贴单提交记录不存在' });
+  const headers = { 'Content-Type': 'application/json' };
+  if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
+  try {
+    const response = await axios.post(submission.endpoint, submission.request_data, { headers, timeout: 30000, maxRedirects: 0 });
+    await pool.query(`UPDATE fulfillment_submissions SET status='success',response_text=$1,failure_reason=NULL,retry_count=retry_count+1,updated_at=NOW() WHERE id=$2 AND owner_username=$3`, [JSON.stringify(response.data).slice(0,5000),submission.id,req.authUser.username]);
+    res.json({ code: 0, message: '重试成功' });
+  } catch (error) {
+    const reason = String(error.response?.data?.message || error.message || '重试失败').slice(0,2000);
+    await pool.query(`UPDATE fulfillment_submissions SET status='failed',response_text=$1,failure_reason=$2,retry_count=retry_count+1,updated_at=NOW() WHERE id=$3 AND owner_username=$4`, [JSON.stringify(error.response?.data || error.message).slice(0,5000),reason,submission.id,req.authUser.username]);
+    res.status(502).json({ code: 502, message: reason });
+  }
+});
+
 app.get('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,name,endpoint,auth_header AS "authHeader",enabled,created_at AS "createdAt" FROM erp_connectors ORDER BY id DESC');
+  const { rows } = await pool.query('SELECT id,name,endpoint,auth_header AS "authHeader",enabled,created_at AS "createdAt" FROM erp_connectors WHERE owner_username=$1 ORDER BY id DESC',[req.authUser.username]);
   res.json({ code: 0, data: rows });
 });
 
@@ -4234,29 +4516,29 @@ app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
   let encryptedAuth;
   try { encryptedAuth = encryptErpCredential(String(authValue || '').slice(0,2000)); }
   catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
-  const { rows } = await pool.query('INSERT INTO erp_connectors(name,endpoint,auth_header,auth_value) VALUES($1,$2,$3,$4) RETURNING id', [String(name).slice(0,120), target.href, String(authHeader || '').slice(0,120), encryptedAuth]);
+  const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value) VALUES($1,$2,$3,$4,$5) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, String(authHeader || '').slice(0,120), encryptedAuth]);
   res.json({ code: 0, data: { id: rows[0].id } });
 });
 
 app.delete('/api/admin/erp-connectors/:id', requireAdmin, async (req, res) => {
-  await pool.query('DELETE FROM erp_connectors WHERE id=$1', [req.params.id]);
+  await pool.query('DELETE FROM erp_connectors WHERE id=$1 AND owner_username=$2', [req.params.id,req.authUser.username]);
   res.json({ code: 0 });
 });
 
 app.post('/api/admin/orders/:orderId/push', requireAdmin, async (req, res) => {
-  const order = await pool.query('SELECT * FROM ml_orders WHERE ml_order_id=$1', [req.params.orderId]);
-  const connector = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND enabled=TRUE', [req.body?.connectorId]);
+  const order = await pool.query('SELECT * FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [req.params.orderId,req.authUser.username]);
+  const connector = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND owner_username=$2 AND enabled=TRUE', [req.body?.connectorId,req.authUser.username]);
   if (!order.rows[0] || !connector.rows[0]) return res.status(404).json({ code: 404, message: '订单或ERP连接不存在' });
   const c = connector.rows[0], headers = { 'Content-Type': 'application/json' };
   try {
     if (c.auth_header && c.auth_value) headers[c.auth_header] = decryptErpCredential(c.auth_value);
     const pushed = await axios.post(c.endpoint, { source: 'shanyue-erp', order: order.rows[0].raw_data }, { headers, timeout: 30000, maxRedirects: 0 });
-    await pool.query("UPDATE ml_orders SET push_status='success',last_pushed_at=NOW() WHERE ml_order_id=$1", [req.params.orderId]);
-    await pool.query('INSERT INTO erp_push_logs(order_id,connector_id,success,http_status,response_text) VALUES($1,$2,TRUE,$3,$4)', [req.params.orderId,c.id,pushed.status,JSON.stringify(pushed.data).slice(0,5000)]);
+    await pool.query("UPDATE ml_orders SET push_status='success',last_pushed_at=NOW() WHERE ml_order_id=$1 AND owner_username=$2", [req.params.orderId,req.authUser.username]);
+    await pool.query('INSERT INTO erp_push_logs(owner_username,order_id,connector_id,success,http_status,response_text) VALUES($1,$2,$3,TRUE,$4,$5)', [req.authUser.username,req.params.orderId,c.id,pushed.status,JSON.stringify(pushed.data).slice(0,5000)]);
     res.json({ code: 0, data: { status: pushed.status } });
   } catch (e) {
-    await pool.query("UPDATE ml_orders SET push_status='failed',last_pushed_at=NOW() WHERE ml_order_id=$1", [req.params.orderId]);
-    await pool.query('INSERT INTO erp_push_logs(order_id,connector_id,success,http_status,response_text) VALUES($1,$2,FALSE,$3,$4)', [req.params.orderId,c.id,e.response?.status || null,JSON.stringify(e.response?.data || e.message).slice(0,5000)]);
+    await pool.query("UPDATE ml_orders SET push_status='failed',last_pushed_at=NOW() WHERE ml_order_id=$1 AND owner_username=$2", [req.params.orderId,req.authUser.username]);
+    await pool.query('INSERT INTO erp_push_logs(owner_username,order_id,connector_id,success,http_status,response_text) VALUES($1,$2,$3,FALSE,$4,$5)', [req.authUser.username,req.params.orderId,c.id,e.response?.status || null,JSON.stringify(e.response?.data || e.message).slice(0,5000)]);
     res.status(502).json({ code: 502, message: 'ERP推单失败', detail: e.response?.data || e.message });
   }
 });
