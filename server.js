@@ -2930,12 +2930,14 @@ async function loadPromotionSites(auth, token, force = false) {
   for (const path of searchPaths) {
     try {
       const representatives = new Map();
+      const cbtSamples = [];
       for (let offset = 0; offset < 500 && representatives.size < 5; offset += 50) {
         const response = await axios.get(`https://api.mercadolibre.com/${path}`, { params: { status: 'active', limit: 50, offset }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
         const ids = (response.data?.results || []).map(String).filter(Boolean);
         for (const itemId of ids) {
           const siteId = itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1];
           if (siteId && !representatives.has(siteId)) representatives.set(siteId, itemId);
+          if (/^CBT\d+$/i.test(itemId) && cbtSamples.length < 12) cbtSamples.push(itemId);
         }
         const total = Number(response.data?.paging?.total || ids.length);
         if (!ids.length || offset + ids.length >= total) break;
@@ -2948,9 +2950,28 @@ async function loadPromotionSites(auth, token, force = false) {
           if (userId) discovered.set(siteId, { siteId, userId, source: 'store-items' });
         } catch {}
       });
+      await mapWithConcurrency(cbtSamples, 3, async itemId => {
+        try {
+          const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
+          const walk = value => {
+            if (!value || typeof value !== 'object') return;
+            const rawId = String(value.item_id || value.id || '');
+            const siteId = String(value.site_id || rawId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
+            const userId = String(value.seller_id || value.seller?.id || value.user_id || '');
+            if (['MLM', 'MLB', 'MLC', 'MCO', 'MLA'].includes(siteId) && userId) discovered.set(siteId, { siteId, userId, source: 'cbt-item-mapping' });
+            for (const child of Object.values(value)) if (child && typeof child === 'object') walk(child);
+          };
+          walk(detailResponse.data);
+        } catch {}
+      });
       if (representatives.size) break;
     } catch {}
   }
+  try {
+    for (const site of await loadMarketingSites(auth, token, force)) {
+      if (!discovered.has(site.siteId)) discovered.set(site.siteId, { siteId: site.siteId, userId: site.userId, source: 'account-identity-fallback' });
+    }
+  } catch {}
   for (const siteId of ['MLM', 'MLB', 'MLC', 'MCO', 'MLA']) {
     if (!discovered.has(siteId)) discovered.set(siteId, { siteId, userId: String(auth.ml_user_id), source: 'authorization-probe' });
   }
