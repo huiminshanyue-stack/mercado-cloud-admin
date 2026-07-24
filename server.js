@@ -3546,7 +3546,10 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
     const seenItemIds = new Set();
     const rawItems = responseItems.filter(item => {
       const itemId = String(item?.id || '');
-      if (!itemId || item.status !== status || seenItemIds.has(itemId)) return false;
+      const returnedStatus = String(item?.status || '').toLowerCase();
+      if (!itemId || seenItemIds.has(itemId)) return false;
+      if (status === 'started' && returnedStatus && returnedStatus !== 'started') return false;
+      if (status === 'candidate' && returnedStatus === 'started') return false;
       if (status === 'candidate' && startedItemIds.has(itemId)) return false;
       seenItemIds.add(itemId);
       return true;
