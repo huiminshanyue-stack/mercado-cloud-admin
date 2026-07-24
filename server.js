@@ -2951,10 +2951,8 @@ async function loadPromotionSites(auth, token, force = false) {
       if (representatives.size) break;
     } catch {}
   }
-  try {
-    for (const site of await loadMarketingSites(auth, token, force)) if (!discovered.has(site.siteId)) discovered.set(site.siteId, { siteId: site.siteId, userId: site.userId, source: 'advertising-fallback' });
-  } catch (error) {
-    console.warn('[Marketing] 广告账户不可用，不影响促销活动发现:', marketingApiError(error, '广告账户不可用'));
+  for (const siteId of ['MLM', 'MLB', 'MLC', 'MCO', 'MLA']) {
+    if (!discovered.has(siteId)) discovered.set(siteId, { siteId, userId: String(auth.ml_user_id), source: 'authorization-probe' });
   }
   return writeTimedCache(marketingCache, cacheKey, [...discovered.values()], 50);
 }
@@ -2969,7 +2967,13 @@ async function loadSitePromotions(token, site, force = false) {
     headers: getPromotionHeaders(token),
     timeout: 20000
   });
-  const promotions = Array.isArray(response.data?.results) ? response.data.results : [];
+  let promotions = Array.isArray(response.data?.results) ? response.data.results : [];
+  if (site.source === 'authorization-probe') {
+    promotions = promotions.filter(promotion => {
+      const promotionSite = String(promotion.id || '').match(/(?:^|-)(MLM|MLB|MLC|MCO|MLA)(?:\d|$)/)?.[1];
+      return !promotionSite || promotionSite === site.siteId;
+    });
+  }
   return writeTimedCache(marketingCache, cacheKey, promotions, 50);
 }
 
