@@ -2879,6 +2879,8 @@ function finalizeAdMetrics(metrics) {
 }
 
 function extractAdvertiserUserId(advertiser) {
+  const direct = advertiser?.user_id || advertiser?.seller_id || advertiser?.account_id || advertiser?.user?.id || advertiser?.seller?.id || advertiser?.account?.user_id;
+  if (direct && /^\d+$/.test(String(direct))) return String(direct);
   const match = String(advertiser?.account_name || '').match(/(?:ID\s*-\s*)?(\d+)\s*$/i);
   return match?.[1] || '';
 }
