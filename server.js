@@ -3283,6 +3283,56 @@ app.patch('/api/marketing/product-ads/campaigns/:campaignId', requireAuth, async
   }
 });
 
+app.post('/api/marketing/product-ads/campaigns', requireAuth, async (req, res) => {
+  try {
+    const siteId = String(req.body?.siteId || '').trim().toUpperCase();
+    const name = String(req.body?.name || '').trim();
+    const status = String(req.body?.status || 'paused').toLowerCase();
+    const strategy = String(req.body?.strategy || '').toLowerCase();
+    const budget = Number(req.body?.budget);
+    const roasTarget = Number(req.body?.roasTarget);
+    if (!siteId || !name || name.length > 200) return res.status(400).json({ code: 400, message: '请选择国家并填写不超过 200 个字符的活动名称' });
+    if (!['active', 'paused'].includes(status)) return res.status(400).json({ code: 400, message: '请选择有效的投放状态' });
+    if (!['profitability', 'increase', 'visibility'].includes(strategy)) return res.status(400).json({ code: 400, message: '请选择有效的投放策略' });
+    if (!Number.isFinite(budget) || budget <= 0) return res.status(400).json({ code: 400, message: '每日预算必须大于 0' });
+    if (!Number.isFinite(roasTarget) || roasTarget < 1 || roasTarget > 35) return res.status(400).json({ code: 400, message: '目标 ROAS 必须在 1 至 35 之间' });
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.body?.storeId);
+    const sites = await loadMarketingSites(auth, token);
+    const site = sites.find(item => item.siteId === siteId);
+    if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
+    const response = await axios.post(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/advertisers/${encodeURIComponent(site.advertiserId)}/product_ads/campaigns`, {
+      name, status, budget: Number(budget.toFixed(2)), strategy, channel: 'marketplace', roas_target: Number(roasTarget.toFixed(2))
+    }, { headers: { ...getProductAdsHeaders(token), 'Content-Type': 'application/json' }, timeout: 25000 });
+    for (const key of productAdsCache.keys()) if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
+    res.json({ code: 0, message: '广告活动已创建并由美客多确认', data: response.data || {} });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '广告活动创建失败') });
+  }
+});
+
+app.delete('/api/marketing/product-ads/campaigns/:campaignId/ad-groups/:adGroupId', requireAuth, async (req, res) => {
+  try {
+    const campaignId = String(req.params.campaignId || '').trim();
+    const adGroupId = String(req.params.adGroupId || '').trim();
+    const siteId = String(req.body?.siteId || '').trim().toUpperCase();
+    if (!campaignId || !adGroupId || !siteId) return res.status(400).json({ code: 400, message: '缺少广告活动或广告组信息' });
+    const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.body?.storeId);
+    const sites = await loadMarketingSites(auth, token);
+    const site = sites.find(item => item.siteId === siteId);
+    if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
+    await axios.delete(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/campaigns/${encodeURIComponent(campaignId)}/ad_groups/${encodeURIComponent(adGroupId)}`, {
+      headers: getProductAdsHeaders(token), timeout: 25000
+    });
+    for (const key of productAdsCache.keys()) if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
+    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${auth.ml_user_id}:${siteId}:`)) marketingProductsCache.delete(key);
+    res.json({ code: 0, message: '商品已从广告活动移除，店铺商品不会被删除' });
+  } catch (error) {
+    const status = error.statusCode || error.response?.status || 500;
+    res.status(status).json({ code: status, message: marketingApiError(error, '移除广告商品失败') });
+  }
+});
+
 app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
   try {
     const promotionId = String(req.query.promotionId || '').trim();
