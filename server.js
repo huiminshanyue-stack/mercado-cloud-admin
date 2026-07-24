@@ -2788,7 +2788,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.14',
+    version: '2026-07-25.16',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2810,8 +2810,12 @@ app.get('/api/health/order-management', (req, res) => {
     combinedSalesCommission: true,
     orderDimensionSnapshots: true,
     dimensionDeclaredVsCurrent: true,
+    dimensionMissingValueLabels: true,
+    compactDimensionCard: true,
     statisticsIndependentFilters: true,
     statisticsNaturalDateRange: true,
+    statisticsCardsFollowFilters: true,
+    yesterdayStatisticsCardsRemoved: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -2953,12 +2957,32 @@ function dimensionSnapshotComparable(snapshot) {
   };
 }
 
+function normalizedComparableDimensions(value) {
+  if (!value || typeof value !== 'object') return null;
+  const dimensionUnit = String(value.dimensionUnit || 'cm').trim().toLowerCase();
+  const weightUnit = String(value.weightUnit || 'g').trim().toLowerCase();
+  const lengthFactor = dimensionUnit === 'mm' ? 0.1 : (dimensionUnit === 'm' ? 100 : (['in','inch','inches'].includes(dimensionUnit) ? 2.54 : 1));
+  const weightFactor = ['kg','kilogram','kilograms'].includes(weightUnit) ? 1000
+    : (['lb','lbs','pound','pounds'].includes(weightUnit) ? 453.59237
+      : (['oz','ounce','ounces'].includes(weightUnit) ? 28.349523125 : 1));
+  const normalize = (raw,factor) => {
+    const number = dimensionNumber(raw);
+    return number === null ? null : Number((number * factor).toFixed(3));
+  };
+  return {
+    lengthCm: normalize(value.length,lengthFactor),
+    widthCm: normalize(value.width,lengthFactor),
+    heightCm: normalize(value.height,lengthFactor),
+    weightG: normalize(value.weight,weightFactor)
+  };
+}
+
 function dimensionSnapshotsDiffer(original, latest) {
   if (!original?.available || !latest?.available) return false;
   const originalValue = original.orderRecorded || original.items?.[0]?.orderDimensions || original.items?.[0]?.dimensions || original.package?.dimensions || null;
   const latestValue = latest.items?.[0]?.listingDimensions || latest.items?.[0]?.dimensions || latest.package?.dimensions || null;
   if (!originalValue || !latestValue) return JSON.stringify(dimensionSnapshotComparable(original)) !== JSON.stringify(dimensionSnapshotComparable(latest));
-  return JSON.stringify(originalValue) !== JSON.stringify(latestValue);
+  return JSON.stringify(normalizedComparableDimensions(originalValue)) !== JSON.stringify(normalizedComparableDimensions(latestValue));
 }
 
 async function fetchOfficialItemDetail(accessToken, itemId, marketplaceFirst = true) {
