@@ -2955,9 +2955,9 @@ async function loadPromotionSites(auth, token, force = false) {
           if (userId) discovered.set(siteId, { siteId, userId, source: 'store-items' });
         } catch {}
       });
-      const sampleStep = Math.max(1, Math.floor(cbtItems.length / 60));
-      const cbtSamples = cbtItems.filter((_, index) => index % sampleStep === 0).slice(0, 60);
-      await mapWithConcurrency(cbtSamples, 5, async itemId => {
+      const sampleStep = Math.max(1, Math.floor(cbtItems.length / 20));
+      const cbtSamples = cbtItems.filter((_, index) => index % sampleStep === 0).slice(0, 20);
+      await mapWithConcurrency(cbtSamples, 4, async itemId => {
         try {
           const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
           const walk = value => {
@@ -2974,6 +2974,43 @@ async function loadPromotionSites(auth, token, force = false) {
       if (representatives.size) break;
     } catch {}
   }
+  await mapWithConcurrency(['MLM', 'MLB', 'MLC', 'MCO', 'MLA'].filter(siteId => !discovered.has(siteId)), 2, async siteId => {
+    for (const path of searchPaths) {
+      try {
+        const response = await axios.get(`https://api.mercadolibre.com/${path}`, {
+          params: { status: 'active', site_id: siteId, limit: 20, offset: 0 },
+          headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+        });
+        const ids = (response.data?.results || []).map(String).filter(Boolean);
+        for (const itemId of ids) {
+          try {
+            const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
+            const detail = detailResponse.data || {};
+            const directSite = String(detail.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
+            const directUser = String(detail.seller_id || detail.seller?.id || '');
+            if (directSite === siteId && directUser) {
+              discovered.set(siteId, { siteId, userId: directUser, source: 'country-filtered-items' });
+              return;
+            }
+            let mappedUser = '';
+            const walk = value => {
+              if (!value || typeof value !== 'object' || mappedUser) return;
+              const rawId = String(value.item_id || value.id || '');
+              const mappedSite = String(value.site_id || rawId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
+              const userId = String(value.seller_id || value.seller?.id || value.user_id || '');
+              if (mappedSite === siteId && userId) mappedUser = userId;
+              else for (const child of Object.values(value)) if (child && typeof child === 'object') walk(child);
+            };
+            walk(detail);
+            if (mappedUser) {
+              discovered.set(siteId, { siteId, userId: mappedUser, source: 'country-filtered-cbt-mapping' });
+              return;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+  });
   try {
     for (const site of await loadMarketingSites(auth, token, force)) {
       if (!discovered.has(site.siteId)) discovered.set(site.siteId, { siteId: site.siteId, userId: site.userId, source: 'account-identity-fallback' });
@@ -3032,6 +3069,7 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
       siteId: site.siteId,
       userId: site.userId
     })));
+    const connectedSites = siteResults.filter(site => site.supported && site.source !== 'authorization-probe');
     let advertisingSites = [];
     try { advertisingSites = await loadMarketingSites(auth, token, force); } catch {}
     const advertisers = advertisingSites.map(site => ({
@@ -3045,13 +3083,14 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
       promotions: {
         supported: siteResults.some(site => site.supported),
         status: siteResults.some(site => site.supported) ? 200 : 403,
-        message: `已读取 ${siteResults.length} 个国家子店铺、${promotions.length} 个活动`,
+        message: `已连接 ${connectedSites.length} 个国家子店铺、读取 ${promotions.length} 个活动${connectedSites.length < siteResults.length ? `；另有 ${siteResults.length - connectedSites.length} 个国家尚未识别子卖家ID` : ''}`,
         items: promotions,
         sites: siteResults.map(site => ({
           siteId: site.siteId,
           userId: site.userId,
           supported: site.supported,
           message: site.message || '',
+          source: site.source || '',
           promotionCount: site.promotions.length
         }))
       },
