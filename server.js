@@ -3266,19 +3266,22 @@ app.get('/api/marketing/product-ads/campaign-products', requireAuth, async (req,
     let products = groupProducts.flat();
     const itemIds = [...new Set(products.map(product => String(product.itemId || '')).filter(id => /^ML[A-Z]\d+$/i.test(id)))];
     const itemDetails = new Map();
-    for (let offset = 0; offset < itemIds.length; offset += 20) {
-      const ids = itemIds.slice(offset, offset + 20);
-      try {
-        const detailResponse = await axios.get('https://api.mercadolibre.com/items', {
-          params: { ids: ids.join(',') }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-        });
-        for (const entry of Array.isArray(detailResponse.data) ? detailResponse.data : []) {
-          if (entry?.code === 200 && entry.body?.id) itemDetails.set(String(entry.body.id), entry.body);
+    await mapWithConcurrency(itemIds, 4, async itemId => {
+      const detailKey = `item:${itemId}`;
+      let detail = readTimedCache(marketingItemCache, detailKey, MARKETING_ITEM_CACHE_TTL);
+      if (!detail) {
+        try {
+          const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, {
+            headers: { Authorization: `Bearer ${token}` }, timeout: 15000
+          });
+          detail = writeTimedCache(marketingItemCache, detailKey, detailResponse.data || {}, 500);
+        } catch (error) {
+          console.warn('[Marketing] CBT 商品资料补充失败:', itemId, marketingApiError(error, '读取失败'));
+          detail = {};
         }
-      } catch (error) {
-        console.warn('[Marketing] 商品图片资料补充失败:', marketingApiError(error, '读取失败'));
       }
-    }
+      if (detail?.id || detail?.title || detail?.thumbnail || detail?.secure_thumbnail) itemDetails.set(String(itemId), detail);
+    });
     products = products.map(product => {
       const detail = itemDetails.get(String(product.itemId));
       return detail ? { ...product, title: detail.title || product.title, thumbnail: detail.secure_thumbnail || detail.thumbnail || product.thumbnail, permalink: detail.permalink || product.permalink, price: Number(detail.price || product.price || 0), currencyId: detail.currency_id || 'USD' } : product;
