@@ -2933,14 +2933,14 @@ async function loadPromotionSites(auth, token, force = false) {
   for (const path of searchPaths) {
     try {
       const representatives = new Map();
-      const cbtSamples = [];
+      const cbtItems = [];
       for (let offset = 0; offset < 500 && representatives.size < 5; offset += 50) {
         const response = await axios.get(`https://api.mercadolibre.com/${path}`, { params: { status: 'active', limit: 50, offset }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
         const ids = (response.data?.results || []).map(String).filter(Boolean);
         for (const itemId of ids) {
           const siteId = itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1];
           if (siteId && !representatives.has(siteId)) representatives.set(siteId, itemId);
-          if (/^CBT\d+$/i.test(itemId) && cbtSamples.length < 12) cbtSamples.push(itemId);
+          if (/^CBT\d+$/i.test(itemId)) cbtItems.push(itemId);
         }
         const total = Number(response.data?.paging?.total || ids.length);
         if (!ids.length || offset + ids.length >= total) break;
@@ -2953,7 +2953,9 @@ async function loadPromotionSites(auth, token, force = false) {
           if (userId) discovered.set(siteId, { siteId, userId, source: 'store-items' });
         } catch {}
       });
-      await mapWithConcurrency(cbtSamples, 3, async itemId => {
+      const sampleStep = Math.max(1, Math.floor(cbtItems.length / 60));
+      const cbtSamples = cbtItems.filter((_, index) => index % sampleStep === 0).slice(0, 60);
+      await mapWithConcurrency(cbtSamples, 5, async itemId => {
         try {
           const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
           const walk = value => {
