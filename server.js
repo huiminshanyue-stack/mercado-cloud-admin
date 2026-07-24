@@ -3245,7 +3245,10 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
           currency: detail.currency_id || 'USD',
           stock: Number(detail.available_quantity || 0),
           status: detail.status || 'active',
-          eligiblePromotions: promotions.filter(item => item.status === 'candidate' && item.id).map(item => ({ id: item.id, type: item.type || '', name: item.name || '', offerId: item.offers?.[0]?.id || '' })),
+          eligiblePromotions: promotions.filter(item => item.status === 'candidate' && item.id).map(item => {
+            const offer = Array.isArray(item.offers) ? (item.offers.find(entry => entry?.status === 'candidate') || item.offers[0] || {}) : {};
+            return { id: item.id, type: item.type || '', name: item.name || '', offerId: item.offer_id || item.candidate_id || offer.id || '', activityPrice: Number(item.price || item.deal_price || offer.price || offer.deal_price || offer.new_price || 0), platformDiscountPercent: Number(item.discount_percentage || offer.discount_percentage || 0), minPrice: Number(item.min_discounted_price || 0), maxPrice: Number(item.max_discounted_price || 0), suggestedPrice: Number(item.suggested_discounted_price || 0) };
+          }),
           joinedPromotions: promotions.filter(item => item.status === 'started' && item.id).map(item => ({ id: item.id, type: item.type || '', name: item.name || '' })),
           ad: null
         };
