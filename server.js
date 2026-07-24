@@ -2742,6 +2742,7 @@ const promotionNameTranslationCache = new Map();
 const productAdsCache = new Map();
 const productAdsAnalyticsCache = new Map();
 const marketingProductsCache = new Map();
+const promotionPageCursorCache = new Map();
 const MARKETING_CACHE_TTL = 60 * 1000;
 const MARKETING_ITEM_CACHE_TTL = 5 * 60 * 1000;
 const PROMOTION_NAME_ZH_OVERRIDES = new Map([
@@ -3553,17 +3554,31 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
     if (!promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
       return res.status(404).json({ code: 404, message: '活动不存在或已结束，请刷新活动列表' });
     }
-    const response = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/promotions/${encodeURIComponent(promotionId)}/items`, {
-      params: {
-        user_id: site.userId,
-        promotion_type: promotionType,
-        status,
-        limit: size,
-        offset: (page - 1) * size
-      },
-      headers: getPromotionHeaders(token),
-      timeout: 25000
-    });
+    const pagingKey = `${auth.ml_user_id}:${siteId}:${promotionId}:${promotionType}:${status}:${size}`;
+    let cursorEntry = readTimedCache(promotionPageCursorCache, pagingKey, 10 * 60 * 1000) || { cursors: { 1: '' } };
+    let response;
+    let currentPage = 1;
+    let cursor = '';
+    const knownPages = Object.keys(cursorEntry.cursors).map(Number).filter(value => value <= page && value > 0).sort((a, b) => b - a);
+    if (knownPages.length) {
+      currentPage = knownPages[0];
+      cursor = cursorEntry.cursors[currentPage] || '';
+    }
+    while (currentPage <= page) {
+      const params = { user_id: site.userId, promotion_type: promotionType, status, limit: size };
+      if (cursor) params.search_after = cursor;
+      response = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/promotions/${encodeURIComponent(promotionId)}/items`, {
+        params, headers: getPromotionHeaders(token), timeout: 25000
+      });
+      const nextCursor = String(response.data?.paging?.search_after || response.data?.paging?.searchAfter || '');
+      if (currentPage < page) {
+        if (!nextCursor) { response = { data: { results: [], paging: { total: response.data?.paging?.total || 0 } } }; break; }
+        cursorEntry.cursors[currentPage + 1] = nextCursor;
+        cursor = nextCursor;
+      }
+      currentPage++;
+    }
+    writeTimedCache(promotionPageCursorCache, pagingKey, cursorEntry, 200);
     const responseItems = Array.isArray(response.data?.results) ? response.data.results : [];
     const startedItemIds = new Set(responseItems
       .filter(item => item?.status === 'started')
@@ -3621,7 +3636,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
       total: Number(response.data?.paging?.total || items.length),
       page,
       size,
-      searchAfter: response.data?.paging?.searchAfter || ''
+      searchAfter: response.data?.paging?.search_after || response.data?.paging?.searchAfter || ''
     } });
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
@@ -3695,6 +3710,7 @@ app.post('/api/marketing/promotions/enroll-batch', requireAuth, async (req, res)
       }
     });
     marketingCache.delete(`promotions:${context.site.userId}`);
+    for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
@@ -3732,6 +3748,7 @@ app.post('/api/marketing/promotions/exit-batch', requireAuth, async (req, res) =
         return { itemId, success: false, message: marketingApiError(error, '退出失败') };
       }
     });
+    for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
