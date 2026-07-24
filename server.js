@@ -2439,32 +2439,44 @@ function parseOrderBilling(detail, grossAmount) {
     Object.values(value).forEach(child => walk(child, currency));
   };
   walk(detail);
-  let saleFee = 0, shippingFee = 0, otherFee = 0, totalCharges = 0, totalBonuses = 0;
+  let saleFee = 0, shippingFee = 0, otherFee = 0, totalCharges = 0, totalBonuses = 0, ledgerDelta = 0;
   for (const entry of entries) {
-    const amount = Math.abs(Number(entry.detail_amount || 0));
+    const signedAmount = Number(entry.detail_amount || 0);
+    const amount = Math.abs(signedAmount);
     const type = String(entry.detail_type || '').toUpperCase();
     const subType = String(entry.detail_sub_type || '').toUpperCase();
     const conceptType = String(entry.concept_type || '').toUpperCase();
     const text = `${entry.transaction_detail || ''} ${entry.detail_description || ''} ${subType} ${conceptType}`.toLowerCase();
-    if (type === 'BONUS' || /bonus|rebate|credit/.test(text)) totalBonuses += amount;
+    if (type === 'BONUS' || /bonus|rebate|credit/.test(text)) {
+      totalBonuses += amount;
+      ledgerDelta += signedAmount;
+    }
     else {
       totalCharges += amount;
+      ledgerDelta -= signedAmount;
       if (subType === 'CXD' || conceptType === 'SHIPPING' || /shipping|shipment|freight|logistic|env[ií]o|mercado env[ií]os/.test(text)) shippingFee += amount;
       else if (subType === 'CV' || /sale.?fee|commission|selling.?fee|cargo por venta|cargo por vender|tarifa de venta/.test(text)) saleFee += amount;
       else otherFee += amount;
     }
   }
-  const explicitSaleFee = Number(detail.sale_fee?.amount ?? detail.sale_fee ?? 0);
+  const explicitSaleFee = Number(detail.sale_fee?.net ?? detail.sale_fee?.amount ?? detail.sale_fee?.gross ?? detail.sale_fee ?? 0);
   const explicitShipping = Number(detail.shipping_info?.sender_shipping_cost ?? detail.shipping_cost ?? 0);
-  if (!saleFee && explicitSaleFee) saleFee = Math.abs(explicitSaleFee);
-  if (!shippingFee && explicitShipping) shippingFee = Math.abs(explicitShipping);
+  if (!saleFee && explicitSaleFee) {
+    saleFee = Math.abs(explicitSaleFee);
+    if (!entries.length) ledgerDelta -= explicitSaleFee;
+  }
+  if (!shippingFee && explicitShipping) {
+    shippingFee = Math.abs(explicitShipping);
+    if (!entries.length) ledgerDelta -= explicitShipping;
+  }
   const netCandidates = [
     detail.net_received_amount, detail.net_amount, detail.total_net_amount,
     detail.settlement_amount, detail.amount_to_receive,
     detail.amounts?.net, detail.amounts?.net_amount, detail.summary?.net_amount
   ];
   const officialNetValue = netCandidates.find(value => value !== undefined && value !== null && Number.isFinite(Number(value)));
-  return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses,
+  const hasOfficialLedger = entries.length > 0 || explicitSaleFee !== 0 || explicitShipping !== 0 || officialNetValue !== undefined;
+  return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, ledgerDelta, hasOfficialLedger,
     netAmount: officialNetValue === undefined ? null : Number(officialNetValue), entries };
 }
 
@@ -2520,7 +2532,7 @@ async function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
-    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, grossAmountUsd: 0, netAmountUsd: 0, refundAmountUsd: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _hasGrossAmountUsd: false, _hasNetAmountUsd: false, _hasRefundAmountUsd: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, grossAmountUsd: 0, netAmountUsd: 0, refundAmountUsd: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _hasGrossAmountUsd: false, _hasNetAmountUsd: false, _hasRefundAmountUsd: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialLedgerDelta: 0, _hasOfficialLedger: false, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
     const group = groups.get(groupId);
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
@@ -2539,6 +2551,8 @@ async function aggregatePackedOrders(rows) {
     }
     group.financeIsOfficial ||= Boolean(row.financeIsOfficial);
     const parsed = parseOrderBilling(row.billingData, Number(row.paidAmount || 0));
+    if (parsed?.hasOfficialLedger) group._hasOfficialLedger = true;
+    if (parsed?.hasOfficialLedger && !parsed.entries?.length) group._officialLedgerDelta += Number(parsed.ledgerDelta || 0);
     for (const entry of parsed?.entries || []) {
       const subType = String(entry.detail_sub_type || '').toUpperCase();
       const conceptType = String(entry.concept_type || '').toUpperCase();
@@ -2553,6 +2567,8 @@ async function aggregatePackedOrders(rows) {
         if (fxRate === null) { group.billingCurrencyMismatch = true; continue; }
         const normalizedAmount = Math.abs(Number(entry.detail_amount || 0)) * fxRate;
         const normalizedSignedAmount = Number(entry.detail_amount || 0) * fxRate;
+        const isBonus = String(entry.detail_type || '').toUpperCase() === 'BONUS' || /bonus|rebate|credit/.test(rawDescription.toLowerCase());
+        group._officialLedgerDelta += isBonus ? normalizedSignedAmount : -normalizedSignedAmount;
         group._officialFees[classified.key] += normalizedAmount;
         group._officialSignedFees[classified.key] += normalizedSignedAmount;
         group.billingBreakdown.push({ id: entryId, category, description, subType, amount: normalizedAmount, signedAmount: normalizedSignedAmount, originalAmount: Number(entry.detail_amount || 0), originalCurrency: entryCurrency, type: entry.detail_type || '' });
@@ -2573,8 +2589,26 @@ async function aggregatePackedOrders(rows) {
     group.grossAmountUsd = group._hasGrossAmountUsd ? Number(group.grossAmountUsd.toFixed(2)) : null;
     group.netAmountUsd = group._hasNetAmountUsd ? Number(group.netAmountUsd.toFixed(2)) : null;
     group.refundAmountUsd = group._hasRefundAmountUsd ? Number(group.refundAmountUsd.toFixed(2)) : null;
+    if (group.netAmountUsd === null && group._hasOfficialLedger && !group.billingCurrencyMismatch) {
+      const payoutLocal = Number((Number(group.paidAmount || 0) - Number(group.refundAmount || 0) + group._officialLedgerDelta).toFixed(2));
+      const payoutFxRate = await getBillingFxRate(group.currency, 'USD');
+      if (payoutFxRate === null) group.billingCurrencyMismatch = true;
+      else {
+        group.netAmount = payoutLocal;
+        group.netAmountUsd = Number((payoutLocal * payoutFxRate).toFixed(2));
+        group.payoutSource = 'official_billing_ledger';
+        group.payoutCalculation = {
+          paidAmount: Number(group.paidAmount || 0),
+          refundAmount: Number(group.refundAmount || 0),
+          officialLedgerDelta: Number(group._officialLedgerDelta.toFixed(2)),
+          currency: group.currency,
+          usdRate: payoutFxRate
+        };
+      }
+    }
     group.payoutIsOfficial = group.netAmountUsd !== null;
-    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialFees; delete group._officialSignedFees;
+    if (!group.payoutSource && group.payoutIsOfficial) group.payoutSource = 'official_net_amount';
+    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialLedgerDelta; delete group._hasOfficialLedger; delete group._officialFees; delete group._officialSignedFees;
   }
   return [...groups.values()];
 }
@@ -2613,9 +2647,11 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.3',
+    version: '2026-07-24.4',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
+    officialPayoutFromLedger: true,
+    shippingActionsHorizontal: true,
     userIsolation: true,
     officialPayoutOnly: true,
     multiStoreSync: true,
@@ -2806,7 +2842,10 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
       // 应回款只接受官方明确返回的净额；不能用销售额减费用伪造，也不能因取消直接强制归零。
       const paymentOfficialNet = netParts.length ? netParts.reduce((sum, value) => sum + Number(value || 0), 0) : null;
       const hasReversal = order.status === 'cancelled' || Number(refundAmount || 0) > 0;
-      const finalNetAmount = officialFinance?.netAmount ?? (hasReversal ? null : paymentOfficialNet) ?? null;
+      const officialLedgerNet = officialFinance?.hasOfficialLedger
+        ? Number((grossAmount - Number(refundAmount || 0) + Number(officialFinance.ledgerDelta || 0)).toFixed(2))
+        : null;
+      const finalNetAmount = officialFinance?.netAmount ?? officialLedgerNet ?? (hasReversal ? null : paymentOfficialNet) ?? null;
       const orderCurrency = String(order.currency_id || '').toUpperCase();
       const usdRate = await getBillingFxRate(orderCurrency, 'USD');
       const grossAmountUsd = usdRate === null ? null : Number((grossAmount * usdRate).toFixed(2));
