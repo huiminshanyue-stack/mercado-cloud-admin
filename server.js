@@ -2691,7 +2691,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.5',
+    version: '2026-07-24.6',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -4409,10 +4409,28 @@ app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
     }
     claims = enrichedClaims;
     const orderIds = [...new Set(claims.map(claimOrderReference).filter(Boolean))];
-    const orderResult = orderIds.length ? await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$2 AND store_user_id=$3 AND (ml_order_id=ANY($1::varchar[]) OR pack_id=ANY($1::varchar[]))`, [orderIds,req.authUser.username,sellerId]) : { rows: [] };
+    const orderResult = orderIds.length ? await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId",raw_data AS "rawData" FROM ml_orders WHERE owner_username=$2 AND store_user_id=$3 AND (ml_order_id=ANY($1::varchar[]) OR pack_id=ANY($1::varchar[]))`, [orderIds,req.authUser.username,sellerId]) : { rows: [] };
     const ordersById = new Map();
     for (const order of orderResult.rows) { ordersById.set(String(order.orderId), order); ordersById.set(String(order.packId), order); }
     const items = claims.map(claim => ({ ...claim, storeId: sellerId, order: ordersById.get(claimOrderReference(claim)) || null }));
+    for (const order of orderResult.rows) {
+      const linkedClaims = items.filter(item => item.order === order).map(item => {
+        const { order: _linkedOrder, ...claim } = item;
+        return claim;
+      });
+      if (linkedClaims.length) {
+        const existingRaw = order.rawData && typeof order.rawData === 'object' ? order.rawData : {};
+        const existingReputation = existingRaw._official_reputation && typeof existingRaw._official_reputation === 'object'
+          ? existingRaw._official_reputation : {};
+        const claimMap = new Map((Array.isArray(existingReputation.claims) ? existingReputation.claims : [])
+          .map(claim => [String(claim.id || `${claimOrderReference(claim)}:${claim.last_updated || ''}`),claim]));
+        for (const claim of linkedClaims) claimMap.set(String(claim.id || `${claimOrderReference(claim)}:${claim.last_updated || ''}`),claim);
+        const nextRaw = { ...existingRaw, _official_reputation: { ...existingReputation, claims: [...claimMap.values()] } };
+        await pool.query('UPDATE ml_orders SET raw_data=$1::jsonb,updated_at=NOW() WHERE ml_order_id=$2 AND owner_username=$3',
+          [JSON.stringify(nextRaw),order.orderId,req.authUser.username]);
+      }
+      delete order.rawData;
+    }
     for (const item of items) if (item.order) {
       await saveOrderApiAudit(req.authUser.username,sellerId,item.order.orderId,'claim',String(item.id),item);
       await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
