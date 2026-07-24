@@ -2918,6 +2918,39 @@ async function loadMarketingSites(auth, token, force = false) {
   return writeTimedCache(marketingCache, cacheKey, sites, 50);
 }
 
+async function loadPromotionSites(auth, token, force = false) {
+  const cacheKey = `promotion-sites:${auth.ml_user_id}`;
+  if (!force) {
+    const cached = readTimedCache(marketingCache, cacheKey, 5 * 60 * 1000);
+    if (cached) return cached;
+  }
+  const discovered = new Map();
+  if (auth.site_id && auth.site_id !== 'CBT') discovered.set(auth.site_id, { siteId: auth.site_id, userId: String(auth.ml_user_id), source: 'authorization' });
+  const searchPaths = [`users/${encodeURIComponent(auth.ml_user_id)}/items/search`, `marketplace/users/${encodeURIComponent(auth.ml_user_id)}/items/search`];
+  for (const path of searchPaths) {
+    try {
+      const response = await axios.get(`https://api.mercadolibre.com/${path}`, { params: { status: 'active', limit: 50, offset: 0 }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+      const ids = (response.data?.results || []).map(String).filter(Boolean);
+      await mapWithConcurrency(ids.slice(0, 30), 4, async itemId => {
+        try {
+          const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 12000 });
+          const detail = detailResponse.data || {};
+          const siteId = String(detail.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '').toUpperCase();
+          const userId = String(detail.seller_id || detail.seller?.id || '');
+          if (['MLM', 'MLB', 'MLC', 'MCO', 'MLA'].includes(siteId) && userId) discovered.set(siteId, { siteId, userId, source: 'store-items' });
+        } catch {}
+      });
+      if (discovered.size) break;
+    } catch {}
+  }
+  try {
+    for (const site of await loadMarketingSites(auth, token, force)) if (!discovered.has(site.siteId)) discovered.set(site.siteId, { siteId: site.siteId, userId: site.userId, source: 'advertising-fallback' });
+  } catch (error) {
+    console.warn('[Marketing] 广告账户不可用，不影响促销活动发现:', marketingApiError(error, '广告账户不可用'));
+  }
+  return writeTimedCache(marketingCache, cacheKey, [...discovered.values()], 50);
+}
+
 async function loadSitePromotions(token, site, force = false) {
   const cacheKey = `promotions:${site.userId}`;
   if (!force) {
@@ -2946,8 +2979,8 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
   try {
     const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
     const force = String(req.query.force || '') === '1';
-    const sites = await loadMarketingSites(auth, token, force);
-    const siteResults = await mapWithConcurrency(sites, 3, async site => {
+    const promotionSites = await loadPromotionSites(auth, token, force);
+    const siteResults = await mapWithConcurrency(promotionSites, 3, async site => {
       try {
         const promotions = await addChinesePromotionNames(await loadSitePromotions(token, site, force));
         return { ...site, supported: true, promotions };
@@ -2960,7 +2993,9 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
       siteId: site.siteId,
       userId: site.userId
     })));
-    const advertisers = siteResults.map(site => ({
+    let advertisingSites = [];
+    try { advertisingSites = await loadMarketingSites(auth, token, force); } catch {}
+    const advertisers = advertisingSites.map(site => ({
       advertiserId: site.advertiserId,
       siteId: site.siteId,
       advertiserName: site.advertiserName,
@@ -2982,9 +3017,9 @@ app.get('/api/marketing/capabilities', requireAuth, async (req, res) => {
         }))
       },
       productAds: {
-        supported: true,
-        status: 200,
-        message: `已读取 ${advertisers.length} 个广告账户`,
+        supported: advertisers.length > 0,
+        status: advertisers.length ? 200 : 404,
+        message: advertisers.length ? `已读取 ${advertisers.length} 个广告账户` : '尚未开通任何国家的商品广告账户，不影响批量报名活动',
         advertisers
       }
     } });
@@ -3117,7 +3152,7 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
     const keyword = String(req.query.keyword || '').trim().toLowerCase();
     const force = String(req.query.force || '') === '1';
     const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
-    const sites = await loadMarketingSites(auth, token, force);
+    const sites = await loadPromotionSites(auth, token, force);
     const site = sites.find(item => item.siteId === siteId);
     if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账户' });
     const cacheKey = `marketing-products:${auth.ml_user_id}:${siteId}:${page}:${size}`;
@@ -3478,7 +3513,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
     const size = Math.min(30, Math.max(1, Number(req.query.size) || 20));
     if (!promotionId || !promotionType || !siteId) return res.status(400).json({ code: 400, message: '请选择国家店铺和活动' });
     const { auth, token } = await resolveMarketingAuthorization(req.authUser, req.query.storeId);
-    const sites = await loadMarketingSites(auth, token);
+    const sites = await loadPromotionSites(auth, token);
     const site = sites.find(item => item.siteId === siteId);
     if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账号' });
     const promotions = await loadSitePromotions(token, site);
@@ -3591,7 +3626,7 @@ async function validatePromotionRequest(authUser, body) {
   const promotionType = String(body.promotionType || '').trim().toUpperCase();
   const siteId = String(body.siteId || '').trim().toUpperCase();
   const { auth, token } = await resolveMarketingAuthorization(authUser, body.storeId);
-  const sites = await loadMarketingSites(auth, token);
+  const sites = await loadPromotionSites(auth, token);
   const site = sites.find(item => item.siteId === siteId);
   if (!site) throw Object.assign(new Error('该国家店铺不属于当前授权账号'), { statusCode: 403 });
   const promotions = await loadSitePromotions(token, site);
