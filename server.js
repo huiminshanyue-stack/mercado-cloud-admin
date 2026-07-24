@@ -2747,6 +2747,15 @@ const promotionItemsPageCache = new Map();
 const MARKETING_CACHE_TTL = 60 * 1000;
 const MARKETING_ITEM_CACHE_TTL = 10 * 60 * 1000;
 const MARKETING_PRODUCTS_CACHE_TTL = 3 * 60 * 1000;
+
+function marketingItemThumbnail(detail) {
+  const value = detail?.secure_thumbnail || detail?.thumbnail || detail?.pictures?.[0]?.secure_url || detail?.pictures?.[0]?.url || '';
+  return String(value).replace(/^http:\/\//i, 'https://');
+}
+
+function hasMarketingItemPresentation(detail) {
+  return Boolean(detail?.title && marketingItemThumbnail(detail));
+}
 const PROMOTION_NAME_ZH_OVERRIDES = new Map([
   ['AON Home Industries', '家居行业全场优惠'],
   ['Best Shared Offers Jul!', '7月精选共享优惠'],
@@ -3224,7 +3233,7 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
       const products = await mapWithConcurrency(itemIds, 4, async itemId => {
         const detailKey = `item:${itemId}`;
         let detail = readTimedCache(marketingItemCache, detailKey, MARKETING_ITEM_CACHE_TTL);
-        if (!detail) {
+        if (!hasMarketingItemPresentation(detail)) {
           try {
             const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
             detail = writeTimedCache(marketingItemCache, detailKey, detailResponse.data || {}, 500);
@@ -3241,7 +3250,7 @@ app.get('/api/marketing/products', requireAuth, async (req, res) => {
           itemId,
           cbtItemId: detail.cbt_item_id || '',
           title: detail.title || itemId,
-          thumbnail: detail.secure_thumbnail || detail.thumbnail || '',
+          thumbnail: marketingItemThumbnail(detail),
           permalink: detail.permalink || '',
           price: Number(detail.price || 0),
           currency: detail.currency_id || 'USD',
@@ -3604,7 +3613,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
       seenItemIds.add(itemId);
       return true;
     });
-    const missingDetailIds = rawItems.map(item => String(item.id || '')).filter(itemId => itemId && !readTimedCache(marketingItemCache, `item:${itemId}`, MARKETING_ITEM_CACHE_TTL));
+    const missingDetailIds = rawItems.map(item => String(item.id || '')).filter(itemId => itemId && !hasMarketingItemPresentation(readTimedCache(marketingItemCache, `item:${itemId}`, MARKETING_ITEM_CACHE_TTL)));
     if (missingDetailIds.length) {
       try {
         const detailResponse = await axios.get('https://api.mercadolibre.com/items', {
@@ -3613,7 +3622,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
         for (const entry of Array.isArray(detailResponse.data) ? detailResponse.data : []) {
           const detail = entry?.body || entry;
           const itemId = String(detail?.id || '');
-          if (itemId) writeTimedCache(marketingItemCache, `item:${itemId}`, detail, 500);
+          if (itemId && hasMarketingItemPresentation(detail)) writeTimedCache(marketingItemCache, `item:${itemId}`, detail, 500);
         }
       } catch (error) {
         console.warn('[Marketing] 商品详情批量预取失败，改用逐件读取:', error.message);
@@ -3623,7 +3632,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
       const offer = Array.isArray(item.offers) ? (item.offers.find(entry => entry?.status === 'candidate') || item.offers[0] || {}) : {};
       const cacheKey = `item:${item.id}`;
       let detail = readTimedCache(marketingItemCache, cacheKey, MARKETING_ITEM_CACHE_TTL);
-      if (!detail) {
+      if (!hasMarketingItemPresentation(detail)) {
         try {
           const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(item.id)}`, {
             headers: { Authorization: `Bearer ${token}` },
@@ -3638,7 +3647,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
         itemId: item.id,
         cbtItemId: detail.cbt_item_id || '',
         title: detail.title || item.id,
-        thumbnail: detail.secure_thumbnail || detail.thumbnail || '',
+        thumbnail: marketingItemThumbnail(detail),
         siteId,
         userId: site.userId,
         status: item.status || status,
