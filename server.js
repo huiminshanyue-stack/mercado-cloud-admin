@@ -272,6 +272,9 @@ async function initOrderManagementTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_owner_date ON ml_orders(owner_username,date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_buyer ON ml_orders(buyer_nickname, date_created DESC)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipment_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_original JSONB NOT NULL DEFAULT \'{}\'::jsonb');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_latest JSONB NOT NULL DEFAULT \'{}\'::jsonb');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_updated_at TIMESTAMPTZ');
   await pool.query(`CREATE TABLE IF NOT EXISTS ml_store_authorizations (
     id BIGSERIAL PRIMARY KEY,
     owner_username VARCHAR(120) NOT NULL,
@@ -2451,7 +2454,7 @@ async function getMLSellerId(accessToken) {
 
 function parseOrderBilling(detail, grossAmount) {
   if (!detail || typeof detail !== 'object') return null;
-  const seen = new Set(), entries = [];
+  const seen = new Set(), receiverShippingSeen = new Set(), entries = [];
   const walk = (value, inheritedCurrency = '') => {
     if (Array.isArray(value)) return value.forEach(item => walk(item, inheritedCurrency));
     if (!value || typeof value !== 'object') return;
@@ -2460,24 +2463,43 @@ function parseOrderBilling(detail, grossAmount) {
       const key = String(value.detail_id || `${value.detail_sub_type || ''}:${value.detail_description || ''}:${value.detail_amount}`);
       if (!seen.has(key)) { seen.add(key); entries.push({ ...value, _currencyId: currency }); }
     }
+    const receiverShippingCost = Number(value.shipping_info?.receiver_shipping_cost);
+    if (Number.isFinite(receiverShippingCost) && receiverShippingCost !== 0) {
+      const shippingId = String(value.shipping_info?.shipping_id || value.shipping_id || value.pack_id || value.order_id || '');
+      const key = `${shippingId}:${currency}:${receiverShippingCost}`;
+      if (!receiverShippingSeen.has(key)) {
+        receiverShippingSeen.add(key);
+        entries.push({
+          detail_id: `receiver_shipping_cost:${key}`,
+          detail_amount: Math.abs(receiverShippingCost),
+          detail_type: 'CREDIT',
+          detail_sub_type: 'RECEIVER_SHIPPING_COST',
+          concept_type: 'SHIPPING',
+          transaction_detail: 'Shipping cost charged to buyer based on item weight',
+          _currencyId: currency,
+          _ledgerDirection: 'credit'
+        });
+      }
+    }
     Object.values(value).forEach(child => walk(child, currency));
   };
   walk(detail);
   let saleFee = 0, shippingFee = 0, otherFee = 0, totalCharges = 0, totalBonuses = 0, ledgerDelta = 0;
   for (const entry of entries) {
-    const signedAmount = Number(entry.detail_amount || 0);
-    const amount = Math.abs(signedAmount);
+    const rawAmount = Number(entry.detail_amount || 0);
+    const amount = Math.abs(rawAmount);
     const type = String(entry.detail_type || '').toUpperCase();
     const subType = String(entry.detail_sub_type || '').toUpperCase();
     const conceptType = String(entry.concept_type || '').toUpperCase();
     const text = `${entry.transaction_detail || ''} ${entry.detail_description || ''} ${subType} ${conceptType}`.toLowerCase();
-    if (type === 'BONUS' || /bonus|rebate|credit/.test(text)) {
+    const isCredit = entry._ledgerDirection === 'credit' || type === 'BONUS' || type === 'CREDIT' || /bonus|rebate|credit/.test(text);
+    if (isCredit) {
       totalBonuses += amount;
-      ledgerDelta += signedAmount;
+      ledgerDelta += amount;
     }
     else {
       totalCharges += amount;
-      ledgerDelta -= signedAmount;
+      ledgerDelta -= amount;
       if (subType === 'CXD' || conceptType === 'SHIPPING' || /shipping|shipment|freight|logistic|env[ií]o|mercado env[ií]os/.test(text)) shippingFee += amount;
       else if (subType === 'CV' || /sale.?fee|commission|selling.?fee|cargo por venta|cargo por vender|tarifa de venta/.test(text)) saleFee += amount;
       else otherFee += amount;
@@ -2487,11 +2509,11 @@ function parseOrderBilling(detail, grossAmount) {
   const explicitShipping = Number(detail.shipping_info?.sender_shipping_cost ?? detail.shipping_cost ?? 0);
   if (!saleFee && explicitSaleFee) {
     saleFee = Math.abs(explicitSaleFee);
-    if (!entries.length) ledgerDelta -= explicitSaleFee;
+    if (!entries.length) ledgerDelta -= Math.abs(explicitSaleFee);
   }
   if (!shippingFee && explicitShipping) {
     shippingFee = Math.abs(explicitShipping);
-    if (!entries.length) ledgerDelta -= explicitShipping;
+    if (!entries.length) ledgerDelta -= Math.abs(explicitShipping);
   }
   const netCandidates = [
     detail.net_received_amount, detail.net_amount, detail.total_net_amount,
@@ -2502,6 +2524,14 @@ function parseOrderBilling(detail, grossAmount) {
   const hasOfficialLedger = entries.length > 0 || explicitSaleFee !== 0 || explicitShipping !== 0 || officialNetValue !== undefined;
   return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, ledgerDelta, hasOfficialLedger,
     netAmount: officialNetValue === undefined ? null : Number(officialNetValue), entries };
+}
+
+function billingEntryLedgerDirection(entry) {
+  const type = String(entry?.detail_type || '').toUpperCase();
+  const text = `${entry?.transaction_detail || ''} ${entry?.detail_description || ''}`.toLowerCase();
+  return entry?._ledgerDirection === 'credit' || type === 'BONUS' || type === 'CREDIT' || /bonus|rebate|credit/.test(text)
+    ? 'credit'
+    : 'charge';
 }
 
 const billingFxCache = new Map();
@@ -2522,6 +2552,7 @@ function translateBillingDescription(value, category, subType) {
   const text = String(value || '').trim();
   const key = text.toLowerCase();
   const rules = [
+    [/shipping cost charged to buyer based on item weight|receiver_shipping_cost/, '买家承担的商品重量物流费'],
     [/shipping costs?.*gross weight.*dimensions|costos? de env[ií]o.*peso|cargo por mercado env[ií]os/, '按商品毛重和尺寸计算的物流运输费'],
     [/anulaci[oó]n.*transferencia de dinero.*cuenta internacional|cancellation.*money transfer/, '撤销国际账户转账手续费'],
     [/anulaci[oó]n.*cargo por gesti[oó]n de venta|cancellation of cost for selling|cancellation.*selling fee/, '撤销美客多平台销售佣金'],
@@ -2542,6 +2573,7 @@ function classifyBillingEntry(entry) {
   const conceptType = String(entry.concept_type || '').toUpperCase();
   const raw = String(entry.transaction_detail || entry.detail_description || '');
   const text = `${raw} ${subType} ${conceptType}`.toLowerCase();
+  if (subType === 'RECEIVER_SHIPPING_COST') return { key: 'shippingFee', category: '物流运输' };
   if (String(entry.detail_type || '').toUpperCase() === 'BONUS') return { key: 'bonusAmount', category: '优惠/返还' };
   if (subType === 'CV' || subType.startsWith('CVML') || /selling fee|sale fee|cost for selling|cargo por (venta|vender|gesti[oó]n de venta)/.test(text)) return { key: 'saleFee', category: '销售佣金' };
   if (subType === 'CVMPCB' || /receiving payments|recibir pagos|mercado pago.*(fee|tarifa)/.test(text)) return { key: 'paymentFee', category: '收款手续费' };
@@ -2556,11 +2588,16 @@ async function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
-    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, grossAmountUsd: 0, netAmountUsd: 0, refundAmountUsd: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _hasGrossAmountUsd: false, _hasNetAmountUsd: false, _hasRefundAmountUsd: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialLedgerDelta: 0, _hasOfficialLedger: false, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, grossAmountUsd: 0, netAmountUsd: 0, refundAmountUsd: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _hasGrossAmountUsd: false, _hasNetAmountUsd: false, _hasRefundAmountUsd: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialLedgerDelta: 0, _hasOfficialLedger: false, _shippingBuyerPaid: 0, _shippingSellerCharge: 0, _shippingAdjustmentEvidence: false, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
     const group = groups.get(groupId);
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
     group.items.push(...(Array.isArray(row.items) ? row.items : []));
+    if (row.dimensionsOriginal?.available && !group.dimensionsOriginal?.available) group.dimensionsOriginal = row.dimensionsOriginal;
+    if (row.dimensionsLatest?.available) {
+      group.dimensionsLatest = row.dimensionsLatest;
+      group.dimensionsUpdatedAt = row.dimensionsUpdatedAt || row.dimensionsLatest.fetchedAt || null;
+    }
     if (row.reputationImpact === true) {
       group.reputationImpact = true;
       group.reputationFeedback ||= row.reputationFeedback || '';
@@ -2596,12 +2633,18 @@ async function aggregatePackedOrders(rows) {
         group._billingEntryIds.add(entryId); group._officialEntryCount++;
         if (fxRate === null) { group.billingCurrencyMismatch = true; continue; }
         const normalizedAmount = Math.abs(Number(entry.detail_amount || 0)) * fxRate;
-        const normalizedSignedAmount = Number(entry.detail_amount || 0) * fxRate;
-        const isBonus = String(entry.detail_type || '').toUpperCase() === 'BONUS' || /bonus|rebate|credit/.test(rawDescription.toLowerCase());
-        group._officialLedgerDelta += isBonus ? normalizedSignedAmount : -normalizedSignedAmount;
+        const direction = billingEntryLedgerDirection(entry);
+        const normalizedOriginalSignedAmount = Number(entry.detail_amount || 0) * fxRate;
+        const normalizedLedgerAmount = (direction === 'credit' ? normalizedAmount : -normalizedAmount);
+        group._officialLedgerDelta += normalizedLedgerAmount;
         group._officialFees[classified.key] += normalizedAmount;
-        group._officialSignedFees[classified.key] += normalizedSignedAmount;
-        group.billingBreakdown.push({ id: entryId, category, description, subType, amount: normalizedAmount, signedAmount: normalizedSignedAmount, originalAmount: Number(entry.detail_amount || 0), originalCurrency: entryCurrency, type: entry.detail_type || '' });
+        group._officialSignedFees[classified.key] += normalizedOriginalSignedAmount;
+        if (classified.key === 'shippingFee') {
+          if (direction === 'credit') group._shippingBuyerPaid += normalizedAmount;
+          else group._shippingSellerCharge += normalizedAmount;
+          if (/reweigh|remeasur|dimension.*(adjust|correct)|weight.*(adjust|correct)|peso.*(ajust|correg)|dimensi[oó]n.*(ajust|correg)/i.test(rawDescription)) group._shippingAdjustmentEvidence = true;
+        }
+        group.billingBreakdown.push({ id: entryId, category, description, subType, amount: normalizedAmount, signedAmount: normalizedOriginalSignedAmount, ledgerAmount: normalizedLedgerAmount, originalAmount: Number(entry.detail_amount || 0), originalCurrency: entryCurrency, type: entry.detail_type || '', direction });
       }
     }
   }
@@ -2612,6 +2655,11 @@ async function aggregatePackedOrders(rows) {
         group[`${field}Signed`] = Number(group._officialSignedFees[field].toFixed(2));
       }
       group.otherFeeSigned = group.cancellationFeeSigned;
+      group.salesCommissionTotalSigned = Number((Number(group.saleFeeSigned || 0) + Number(group.paymentFeeSigned || 0) + Number(group.transferFeeSigned || 0)).toFixed(2));
+      group.shippingBuyerPaidSigned = Number(group._shippingBuyerPaid.toFixed(2));
+      group.shippingSellerChargeSigned = Number((-group._shippingSellerCharge).toFixed(2));
+      group.shippingFeeSigned = Number((group._shippingBuyerPaid - group._shippingSellerCharge).toFixed(2));
+      group.shippingAdjustmentEvidence = group._shippingAdjustmentEvidence;
     }
     for (const field of ['saleFee','shippingFee','paymentFee','transferFee','cancellationFee','taxFee','adjustmentFee','bonusAmount']) group[field] = Number(group[field].toFixed(2));
     if (group._officialEntryCount) group.otherFee = group.cancellationFee;
@@ -2619,7 +2667,7 @@ async function aggregatePackedOrders(rows) {
     group.grossAmountUsd = group._hasGrossAmountUsd ? Number(group.grossAmountUsd.toFixed(2)) : null;
     group.netAmountUsd = group._hasNetAmountUsd ? Number(group.netAmountUsd.toFixed(2)) : null;
     group.refundAmountUsd = group._hasRefundAmountUsd ? Number(group.refundAmountUsd.toFixed(2)) : null;
-    if (group.netAmountUsd === null && group._hasOfficialLedger && !group.billingCurrencyMismatch) {
+    if (group._hasOfficialLedger && !group.billingCurrencyMismatch) {
       const payoutLocal = Number((Number(group.paidAmount || 0) - Number(group.refundAmount || 0) + group._officialLedgerDelta).toFixed(2));
       const payoutFxRate = await getBillingFxRate(group.currency, 'USD');
       if (payoutFxRate === null) group.billingCurrencyMismatch = true;
@@ -2638,7 +2686,8 @@ async function aggregatePackedOrders(rows) {
     }
     group.payoutIsOfficial = group.netAmountUsd !== null;
     if (!group.payoutSource && group.payoutIsOfficial) group.payoutSource = 'official_net_amount';
-    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialLedgerDelta; delete group._hasOfficialLedger; delete group._officialFees; delete group._officialSignedFees;
+    group.dimensionsChanged = dimensionSnapshotsDiffer(group.dimensionsOriginal,group.dimensionsLatest);
+    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialLedgerDelta; delete group._hasOfficialLedger; delete group._shippingBuyerPaid; delete group._shippingSellerCharge; delete group._shippingAdjustmentEvidence; delete group._officialFees; delete group._officialSignedFees;
   }
   return [...groups.values()];
 }
@@ -2715,7 +2764,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.11',
+    version: '2026-07-24.12',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2731,6 +2780,9 @@ app.get('/api/health/order-management', (req, res) => {
     cntoroMarketingTestAccess: true,
     userIsolation: true,
     officialPayoutOnly: true,
+    receiverShippingCreditIncluded: true,
+    shippingLedgerExplanation: true,
+    orderDimensionSnapshots: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -2743,6 +2795,157 @@ async function saveOrderApiAudit(ownerUsername, storeUserId, orderId, apiType, e
     VALUES($1,$2,$3,$4,$5,$6::jsonb,NOW()) ON CONFLICT(owner_username,api_type,external_id)
     DO UPDATE SET store_user_id=EXCLUDED.store_user_id,order_id=EXCLUDED.order_id,raw_data=EXCLUDED.raw_data,fetched_at=NOW()`,
     [ownerUsername,String(storeUserId || ''),String(orderId || ''),String(apiType),String(externalId),JSON.stringify(rawData || {})]);
+}
+
+function dimensionNumber(value) {
+  const candidate = value && typeof value === 'object' ? (value.value ?? value.number ?? value.amount) : value;
+  const parsed = Number(String(candidate ?? '').replace(',', '.').match(/-?\d+(?:\.\d+)?/)?.[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseDimensionString(value) {
+  const [sizePart = '', weightPart = ''] = String(value || '').split(',');
+  const size = sizePart.split(/[xX×]/).map(dimensionNumber);
+  const result = {
+    length: size[0] ?? null,
+    width: size[1] ?? null,
+    height: size[2] ?? null,
+    weight: dimensionNumber(weightPart),
+    dimensionUnit: 'cm',
+    weightUnit: 'g'
+  };
+  return Object.values(result).some(item => typeof item === 'number') ? result : null;
+}
+
+function shipmentDimensions(shipment) {
+  const value = shipment?.dimensions;
+  if (typeof value === 'string') return parseDimensionString(value);
+  if (!value || typeof value !== 'object') return null;
+  const result = {
+    length: dimensionNumber(value.length),
+    width: dimensionNumber(value.width),
+    height: dimensionNumber(value.height),
+    weight: dimensionNumber(value.weight),
+    dimensionUnit: String(value.dimension_unit || value.unit || 'cm'),
+    weightUnit: String(value.weight_unit || 'g')
+  };
+  return Object.values(result).some(item => typeof item === 'number') ? result : null;
+}
+
+function findBillableWeight(value) {
+  if (Array.isArray(value)) {
+    for (const child of value) { const found = findBillableWeight(child); if (found) return found; }
+    return null;
+  }
+  if (!value || typeof value !== 'object') return null;
+  if (value.billable_weight) return value.billable_weight;
+  for (const child of Object.values(value)) { const found = findBillableWeight(child); if (found) return found; }
+  return null;
+}
+
+function itemDimensions(item) {
+  const billableWeight = findBillableWeight(item?._shipping_cost_info);
+  const officialWeight = dimensionNumber(billableWeight);
+  const direct = typeof item?.shipping?.dimensions === 'string'
+    ? parseDimensionString(item.shipping.dimensions)
+    : (typeof item?.dimensions === 'string' ? parseDimensionString(item.dimensions) : null);
+  if (direct) return officialWeight === null ? direct : { ...direct, weight: officialWeight, weightUnit: billableWeight?.unit || direct.weightUnit || 'g' };
+  const attributes = new Map((Array.isArray(item?.attributes) ? item.attributes : []).map(attribute => [String(attribute.id || '').toUpperCase(), attribute]));
+  const attributeValue = (...ids) => {
+    for (const id of ids) {
+      const attribute = attributes.get(id);
+      const parsed = dimensionNumber(attribute?.value_struct ?? attribute?.value_name ?? attribute?.value);
+      if (parsed !== null) return { value: parsed, unit: attribute?.value_struct?.unit || '' };
+    }
+    return { value: null, unit: '' };
+  };
+  const length = attributeValue('PACKAGE_LENGTH','LENGTH');
+  const width = attributeValue('PACKAGE_WIDTH','WIDTH');
+  const height = attributeValue('PACKAGE_HEIGHT','HEIGHT');
+  const weight = attributeValue('PACKAGE_WEIGHT','WEIGHT');
+  if ([length,width,height,weight].every(entry => entry.value === null) && officialWeight === null) return null;
+  return {
+    length: length.value,
+    width: width.value,
+    height: height.value,
+    weight: officialWeight ?? weight.value,
+    dimensionUnit: length.unit || width.unit || height.unit || 'cm',
+    weightUnit: billableWeight?.unit || weight.unit || 'g'
+  };
+}
+
+function buildOrderDimensionSnapshot(shipments, items) {
+  const shipmentList = (Array.isArray(shipments) ? shipments : [shipments]).filter(Boolean);
+  const itemList = (Array.isArray(items) ? items : []).filter(Boolean);
+  const packageRecords = shipmentList.map(shipment => ({
+    shippingId: String(shipment?.id || ''),
+    dimensions: shipmentDimensions(shipment),
+    source: 'shipment.dimensions'
+  })).filter(record => record.dimensions);
+  const shipmentItemDimensions = new Map();
+  for (const shipment of shipmentList) {
+    for (const shippingItem of (Array.isArray(shipment?.shipping_items) ? shipment.shipping_items : [])) {
+      const itemId = String(shippingItem?.id || shippingItem?.item_id || shippingItem?.item?.id || '');
+      const dimensions = typeof shippingItem?.dimensions === 'string'
+        ? parseDimensionString(shippingItem.dimensions)
+        : shipmentDimensions({ dimensions: shippingItem?.dimensions });
+      if (itemId && dimensions) shipmentItemDimensions.set(itemId, dimensions);
+    }
+  }
+  const itemRecords = itemList.map(item => {
+    const itemId = String(item?.id || '');
+    const fromShipment = shipmentItemDimensions.get(itemId);
+    const fromItem = itemDimensions(item);
+    const dimensions = fromItem || fromShipment;
+    return dimensions ? {
+      itemId,
+      title: String(item?.title || ''),
+      dimensions,
+      orderDimensions: fromShipment || null,
+      listingDimensions: fromItem || null,
+      source: fromItem ? 'item.attributes' : 'shipment.shipping_items.dimensions'
+    } : null;
+  }).filter(Boolean);
+  return {
+    source: 'mercado_libre_official',
+    fetchedAt: new Date().toISOString(),
+    package: packageRecords[0] || null,
+    packages: packageRecords,
+    items: itemRecords,
+    orderRecorded: itemRecords.find(item => item.orderDimensions)?.orderDimensions || null,
+    available: Boolean(packageRecords.length || itemRecords.length)
+  };
+}
+
+function dimensionSnapshotComparable(snapshot) {
+  return {
+    package: snapshot?.package?.dimensions || null,
+    items: (snapshot?.items || []).map(item => ({ itemId: item.itemId, dimensions: item.dimensions })).sort((a,b) => String(a.itemId).localeCompare(String(b.itemId)))
+  };
+}
+
+function dimensionSnapshotsDiffer(original, latest) {
+  if (!original?.available || !latest?.available) return false;
+  return JSON.stringify(dimensionSnapshotComparable(original)) !== JSON.stringify(dimensionSnapshotComparable(latest));
+}
+
+async function fetchOfficialItemDetail(accessToken, itemId, marketplaceFirst = true) {
+  const paths = marketplaceFirst ? [`marketplace/items/${itemId}`,`items/${itemId}`] : [`items/${itemId}`,`marketplace/items/${itemId}`];
+  let lastError;
+  for (const path of paths) {
+    try {
+      const response = await axios.get(`https://api.mercadolibre.com/${path}`, { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 });
+      const item = response.data || {};
+      try {
+        const shippingCost = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(itemId)}/shipping_options/cost`, {
+          headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
+        });
+        item._shipping_cost_info = shippingCost.data || {};
+      } catch (_) { /* 部分站点不支持计费重量接口，仍保留商品和运单尺寸 */ }
+      return item;
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error('商品尺寸接口未返回数据');
 }
 
 app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
@@ -2808,20 +3011,12 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
     const itemIds = [...new Set(sourceOrders.flatMap(order =>
       (order.order_items || []).map(entry => entry.item?.id).filter(Boolean)
     ))];
-    const itemPictures = new Map();
+    const itemPictures = new Map(), itemDetails = new Map();
     for (let i = 0; i < itemIds.length; i += 10) {
       await Promise.all(itemIds.slice(i, i + 10).map(async id => {
         try {
-          let item = {};
-          for (const path of me.site_id === 'CBT' ? [`marketplace/items/${id}`, `items/${id}`] : [`items/${id}`, `marketplace/items/${id}`]) {
-            try {
-              const itemResponse = await axios.get(`https://api.mercadolibre.com/${path}`, {
-                headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000
-              });
-              item = itemResponse.data || {};
-              if (item.thumbnail || item.secure_thumbnail || item.pictures?.length) break;
-            } catch (_) { /* 尝试下一个兼容接口 */ }
-          }
+          const item = await fetchOfficialItemDetail(accessToken,id,me.site_id === 'CBT');
+          if (Object.keys(item).length) itemDetails.set(String(id), item);
           const picture = item.thumbnail || item.secure_thumbnail || item.pictures?.[0]?.secure_url || item.pictures?.[0]?.url || item.picture_url || '';
           if (picture) itemPictures.set(String(id), picture.replace(/^http:/, 'https:'));
         } catch (error) {
@@ -3000,6 +3195,25 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
           finalSaleFee, finalShippingFee, finalNetAmount, refundAmount, otherFee, JSON.stringify(billingDetail || {}), Boolean(billingDetail),
           req.authUser.username, grossAmountUsd, finalNetAmountUsd, refundAmountUsd]
       );
+      const dimensionSnapshot = buildOrderDimensionSnapshot([shipment], orderItems.map(entry => itemDetails.get(String(entry.item?.id)) || entry.item));
+      if (dimensionSnapshot.available) {
+        await pool.query(`UPDATE ml_orders SET
+          shipping_dimensions_original=CASE WHEN COALESCE(shipping_dimensions_original,'{}'::jsonb)='{}'::jsonb THEN $1::jsonb ELSE shipping_dimensions_original END,
+          shipping_dimensions_latest=$1::jsonb,shipping_dimensions_updated_at=NOW()
+          WHERE ml_order_id=$2 AND owner_username=$3`, [JSON.stringify(dimensionSnapshot),String(order.id),req.authUser.username]);
+        const dimensionAuditItems = orderItems.map(entry => itemDetails.get(String(entry.item?.id))).filter(Boolean).map(item => ({
+          id: item.id,
+          dimensions: item.dimensions,
+          shipping: item.shipping,
+          attributes: (item.attributes || []).filter(attribute => /^(PACKAGE_(LENGTH|WIDTH|HEIGHT|WEIGHT)|LENGTH|WIDTH|HEIGHT|WEIGHT)$/.test(String(attribute.id || '').toUpperCase())),
+          shipping_cost_info: item._shipping_cost_info
+        }));
+        await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'dimensions',`dimensions:${order.id}`,{
+          shipment: { id: shipment.id, dimensions: shipment.dimensions, shipping_items: shipment.shipping_items },
+          items: dimensionAuditItems,
+          snapshot: dimensionSnapshot
+        });
+      }
       if (billingDetail) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'billing',String(order.id),billingDetail);
       if (Object.keys(shipment).length) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'shipment',String(order.shipping?.id || order.id),shipment);
       if (order._official_reputation) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'reputation',String(order.id),order._official_reputation);
@@ -3045,7 +3259,7 @@ app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
     SELECT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) AS display_id,MAX(o.date_created) AS group_date
     FROM ml_orders o ${clause} GROUP BY COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)
     ORDER BY group_date DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}
-  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote"
+  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.shipping_dimensions_original AS "dimensionsOriginal",o.shipping_dimensions_latest AS "dimensionsLatest",o.shipping_dimensions_updated_at AS "dimensionsUpdatedAt"
     FROM page_groups pg JOIN ml_orders o ON COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)=pg.display_id AND o.owner_username=$1
     LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ORDER BY pg.group_date DESC NULLS LAST,o.date_created`, params);
   const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE owner_username=$2 AND ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId),req.authUser.username]) : { rows: [] };
@@ -3063,6 +3277,61 @@ app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
   }
   const packedRows = await aggregatePackedOrders(rows.rows);
   res.json({ code: 0, data: { items: packedRows, total: count.rows[0].total, page, size } });
+});
+
+app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || '').trim();
+    const { rows } = await pool.query(`SELECT ml_order_id,pack_id,shipping_id,store_user_id,site_id,items,
+      shipping_dimensions_original AS "dimensionsOriginal"
+      FROM ml_orders WHERE owner_username=$1 AND (ml_order_id=$2 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$2)
+      ORDER BY date_created`, [req.authUser.username,orderId]);
+    if (!rows.length) return res.status(404).json({ code: 404, message: '订单不存在或无权访问' });
+    const context = await getOrderStoreContext(req.authUser,rows[0].store_user_id);
+    if (!context) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权后获取尺寸' });
+    const shipmentIds = [...new Set(rows.map(row => String(row.shipping_id || '')).filter(Boolean))];
+    const itemIds = [...new Set(rows.flatMap(row => (Array.isArray(row.items) ? row.items : []).map(entry => String(entry?.item?.id || '')).filter(Boolean)))];
+    const shipments = [], items = [], failures = [];
+    for (const shipmentId of shipmentIds) {
+      try {
+        const response = await axios.get(`https://api.mercadolibre.com/marketplace/shipments/${encodeURIComponent(shipmentId)}`, {
+          headers: { Authorization: `Bearer ${context.token}`, 'x-format-new': 'true' }, timeout: 20000
+        });
+        shipments.push(response.data || {});
+      } catch (error) {
+        failures.push({ type: 'shipment', id: shipmentId, status: error.response?.status || 0, message: error.response?.data?.message || error.message });
+      }
+    }
+    for (const itemId of itemIds) {
+      try { items.push(await fetchOfficialItemDetail(context.token,itemId,true)); }
+      catch (error) { failures.push({ type: 'item', id: itemId, status: error.response?.status || 0, message: error.response?.data?.message || error.message }); }
+    }
+    const snapshot = buildOrderDimensionSnapshot(shipments,items);
+    await saveOrderApiAudit(req.authUser.username,context.sellerId,String(rows[0].ml_order_id),'dimensions',`dimensions:${orderId}`,{ shipments,items,failures,snapshot });
+    if (!snapshot.available) {
+      const officialReason = failures.map(item => `${item.type} ${item.id}：${item.message}`).join('；');
+      return res.status(422).json({ code: 422, message: officialReason || '美客多官方接口当前未返回该订单的长宽高和重量' });
+    }
+    const existingOriginal = rows.find(row => row.dimensionsOriginal?.available)?.dimensionsOriginal || null;
+    const original = existingOriginal || snapshot;
+    const changed = dimensionSnapshotsDiffer(original,snapshot);
+    await pool.query(`UPDATE ml_orders SET
+      shipping_dimensions_original=CASE WHEN COALESCE(shipping_dimensions_original,'{}'::jsonb)='{}'::jsonb THEN $1::jsonb ELSE shipping_dimensions_original END,
+      shipping_dimensions_latest=$2::jsonb,shipping_dimensions_updated_at=NOW(),updated_at=NOW()
+      WHERE owner_username=$3 AND (ml_order_id=$4 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$4)`,
+      [JSON.stringify(original),JSON.stringify(snapshot),req.authUser.username,orderId]);
+    res.json({ code: 0, data: {
+      dimensionsOriginal: original,
+      dimensionsLatest: snapshot,
+      dimensionsUpdatedAt: snapshot.fetchedAt,
+      dimensionsChanged: changed,
+      note: changed ? '美客多当前官方尺寸/重量与订单首次同步快照不同，请以平台最新值核对运费。' : '美客多当前官方尺寸/重量与订单首次同步快照一致。',
+      failures
+    } });
+  } catch (error) {
+    console.error('[Orders] 获取官方尺寸重量失败:', error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({ code: error.response?.status || 500, message: error.response?.data?.message || error.message || '获取尺寸重量失败' });
+  }
 });
 
 app.get('/api/admin/order-stores', requireOrderAccess, async (req, res) => {
