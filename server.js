@@ -2454,6 +2454,19 @@ async function getMLSellerId(accessToken) {
 
 function parseOrderBilling(detail, grossAmount) {
   if (!detail || typeof detail !== 'object') return null;
+  let localToUsdRate = null, billingItemId = '';
+  const inspectBillingContext = value => {
+    if (Array.isArray(value)) return value.forEach(inspectBillingContext);
+    if (!value || typeof value !== 'object') return;
+    const transactionAmount = Number(value.transaction_amount);
+    const transactionAmountUsd = Number(value.transaction_amount_usd);
+    if (!localToUsdRate && transactionAmount > 0 && transactionAmountUsd > 0) localToUsdRate = transactionAmountUsd / transactionAmount;
+    if (!billingItemId && value.item_id) billingItemId = String(value.item_id).toUpperCase();
+    Object.values(value).forEach(inspectBillingContext);
+  };
+  inspectBillingContext(detail);
+  const localCurrencyBySite = { MLB:'BRL',MLM:'MXN',MLC:'CLP',MCO:'COP',MLA:'ARS' };
+  const receiverCurrency = localCurrencyBySite[billingItemId.match(/^(MLB|MLM|MLC|MCO|MLA)/)?.[1]] || '';
   const seen = new Set(), receiverShippingSeen = new Set(), entries = [];
   const walk = (value, inheritedCurrency = '') => {
     if (Array.isArray(value)) return value.forEach(item => walk(item, inheritedCurrency));
@@ -2466,7 +2479,7 @@ function parseOrderBilling(detail, grossAmount) {
     const receiverShippingCost = Number(value.shipping_info?.receiver_shipping_cost);
     if (Number.isFinite(receiverShippingCost) && receiverShippingCost !== 0) {
       const shippingId = String(value.shipping_info?.shipping_id || value.shipping_id || value.pack_id || value.order_id || '');
-      const key = `${shippingId}:${currency}:${receiverShippingCost}`;
+      const key = `${shippingId}:${receiverCurrency || 'LOCAL'}:${receiverShippingCost}`;
       if (!receiverShippingSeen.has(key)) {
         receiverShippingSeen.add(key);
         entries.push({
@@ -2476,7 +2489,9 @@ function parseOrderBilling(detail, grossAmount) {
           detail_sub_type: 'RECEIVER_SHIPPING_COST',
           concept_type: 'SHIPPING',
           transaction_detail: 'Shipping cost charged to buyer based on item weight',
-          _currencyId: currency,
+          _currencyId: receiverCurrency,
+          _currencyUnknown: !receiverCurrency,
+          _normalizedUsdAmount: localToUsdRate ? Math.abs(receiverShippingCost) * localToUsdRate : null,
           _ledgerDirection: 'credit'
         });
       }
@@ -2629,12 +2644,21 @@ async function aggregatePackedOrders(rows) {
       const entryId = String(entry.detail_id || `${subType}:${description}:${entry.detail_amount}`);
       if (!group._billingEntryIds.has(entryId)) {
         const entryCurrency = String(entry._currencyId || row.currency || '').toUpperCase();
-        const fxRate = await getBillingFxRate(entryCurrency, row.currency);
         group._billingEntryIds.add(entryId); group._officialEntryCount++;
-        if (fxRate === null) { group.billingCurrencyMismatch = true; continue; }
-        const normalizedAmount = Math.abs(Number(entry.detail_amount || 0)) * fxRate;
+        if (entry._currencyUnknown) { group.billingCurrencyMismatch = true; continue; }
+        let normalizedAmount, normalizedOriginalSignedAmount;
+        if (Number.isFinite(Number(entry._normalizedUsdAmount)) && Number(entry._normalizedUsdAmount) > 0) {
+          const usdTargetRate = await getBillingFxRate('USD',row.currency);
+          if (usdTargetRate === null) { group.billingCurrencyMismatch = true; continue; }
+          normalizedAmount = Math.abs(Number(entry._normalizedUsdAmount)) * usdTargetRate;
+          normalizedOriginalSignedAmount = Math.sign(Number(entry.detail_amount || 0) || 1) * normalizedAmount;
+        } else {
+          const fxRate = await getBillingFxRate(entryCurrency,row.currency);
+          if (fxRate === null) { group.billingCurrencyMismatch = true; continue; }
+          normalizedAmount = Math.abs(Number(entry.detail_amount || 0)) * fxRate;
+          normalizedOriginalSignedAmount = Number(entry.detail_amount || 0) * fxRate;
+        }
         const direction = billingEntryLedgerDirection(entry);
-        const normalizedOriginalSignedAmount = Number(entry.detail_amount || 0) * fxRate;
         const normalizedLedgerAmount = (direction === 'credit' ? normalizedAmount : -normalizedAmount);
         group._officialLedgerDelta += normalizedLedgerAmount;
         group._officialFees[classified.key] += normalizedAmount;
@@ -2764,7 +2788,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.12',
+    version: '2026-07-25.14',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2781,8 +2805,13 @@ app.get('/api/health/order-management', (req, res) => {
     userIsolation: true,
     officialPayoutOnly: true,
     receiverShippingCreditIncluded: true,
+    receiverShippingLocalCurrencyConversion: true,
     shippingLedgerExplanation: true,
+    combinedSalesCommission: true,
     orderDimensionSnapshots: true,
+    dimensionDeclaredVsCurrent: true,
+    statisticsIndependentFilters: true,
+    statisticsNaturalDateRange: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -2926,7 +2955,10 @@ function dimensionSnapshotComparable(snapshot) {
 
 function dimensionSnapshotsDiffer(original, latest) {
   if (!original?.available || !latest?.available) return false;
-  return JSON.stringify(dimensionSnapshotComparable(original)) !== JSON.stringify(dimensionSnapshotComparable(latest));
+  const originalValue = original.orderRecorded || original.items?.[0]?.orderDimensions || original.items?.[0]?.dimensions || original.package?.dimensions || null;
+  const latestValue = latest.items?.[0]?.listingDimensions || latest.items?.[0]?.dimensions || latest.package?.dimensions || null;
+  if (!originalValue || !latestValue) return JSON.stringify(dimensionSnapshotComparable(original)) !== JSON.stringify(dimensionSnapshotComparable(latest));
+  return JSON.stringify(originalValue) !== JSON.stringify(latestValue);
 }
 
 async function fetchOfficialItemDetail(accessToken, itemId, marketplaceFirst = true) {
@@ -3325,7 +3357,9 @@ app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, as
       dimensionsLatest: snapshot,
       dimensionsUpdatedAt: snapshot.fetchedAt,
       dimensionsChanged: changed,
-      note: changed ? '美客多当前官方尺寸/重量与订单首次同步快照不同，请以平台最新值核对运费。' : '美客多当前官方尺寸/重量与订单首次同步快照一致。',
+      note: changed
+        ? '美客多当前计费尺寸/重量与下单时申报记录不同。按平台机制，发货后的称重和尺寸验证可能自动更新商品数据；是否产生额外运费以官方账单实际收费项目为准。'
+        : '美客多当前计费尺寸/重量与下单时申报记录一致。',
       failures
     } });
   } catch (error) {
@@ -4586,7 +4620,10 @@ app.get('/api/admin/order-profits', requireOrderAccess, async (req, res) => {
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country=$${params.length}`); }
   if (req.query.orderId) { params.push(String(req.query.orderId).trim()); where.push(`COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) = $${params.length}`); }
   const days = Number(req.query.days || 0);
-  if ([1,3,7,15,30,90,180,365].includes(days)) { params.push(days); where.push(`o.date_created >= NOW() - ($${params.length}::int * INTERVAL '1 day')`); }
+  if ([1,3,7,15,30,90,180,365].includes(days)) {
+    params.push(days);
+    where.push(`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date - ($${params.length}::int - 1)`);
+  }
   const dateFrom = String(req.query.dateFrom || ''), dateTo = String(req.query.dateTo || '');
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) { params.push(dateFrom); where.push(`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date >= $${params.length}::date`); }
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) { params.push(dateTo); where.push(`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date <= $${params.length}::date`); }
