@@ -2537,7 +2537,13 @@ async function aggregatePackedOrders(rows) {
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
     group.items.push(...(Array.isArray(row.items) ? row.items : []));
-    if (row.reputationImpact === true) group.reputationImpact = true;
+    if (row.reputationImpact === true) {
+      group.reputationImpact = true;
+      group.reputationFeedback ||= row.reputationFeedback || '';
+      group.reputationResponsibility ||= row.reputationResponsibility || '';
+      group.reputationAdvice ||= row.reputationAdvice || '';
+      group.reputationSource ||= row.reputationSource || '';
+    }
     if (row.reputationReason && !String(group.reputationReason || '').includes(row.reputationReason)) {
       group.reputationReason = [group.reputationReason, row.reputationReason].filter(Boolean).join('；');
     }
@@ -2613,13 +2619,49 @@ async function aggregatePackedOrders(rows) {
   return [...groups.values()];
 }
 
+function reputationIsAffected(value) {
+  if (value === true) return true;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return ['affected','affects_reputation','true','yes','1'].includes(normalized);
+}
+
+async function fetchClaimReputation(token, claimId) {
+  const response = await axios.get(`https://api.mercadolibre.com/marketplace/v2/claims/${encodeURIComponent(claimId)}/affects-reputation`, {
+    headers: { Authorization: `Bearer ${token}` }, timeout: 15000
+  });
+  return response.data || {};
+}
+
+function claimOrderReference(claim) {
+  const resource = claim?.resource;
+  return String(claim?.resource_id || claim?.order_id || resource?.id ||
+    (typeof resource === 'string' ? resource.split('/').pop() : '') || '');
+}
+
+function withOfficialClaimReputation(claim, reputation) {
+  return {
+    ...claim,
+    affects_reputation: reputation?.affects_reputation ?? claim?.affects_reputation,
+    reputation: { ...(claim?.reputation || {}), ...(reputation || {}) },
+    _official_reputation: reputation || {}
+  };
+}
+
 function extractReputationInfo(rawData) {
   const raw = rawData && typeof rawData === 'object' ? rawData : {};
   const official = raw._official_reputation && typeof raw._official_reputation === 'object' ? raw._official_reputation : {};
+  const officialFeedback = official.feedback && typeof official.feedback === 'object' ? official.feedback : official;
+  const affectedClaim = (Array.isArray(official.claims) ? official.claims : []).find(claim =>
+    reputationIsAffected(claim.affects_reputation) || reputationIsAffected(claim.reputation_affected) ||
+    reputationIsAffected(claim.reputation?.affects_reputation) || reputationIsAffected(claim.reputation?.affected));
+  const claimReputation = affectedClaim?.reputation || affectedClaim?._official_reputation || {};
   const values = [
     official.affects_reputation,
     official.reputation_affected,
     official.sale?.affects_reputation,
+    affectedClaim?.affects_reputation,
+    affectedClaim?.reputation_affected,
+    claimReputation.affects_reputation,
     raw.affects_reputation,
     raw.reputation_affected,
     raw.reputation?.affected,
@@ -2627,31 +2669,34 @@ function extractReputationInfo(rawData) {
     raw.feedback?.affects_reputation,
     raw.feedback?.sale?.affects_reputation
   ];
-  const explicit = values.find(value => typeof value === 'boolean');
-  const rating = String(official.sale?.rating || official.rating || raw.feedback?.sale?.rating || raw.feedback?.rating || '').toLowerCase();
-  const impact = explicit === true || ['negative', 'neutral'].includes(rating)
+  const explicit = values.find(value => typeof value === 'boolean' || String(value || '').trim() !== '');
+  const rating = String(officialFeedback.sale?.rating || officialFeedback.seller?.rating || officialFeedback.rating || raw.feedback?.sale?.rating || raw.feedback?.seller?.rating || raw.feedback?.rating || '').toLowerCase();
+  const impact = reputationIsAffected(explicit) || ['negative','neutral'].includes(rating)
     ? true
-    : (explicit === false ? false : null);
-  const reason = official.reputation?.reason || official.reason || official.sale?.reason || raw.reputation?.reason || raw.reputation_reason ||
-    raw.feedback?.sale?.reason || raw.feedback?.reason ||
+    : (explicit === false || ['not_affected','unaffected'].includes(String(explicit || '').toLowerCase()) ? false : null);
+  const reason = claimReputation.reason || affectedClaim?.reason_id || affectedClaim?.type || affectedClaim?.status_detail ||
+    official.reputation?.reason || official.reason || officialFeedback.sale?.reason || officialFeedback.seller?.reason || raw.reputation?.reason || raw.reputation_reason ||
+    raw.feedback?.sale?.reason || raw.feedback?.seller?.reason || raw.feedback?.reason ||
     (rating === 'negative' ? 'negative_feedback' : (rating === 'neutral' ? 'neutral_feedback' : ''));
   return {
     impact,
     reason: String(reason || ''),
-    feedback: String(official.message || official.feedback || official.sale?.message || ''),
-    responsibility: String(official.responsible_party || official.reputation?.responsible_party || ''),
-    advice: String(official.recommendation || official.reputation?.recommendation || ''),
-    source: Object.keys(official).length ? 'official_feedback' : (explicit !== undefined ? 'order' : '')
+    feedback: String(claimReputation.feedback || official.message || officialFeedback.sale?.message || officialFeedback.seller?.message || (affectedClaim ? '美客多官方判定该投诉影响店铺声誉' : '')),
+    responsibility: String(affectedClaim?.responsible_party || claimReputation.responsible_party || official.responsible_party || official.reputation?.responsible_party || ''),
+    advice: String(affectedClaim?.recommendation || official.recommendation || official.reputation?.recommendation ||
+      (claimReputation.has_incentive ? `请在${claimReputation.due_date ? ` ${claimReputation.due_date} ` : '官方期限内'}完成处理，争取避免最终计入声誉` : '')),
+    source: affectedClaim ? 'official_claim_reputation' : (Object.keys(official).length ? 'official_feedback' : (explicit !== undefined ? 'order' : ''))
   };
 }
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-24.4',
+    version: '2026-07-24.5',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
     shippingActionsHorizontal: true,
+    officialClaimReputation: true,
     userIsolation: true,
     officialPayoutOnly: true,
     multiStoreSync: true,
@@ -2772,13 +2817,53 @@ app.post('/api/admin/orders/sync', requireAdmin, async (req, res) => {
         }
       }
     }
+    // 逐条读取投诉是否影响声誉。官方返回 affected/not_affected 字符串，不能按布尔值误判。
+    const sourceOrderByRef = new Map();
+    for (const order of sourceOrders) {
+      sourceOrderByRef.set(String(order.id), order);
+      if (order.pack_id) sourceOrderByRef.set(String(order.pack_id), order);
+    }
+    try {
+      const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
+      const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId =>
+        axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
+          params: { seller_id: localSellerId, sort: 'last_updated:desc', limit: 100 },
+          headers: { Authorization: `Bearer ${accessToken}` }, timeout: 20000
+        }).catch(() => null)));
+      const claims = [...new Map(claimResponses.flatMap(response => {
+        const rawClaims = response?.data || {};
+        const list = Array.isArray(rawClaims) ? rawClaims : (rawClaims.data || rawClaims.results || []);
+        return Array.isArray(list) ? list : [];
+      }).filter(claim => sourceOrderByRef.has(claimOrderReference(claim)))
+        .map(claim => [String(claim.id || `${claimOrderReference(claim)}:${claim.last_updated || ''}`),claim])).values()];
+      for (let i = 0; i < claims.length; i += 5) {
+        const enrichedClaims = await Promise.all(claims.slice(i,i+5).map(async claim => {
+          if (!claim.id) return claim;
+          try { return withOfficialClaimReputation(claim,await fetchClaimReputation(accessToken,claim.id)); }
+          catch (error) {
+            console.warn('[Orders] 投诉声誉判定读取失败:', claim.id, error.response?.status || error.message);
+            return claim;
+          }
+        }));
+        for (const claim of enrichedClaims) {
+          const linkedOrder = sourceOrderByRef.get(claimOrderReference(claim));
+          if (!linkedOrder) continue;
+          linkedOrder._official_reputation ||= {};
+          linkedOrder._official_reputation.claims ||= [];
+          linkedOrder._official_reputation.claims.push(claim);
+        }
+      }
+    } catch (error) {
+      console.warn('[Orders] 投诉声誉列表读取失败:', error.response?.status || error.message);
+    }
     // 官方评价/声誉反馈优先于取消原因推断；不支持的站点静默保留为空。
     for (let i = 0; i < sourceOrders.length; i += 5) {
       await Promise.all(sourceOrders.slice(i,i+5).map(async order => {
         for (const path of [`orders/${order.id}/feedback`,`marketplace/orders/${order.id}/feedback`]) {
           try {
             const feedbackResponse = await axios.get(`https://api.mercadolibre.com/${path}`, { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 12000 });
-            order._official_reputation = feedbackResponse.data || {};
+            order._official_reputation ||= {};
+            order._official_reputation.feedback = feedbackResponse.data || {};
             break;
           } catch (error) { if (![403,404].includes(error.response?.status)) break; }
         }
@@ -4307,17 +4392,27 @@ app.get('/api/admin/order-after-sales', requireAdmin, async (req, res) => {
       params: { status: 'opened', seller_id: localSellerId, sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     }).catch(error => ({ error }))));
     if (claimResponses.every(response => response.error)) throw claimResponses[0].error;
-    const claims = [...new Map(claimResponses.flatMap(response => {
+    let claims = [...new Map(claimResponses.flatMap(response => {
       if (response.error) return [];
       const raw = response.data || {};
       const source = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
       return Array.isArray(source) ? source : [];
     }).map(claim=>[String(claim.id || `${claim.resource_id}:${claim.last_updated || ''}`),claim])).values()];
-    const orderIds = [...new Set(claims.map(claim => String(claim.resource_id || claim.order_id || claim.resource?.split('/')?.pop() || '')).filter(Boolean))];
+    const enrichedClaims = [];
+    for (let i = 0; i < claims.length; i += 5) {
+      const batch = await Promise.all(claims.slice(i,i+5).map(async claim => {
+        if (!claim.id) return claim;
+        try { return withOfficialClaimReputation(claim,await fetchClaimReputation(token,claim.id)); }
+        catch (_) { return claim; }
+      }));
+      enrichedClaims.push(...batch);
+    }
+    claims = enrichedClaims;
+    const orderIds = [...new Set(claims.map(claimOrderReference).filter(Boolean))];
     const orderResult = orderIds.length ? await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$2 AND store_user_id=$3 AND (ml_order_id=ANY($1::varchar[]) OR pack_id=ANY($1::varchar[]))`, [orderIds,req.authUser.username,sellerId]) : { rows: [] };
     const ordersById = new Map();
     for (const order of orderResult.rows) { ordersById.set(String(order.orderId), order); ordersById.set(String(order.packId), order); }
-    const items = claims.map(claim => ({ ...claim, storeId: sellerId, order: ordersById.get(String(claim.resource_id || claim.order_id || claim.resource?.split('/')?.pop() || '')) || null }));
+    const items = claims.map(claim => ({ ...claim, storeId: sellerId, order: ordersById.get(claimOrderReference(claim)) || null }));
     for (const item of items) if (item.order) {
       await saveOrderApiAudit(req.authUser.username,sellerId,item.order.orderId,'claim',String(item.id),item);
       await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
