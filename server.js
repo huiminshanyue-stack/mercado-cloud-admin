@@ -2934,6 +2934,7 @@ async function loadSitePromotions(token, site, force = false) {
 
 function marketingApiError(error, fallback) {
   const data = error.response?.data;
+  if (error.response?.status === 404 || /^(not_found|not found)$/i.test(String(data?.message || data?.error || ''))) return '美客多未找到该授权店铺对应的营销或广告资源；这与 ERP 代理角色无关，请确认店铺已开通营销/商品广告，并尝试重新授权店铺';
   if (/ad group with status hold can'?t be updated/i.test(String(data?.message || data?.error || ''))) return '该广告组处于平台锁定（HOLD）状态，暂时不能激活、暂停或调整活动；请等待美客多解除限制后再操作';
   if (/target campaign not allowed/i.test(String(data?.message || data?.error || ''))) return '美客多不允许该广告组执行目标活动操作；请先刷新真实归属，若仍失败可暂停广告但不能从该受保护活动移除';
   const cause = Array.isArray(data?.cause) ? data.cause.map(item => item?.message || item?.code).filter(Boolean).join('；') : '';
