@@ -16,7 +16,7 @@ function decrypt(value) {
   const { rows } = await pool.query("SELECT * FROM ml_store_authorizations WHERE enabled=TRUE AND nickname ILIKE '%TONRON%' ORDER BY updated_at DESC LIMIT 1");
   const auth = rows[0], token = decrypt(rows[0].access_token_encrypted);
   const authHeader = { Authorization: `Bearer ${token}` };
-  const output = { root: auth.ml_user_id, searches: [], advertisers: [], samples: [] };
+  const output = { root: auth.ml_user_id, searches: [], advertisers: [], samples: [], promotionProbes: [] };
   for (const base of ['users', 'marketplace/users']) {
     for (const siteId of ['', 'MLM', 'MLB', 'MLC', 'MCO', 'MLA']) {
       try {
@@ -30,6 +30,15 @@ function decrypt(value) {
     output.advertisers = (response.data?.advertisers || []).map(value => Object.fromEntries(Object.entries(value).filter(([key]) => !/name/i.test(key))));
   } catch (error) { output.advertisers = [{ error: error.response?.status || error.message }]; }
   const ids = output.searches.find(item => item.base === 'users' && item.siteId === 'none')?.ids || [];
+  const promotionHeaders = { ...authHeader, version: 'v2', ...(process.env.ML_CLIENT_ID ? { 'X-Client-Id': process.env.ML_CLIENT_ID, 'X-Caller-Id': process.env.ML_CLIENT_ID } : {}) };
+  for (const itemId of ids.slice(0, 5)) {
+    for (const params of [{ user_id: auth.ml_user_id }, {}, { user_id: auth.ml_user_id, site_id: 'MLM' }]) {
+      try {
+        const response = await axios.get(`https://api.mercadolibre.com/marketplace/seller-promotions/items/${itemId}`, { params, headers: promotionHeaders, timeout: 15000 });
+        output.promotionProbes.push({ itemId, params, status: 200, count: Array.isArray(response.data) ? response.data.length : -1, data: response.data });
+      } catch (error) { output.promotionProbes.push({ itemId, params, error: error.response?.status || error.message, body: error.response?.data?.message || error.response?.data?.error || '' }); }
+    }
+  }
   for (const itemId of ids.slice(0, 3)) {
     const sample = { itemId };
     try {
