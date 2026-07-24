@@ -2743,6 +2743,7 @@ const productAdsCache = new Map();
 const productAdsAnalyticsCache = new Map();
 const marketingProductsCache = new Map();
 const promotionPageCursorCache = new Map();
+const promotionItemsPageCache = new Map();
 const MARKETING_CACHE_TTL = 60 * 1000;
 const MARKETING_ITEM_CACHE_TTL = 5 * 60 * 1000;
 const PROMOTION_NAME_ZH_OVERRIDES = new Map([
@@ -3553,6 +3554,9 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
     const sites = await loadPromotionSites(auth, token);
     const site = sites.find(item => item.siteId === siteId);
     if (!site) return res.status(403).json({ code: 403, message: '该国家店铺不属于当前授权账号' });
+    const pageCacheKey = `${auth.ml_user_id}:${siteId}:${promotionId}:${promotionType}:${status}:${page}:${size}`;
+    const cachedPage = readTimedCache(promotionItemsPageCache, pageCacheKey, 2 * 60 * 1000);
+    if (cachedPage) return res.json({ code: 0, data: cachedPage });
     const promotions = await loadSitePromotions(token, site);
     if (!promotions.some(item => String(item.id) === promotionId && String(item.type).toUpperCase() === promotionType)) {
       return res.status(404).json({ code: 404, message: '活动不存在或已结束，请刷新活动列表' });
@@ -3597,6 +3601,21 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
       seenItemIds.add(itemId);
       return true;
     });
+    const missingDetailIds = rawItems.map(item => String(item.id || '')).filter(itemId => itemId && !readTimedCache(marketingItemCache, `item:${itemId}`, MARKETING_ITEM_CACHE_TTL));
+    if (missingDetailIds.length) {
+      try {
+        const detailResponse = await axios.get('https://api.mercadolibre.com/items', {
+          params: { ids: missingDetailIds.join(',') }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+        });
+        for (const entry of Array.isArray(detailResponse.data) ? detailResponse.data : []) {
+          const detail = entry?.body || entry;
+          const itemId = String(detail?.id || '');
+          if (itemId) writeTimedCache(marketingItemCache, `item:${itemId}`, detail, 500);
+        }
+      } catch (error) {
+        console.warn('[Marketing] 商品详情批量预取失败，改用逐件读取:', error.message);
+      }
+    }
     const items = await mapWithConcurrency(rawItems, 4, async item => {
       const offer = Array.isArray(item.offers) ? (item.offers.find(entry => entry?.status === 'candidate') || item.offers[0] || {}) : {};
       const cacheKey = `item:${item.id}`;
@@ -3634,13 +3653,15 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
         endDate: item.end_date || item.finish_date || ''
       };
     });
-    res.json({ code: 0, data: {
+    const pageData = {
       items,
       total: Number(response.data?.paging?.total || items.length),
       page,
       size,
       searchAfter: response.data?.paging?.search_after || response.data?.paging?.searchAfter || ''
-    } });
+    };
+    writeTimedCache(promotionItemsPageCache, pageCacheKey, pageData, 300);
+    res.json({ code: 0, data: pageData });
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
     res.status(status).json({ code: status, message: marketingApiError(error, '活动商品读取失败') });
@@ -3714,6 +3735,7 @@ app.post('/api/marketing/promotions/enroll-batch', requireAuth, async (req, res)
     });
     marketingCache.delete(`promotions:${context.site.userId}`);
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
+    for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
@@ -3752,6 +3774,7 @@ app.post('/api/marketing/promotions/exit-batch', requireAuth, async (req, res) =
       }
     });
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
+    for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
