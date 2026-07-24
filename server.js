@@ -2933,6 +2933,7 @@ async function loadSitePromotions(token, site, force = false) {
 
 function marketingApiError(error, fallback) {
   const data = error.response?.data;
+  if (/ad group with status hold can'?t be updated/i.test(String(data?.message || data?.error || ''))) return '该广告组处于平台锁定（HOLD）状态，暂时不能激活、暂停或调整活动；请等待美客多解除限制后再操作';
   if (/target campaign not allowed/i.test(String(data?.message || data?.error || ''))) return '美客多不允许该广告组执行目标活动操作；请先刷新真实归属，若仍失败可暂停广告但不能从该受保护活动移除';
   const cause = Array.isArray(data?.cause) ? data.cause.map(item => item?.message || item?.code).filter(Boolean).join('；') : '';
   if (error.response?.status === 429) return '美客多接口请求过于频繁，请稍后重试';
@@ -3376,9 +3377,25 @@ app.delete('/api/marketing/product-ads/campaigns/:campaignId/ad-groups/:adGroupI
     await axios.delete(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/campaigns/${encodeURIComponent(actualCampaignId)}/ad_groups/${encodeURIComponent(adGroupId)}`, {
       headers: { Authorization: `Bearer ${token}` }, timeout: 25000
     });
+    let confirmedCampaignId = actualCampaignId;
+    for (let attempt = 0; attempt < 3 && confirmedCampaignId === actualCampaignId; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      try {
+        const confirmation = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/ad_groups/${encodeURIComponent(adGroupId)}`, {
+          headers: { Authorization: `Bearer ${token}` }, timeout: 15000
+        });
+        confirmedCampaignId = String(confirmation.data?.campaign_id || '').trim();
+      } catch (confirmationError) {
+        if (confirmationError.response?.status === 404) confirmedCampaignId = '';
+        else throw confirmationError;
+      }
+    }
+    if (confirmedCampaignId === actualCampaignId) {
+      return res.status(409).json({ code: 409, message: '美客多已接收移除请求，但该广告组仍在原活动中，可能是平台锁定或受保护的主活动，当前不能移除' });
+    }
     for (const key of productAdsCache.keys()) if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
     for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${auth.ml_user_id}:${siteId}:`)) marketingProductsCache.delete(key);
-    res.json({ code: 0, message: '商品已从广告活动移除，店铺商品不会被删除' });
+    res.json({ code: 0, message: confirmedCampaignId ? '广告组已移出当前活动，并由美客多转入其他活动' : '广告组已从当前广告活动移除，店铺商品不会被删除', data: { previousCampaignId: actualCampaignId, currentCampaignId: confirmedCampaignId || null } });
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
     res.status(status).json({ code: status, message: marketingApiError(error, '移除广告商品失败') });
