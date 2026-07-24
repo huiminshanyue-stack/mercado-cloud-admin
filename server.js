@@ -2788,7 +2788,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.16',
+    version: '2026-07-25.17',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2816,6 +2816,8 @@ app.get('/api/health/order-management', (req, res) => {
     statisticsNaturalDateRange: true,
     statisticsCardsFollowFilters: true,
     yesterdayStatisticsCardsRemoved: true,
+    signedOrderCost: true,
+    shipmentScopedLabelAuthorization: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -4599,7 +4601,7 @@ app.get('/api/admin/order-buyers/:buyer', requireOrderAccess, async (req, res) =
 
 app.patch('/api/admin/orders/:orderId/cost', requireOrderAccess, async (req, res) => {
   const cost = Number(req.body?.cost);
-  if (!Number.isFinite(cost) || cost < 0) return res.status(400).json({ code: 400, message: '成本必须是大于等于0的数字' });
+  if (!Number.isFinite(cost)) return res.status(400).json({ code: 400, message: '成本必须是有效数字，可填写负数' });
   const note = String(req.body?.note || '').trim().slice(0, 500);
   const { rowCount } = await pool.query('UPDATE ml_orders SET product_cost=$1,cost_note=$2,updated_at=NOW() WHERE ml_order_id=$3 AND owner_username=$4', [cost, note, req.params.orderId,req.authUser.username]);
   if (!rowCount) return res.status(404).json({ code: 404, message: '订单不存在' });
@@ -4909,9 +4911,13 @@ function decodeOfficialLabelError(error) {
     : '';
   const officialCode = parsed?.error || parsed?.code || '';
   const reason = parsed?.message || parsed?.description || causes || '';
-  const message = reason
+  let message = reason
     ? `${officialCode ? `${officialCode}：` : ''}${reason}`
     : `美客多面单接口返回 HTTP ${status}`;
+  const notPrintable = String(reason).match(/Shipment\s+(\d+)\s+is not printable by Caller\s+(\d+)/i);
+  if (notPrintable) {
+    message = `运单 ${notPrintable[1]} 当前不允许授权店铺 ${notPrintable[2]} 通过官方接口打印。可能是运单所属店铺身份不一致，或当前运单状态/跨境权限不支持 API 打印；请重新同步该订单并确认所属店铺授权。`;
+  }
   const auditData = parsed && typeof parsed === 'object'
     ? parsed
     : { message: String(parsed || message).slice(0,4000) };
@@ -4928,8 +4934,9 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
     const requestedShipmentId = String(req.query.shipmentId || '').trim();
     const targetShipmentId = requestedShipmentId && shipmentIds.includes(requestedShipmentId)
       ? requestedShipmentId : shipmentIds[0];
-    audit = { storeUserId: rows[0].store_user_id, shipmentIds };
-    const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
+    const targetRow = rows.find(row => String(row.shipping_id || '') === targetShipmentId) || rows[0];
+    audit = { storeUserId: targetRow.store_user_id, shipmentIds, targetShipmentId };
+    const context = await getOrderStoreContext(req.authUser, targetRow.store_user_id);
     if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效，请重新授权后下载' });
     let pdfResponse;
     let lastOfficialError;
