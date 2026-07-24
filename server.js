@@ -3552,6 +3552,7 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
       return true;
     });
     const items = await mapWithConcurrency(rawItems, 4, async item => {
+      const offer = Array.isArray(item.offers) ? (item.offers.find(entry => entry?.status === 'candidate') || item.offers[0] || {}) : {};
       const cacheKey = `item:${item.id}`;
       let detail = readTimedCache(marketingItemCache, cacheKey, MARKETING_ITEM_CACHE_TTL);
       if (!detail) {
@@ -3574,13 +3575,14 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
         userId: site.userId,
         status: item.status || status,
         currentPrice: Number(item.original_price ?? detail.price ?? 0),
-        activityPrice: Number(item.price || 0),
+        activityPrice: Number(item.price || item.deal_price || offer.price || offer.deal_price || offer.new_price || offer.suggested_discounted_price || 0),
+        platformDiscountPercent: Number(item.discount_percentage || offer.discount_percentage || offer.discount_percent || 0),
         currency: item.currency_id || detail.currency_id || 'USD',
         minPrice: Number(item.min_discounted_price || 0),
         maxPrice: Number(item.max_discounted_price || 0),
         suggestedPrice: Number(item.suggested_discounted_price || 0),
         stock: Number(detail.available_quantity || 0),
-        offerId: item.offer_id || item.candidate_id || '',
+        offerId: item.offer_id || item.candidate_id || offer.id || '',
         netProceeds: item.net_proceeds || null,
         startDate: item.start_date || '',
         endDate: item.end_date || item.finish_date || ''
