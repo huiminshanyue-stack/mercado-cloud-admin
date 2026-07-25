@@ -5,6 +5,7 @@ const axios = require('axios');
 const path = require('path');
 const { Pool } = require('pg');
 const { resolveOfficialOrderPayout } = require('./order-payout');
+const { isFulfillmentFinished, shouldCreateNewOrderAlert } = require('./order-alert-policy');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -434,6 +435,23 @@ async function initOrderManagementTables() {
     }
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_payout_repair_version',$1,NOW())
       ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [payoutRepairVersion]);
+  }
+  // Historical imports must remain in the message center, but once fulfillment is
+  // finished their new-order/deadline notices are no longer actionable or audible.
+  const terminalAlertCleanupVersion = '2026-07-25-terminal-alert-cleanup-v1';
+  const terminalAlertCleanupSetting = await pool.query("SELECT value FROM settings WHERE key='order_terminal_alert_cleanup_version'");
+  if (terminalAlertCleanupSetting.rows[0]?.value !== terminalAlertCleanupVersion) {
+    await pool.query(`UPDATE order_alerts a SET is_read=TRUE
+      FROM ml_orders o
+      WHERE a.owner_username=o.owner_username AND a.order_id=o.ml_order_id
+        AND a.alert_type IN ('new_order','deadline')
+        AND (
+          LOWER(COALESCE(o.status,'')) IN ('cancelled','refunded')
+          OR LOWER(COALESCE(o.shipment_status,'')) IN ('shipped','delivered','cancelled')
+          OR COALESCE(o.refund_amount,0)>0
+        )`);
+    await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_terminal_alert_cleanup_version',$1,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [terminalAlertCleanupVersion]);
   }
   await pool.query(`UPDATE erp_connectors SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
   await pool.query(`UPDATE fulfillment_services SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
@@ -2824,7 +2842,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.25',
+    version: '2026-07-25.26',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2870,6 +2888,9 @@ app.get('/api/health/order-management', (req, res) => {
     cachedPayoutAggregationOnly: true,
     cancelledBeforeDispatchPayoutRepair: true,
     lockedOfficialPayoutInvariant: '21.52-2.69-11.00=7.83',
+    terminalOrderAlertCleanup: true,
+    recentActiveOrderAlertsOnly: true,
+    singlePlayVoiceAlerts: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3374,11 +3395,22 @@ async function syncOrdersForUser(authUser, body = {}) {
       if (Object.keys(shipment).length) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'shipment',String(order.shipping?.id || order.id),shipment);
       if (order._official_reputation) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'reputation',String(order.id),order._official_reputation);
       const old = previous.rows[0];
-      if (!old) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'new_order','收到新订单',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
+      const fulfillmentFinished = isFulfillmentFinished({
+        orderStatus: order.status,
+        shipmentStatus: shipment.status,
+        refundAmount
+      });
+      if (shouldCreateNewOrderAlert({
+        existed: Boolean(old),
+        orderStatus: order.status,
+        shipmentStatus: shipment.status,
+        refundAmount,
+        dateCreated: order.date_created
+      })) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'new_order','收到新订单',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'} · ${order.currency_id || ''} ${order.paid_amount || order.total_amount || 0}`, `new:${order.id}`]);
       if (order.status === 'cancelled' && old?.status !== 'cancelled') await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'cancelled','订单已取消',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'}订单已被取消`, `cancelled:${order.id}`]);
-      const deadlineFinished = refundAmount > 0 || ['cancelled','refunded'].includes(order.status) || ['shipped','delivered','cancelled'].includes(shipment.status);
+      const deadlineFinished = fulfillmentFinished;
       if (deadlineFinished) await pool.query(`UPDATE order_alerts SET is_read=TRUE
-        WHERE owner_username=$1 AND order_id=$2 AND alert_type='deadline'`, [req.authUser.username,String(order.id)]);
+        WHERE owner_username=$1 AND order_id=$2 AND alert_type IN ('new_order','deadline')`, [req.authUser.username,String(order.id)]);
       if (handlingDeadline && !deadlineFinished && new Date(handlingDeadline).getTime() > Date.now() && new Date(handlingDeadline).getTime() - Date.now() <= 86400000) {
         await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'deadline','订单即将延误',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${officialHandlingDeadline ? '官方' : '预计'}待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
       }
@@ -5024,7 +5056,7 @@ app.get('/api/admin/order-alerts', requireOrderAccess, async (req, res) => {
   const countParams = [...params];
   params.push(size,(page-1)*size);
   const [{ rows }, unread, total] = await Promise.all([
-    pool.query(`SELECT a.id,a.order_id AS "orderId",COALESCE(NULLIF(o.pack_id,''),a.order_id) AS "displayOrderId",a.alert_type AS type,a.title,a.content,a.is_read AS "isRead",a.created_at AS "createdAt",o.country,o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'授权店铺') AS "storeName" FROM order_alerts a LEFT JOIN ml_orders o ON o.ml_order_id=a.order_id AND o.owner_username=a.owner_username LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY a.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params),
+    pool.query(`SELECT a.id,a.order_id AS "orderId",COALESCE(NULLIF(o.pack_id,''),a.order_id) AS "displayOrderId",a.alert_type AS type,a.title,a.content,a.is_read AS "isRead",a.created_at AS "createdAt",o.status AS "orderStatus",o.shipment_status AS "shipmentStatus",o.country,o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'授权店铺') AS "storeName" FROM order_alerts a LEFT JOIN ml_orders o ON o.ml_order_id=a.order_id AND o.owner_username=a.owner_username LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ${clause} ORDER BY a.created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`, params),
     pool.query('SELECT COUNT(*)::int AS count FROM order_alerts WHERE owner_username=$1 AND is_read=FALSE',[req.authUser.username]),
     pool.query(`SELECT COUNT(*)::int AS count FROM order_alerts a LEFT JOIN ml_orders o ON o.ml_order_id=a.order_id AND o.owner_username=a.owner_username ${clause}`,countParams)
   ]);
