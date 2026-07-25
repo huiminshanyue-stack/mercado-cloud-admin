@@ -12,9 +12,9 @@
       <view class="section-title">商品信息</view>
       <view wx:for="{{order.products}}" wx:key="itemId" class="product">
         <image class="image" mode="aspectFit" src="{{item.image}}" data-index="{{index}}" bindtap="previewImage" />
-        <view class="product-main"><view class="product-title">{{item.title}}</view><view class="muted">商品ID：<text selectable="true">{{item.itemId}}</text></view><view class="muted">SKU：{{item.sku}}　数量 ×{{item.quantity}}</view></view>
+        <view class="product-main"><view class="product-title">{{item.title}}</view><view class="muted">商品ID：<text user-select="true">{{item.itemId}}</text></view><view class="muted">SKU：{{item.sku}}　数量 ×{{item.quantity}}</view></view>
       </view>
-      <view class="row"><text>买家</text><text selectable="true">{{order.buyer || '-'}}</text></view>
+      <view class="row"><text>买家</text><text user-select="true">{{order.buyer || '-'}}</text></view>
     </view>
 
     <view wx:if="{{order.status === 'cancelled'}}" class="card section warning-section"><view class="section-title">取消原因</view><view class="explain">{{order.cancellationText}}</view></view>
@@ -48,8 +48,8 @@
     <view class="card section">
       <view class="section-title">物流信息</view>
       <view class="row"><text>物流方式</text><text>{{order.trackingMethod || '-'}}</text></view>
-      <view class="row"><text>国际运单号</text><text selectable="true">{{order.trackingNumber || '-'}}</text></view>
-      <view class="row"><text>Shipment ID</text><text selectable="true">{{order.shippingId || '-'}}</text></view>
+      <view class="row"><text>国际运单号</text><text user-select="true">{{order.trackingNumber || '-'}}</text></view>
+      <view class="row"><text>Shipment ID</text><text user-select="true">{{order.shippingId || '-'}}</text></view>
       <view class="row"><text>24小时上网</text><text>{{order.onlineText}}</text></view>
     </view>
     <view class="readonly">当前为只读内测版，回复消息、修改成本和提交代贴单将在确认权限后逐项开放。</view>
