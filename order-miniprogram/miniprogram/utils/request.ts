@@ -2,9 +2,10 @@ import { apiBase } from './env';
 
 interface RequestOptions {
   path: string;
-  method?: WechatMiniprogram.RequestOption['method'];
+  method?: WechatMiniprogram.RequestOption['method'] | 'PATCH';
   data?: WechatMiniprogram.IAnyObject;
   authenticated?: boolean;
+  timeout?: number;
 }
 
 export function request<T>(options: RequestOptions): Promise<T> {
@@ -12,9 +13,9 @@ export function request<T>(options: RequestOptions): Promise<T> {
   return new Promise((resolve,reject) => {
     wx.request<ApiResponse<T>>({
       url: `${apiBase()}${options.path}`,
-      method: options.method || 'GET',
+      method: (options.method || 'GET') as WechatMiniprogram.RequestOption['method'],
       data: options.data || {},
-      timeout: 30000,
+      timeout: options.timeout || 30000,
       header: {
         'Content-Type': 'application/json',
         ...(options.authenticated === false || !app.globalData.token

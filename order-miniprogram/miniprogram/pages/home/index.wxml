@@ -1,0 +1,24 @@
+<view class="page home-page">
+  <view class="hero">
+    <view><view class="welcome">你好，{{userName}}</view><view class="subtitle">今天也要顺利处理每一笔订单</view></view>
+    <button class="logout" size="mini" bindtap="logout">退出</button>
+  </view>
+
+  <view class="overview card">
+    <view><text class="number">{{summary.orderCount}}</text><text class="unit">订单</text></view>
+    <view><text class="number warning">{{summary.inquiryCount}}</text><text class="unit">售前待看</text></view>
+    <view><text class="number danger">{{summary.afterSalesCount}}</text><text class="unit">售后待看</text></view>
+  </view>
+
+  <view class="section-title">工作台</view>
+  <view class="menu-card order-menu" bindtap="openOrders">
+    <view class="icon">单</view><view class="menu-main"><view class="menu-title">订单工作台</view><view class="menu-desc">查看订单、账单、物流并填写商品成本</view></view><view class="arrow">›</view>
+  </view>
+  <view class="menu-card inquiry-menu" bindtap="openInquiries">
+    <view class="icon">询</view><view class="menu-main"><view class="menu-title">售前咨询</view><view class="menu-desc">查看买家订单咨询，翻译后确认回复</view></view><view class="badge" wx:if="{{summary.inquiryCount}}">{{summary.inquiryCount}}</view><view class="arrow">›</view>
+  </view>
+  <view class="menu-card after-menu" bindtap="openAfterSales">
+    <view class="icon">售</view><view class="menu-main"><view class="menu-title">售后消息</view><view class="menu-desc">处理申诉和售后线程，不受退款状态限制</view></view><view class="badge red" wx:if="{{summary.afterSalesCount}}">{{summary.afterSalesCount}}</view><view class="arrow">›</view>
+  </view>
+  <view class="security">所有数据均按当前 ERP 账号的授权店铺隔离</view>
+</view>

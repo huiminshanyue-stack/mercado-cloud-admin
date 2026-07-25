@@ -36,10 +36,11 @@ async function runHandlers(handlers,req,res) {
 }
 
 async function testRoutes() {
-  const routes=new Map(),listCalls=[];
+  const routes=new Map(),listCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
-    post(path,...handlers) { routes.set(`POST ${path}`,handlers); }
+    post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
+    patch(path,...handlers) { routes.set(`PATCH ${path}`,handlers); }
   };
   const pool={
     async query(sql,params=[]) {
@@ -48,6 +49,14 @@ async function testRoutes() {
         if (params[0]==='cntoro-token') return { rows:[{ username:'CNTORO',role:'user',validuntil:null }] };
         if (params[0]==='other-token') return { rows:[{ username:'OTHER',role:'user',validuntil:null }] };
         return { rows:[] };
+      }
+      if (sql.includes('COUNT(DISTINCT') && sql.includes('FROM ml_orders')) {
+        assert.equal(params[0],'CNTORO');
+        return { rows:[{ count:7 }] };
+      }
+      if (sql.includes('FROM order_alerts') && sql.includes("alert_type IN ('buyer_inquiry','after_sales')")) {
+        assert.equal(params[0],'CNTORO');
+        return { rows:[{ alert_type:'buyer_inquiry',count:2 },{ alert_type:'after_sales',count:1 }] };
       }
       return { rows:[] };
     }
@@ -60,14 +69,32 @@ async function testRoutes() {
     getOrderListData:async (user,query) => {
       listCalls.push({ user,query });
       return { items:[{ orderId:'order-1' }],total:1,page:1,size:20 };
-    }
+    },
+    updateOrderCostData:async (user,orderId,body) => {
+      costCalls.push({ user,orderId,body });
+      return { orderId,cost:body.cost,note:body.note || '' };
+    },
+    getOrderInquiriesData:async()=>({ count:0,items:[],orders:[] }),
+    getOrderAfterSalesData:async()=>({ count:0,items:[],orders:[] }),
+    getOrderMessagesData:async()=>({ messages:[] }),
+    sendOrderMessageData:async (user,orderId,body)=>{
+      inquirySendCalls.push({ user,orderId,body });
+      return { id:'message-1' };
+    },
+    getOrderClaimMessagesData:async()=>({ messages:[] }),
+    sendOrderClaimMessageData:async (user,claimId,body)=>{
+      claimSendCalls.push({ user,claimId,body });
+      return { id:'claim-message-1' };
+    },
+    translateOrderTextData:async body=>({ text:body.text })
   });
 
   const configRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/config'),{ headers:{} },configRes);
   assert.equal(configRes.statusCode,200);
   assert.equal(configRes.body.data.appId,DEFAULT_APP_ID);
-  assert.equal(configRes.body.data.writeOperationsEnabled,false);
+  assert.equal(configRes.body.data.writeOperationsEnabled,true);
+  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply']);
 
   const anonymousRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/orders'),{ headers:{},query:{} },anonymousRes);
@@ -88,6 +115,39 @@ async function testRoutes() {
   assert.equal(listCalls.length,1);
   assert.equal(listCalls[0].user.username,'CNTORO');
   assert.deepEqual(listCalls[0].query,{ page:'2',storeId:'store-1' });
+
+  const costRes=responseRecorder();
+  await runHandlers(routes.get('PATCH /api/miniprogram/v1/orders/:orderId/cost'),{
+    headers:{ authorization:'Bearer cntoro-token' },params:{ orderId:'order-1' },body:{ cost:-12.5,note:'赔付调整' }
+  },costRes);
+  assert.equal(costRes.statusCode,200);
+  assert.equal(costCalls.length,1);
+  assert.equal(costCalls[0].user.username,'CNTORO');
+  assert.equal(costCalls[0].orderId,'order-1');
+  assert.deepEqual(costCalls[0].body,{ cost:-12.5,note:'赔付调整' });
+
+  const homeRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/home-summary'),{
+    headers:{ authorization:'Bearer cntoro-token' }
+  },homeRes);
+  assert.deepEqual(homeRes.body.data,{ orderCount:7,inquiryCount:2,afterSalesCount:1 });
+
+  const inquirySendRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/inquiries/:orderId/messages'),{
+    headers:{ authorization:'Bearer cntoro-token' },params:{ orderId:'order-1' },body:{ text:'Hello' }
+  },inquirySendRes);
+  assert.equal(inquirySendRes.statusCode,200);
+  assert.equal(inquirySendCalls[0].user.username,'CNTORO');
+  assert.deepEqual(inquirySendCalls[0],{ user:inquirySendCalls[0].user,orderId:'order-1',body:{ text:'Hello' } });
+
+  const claimSendRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/after-sales/:claimId/messages'),{
+    headers:{ authorization:'Bearer cntoro-token' },params:{ claimId:'claim-1' },body:{ text:'Resolved',storeId:'store-1' }
+  },claimSendRes);
+  assert.equal(claimSendRes.statusCode,200);
+  assert.equal(claimSendCalls[0].user.username,'CNTORO');
+  assert.equal(claimSendCalls[0].claimId,'claim-1');
+  assert.deepEqual(claimSendCalls[0].body,{ text:'Resolved',storeId:'store-1' });
 }
 
 testRoutes().then(() => console.log('wechat miniprogram security and route tests passed'));

@@ -18,7 +18,8 @@
 .image { width:132rpx; height:132rpx; flex:none; background:#f1f3f6; border-radius:14rpx; }
 .product-main { min-width:0; flex:1; }.product-title { display:-webkit-box; overflow:hidden; font-size:28rpx; font-weight:650; line-height:1.45; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
 .meta { margin-top:10rpx; overflow:hidden; color:#83909f; font-size:23rpx; text-overflow:ellipsis; white-space:nowrap; }
-.money-row { display:flex; justify-content:space-between; padding-top:20rpx; }
+.money-row { display:flex; justify-content:space-between; align-items:flex-end; padding-top:20rpx; }
 .money-row view { display:flex; flex-direction:column; }.money-row view:last-child { text-align:right; }
 .label { color:#8b97a4; font-size:22rpx; }.amount { margin-top:5rpx; font-size:29rpx; font-weight:700; }.payout { color:#16a66a; }
+.cost-column { align-items:flex-end; }.cost-action { margin:7rpx 0 0; padding:0 14rpx; color:#1677ff; background:#edf5ff; font-size:21rpx; line-height:46rpx; }
 .empty,.loading-more { padding:90rpx 0; color:#94a0ad; text-align:center; font-size:26rpx; }.loading-more { padding:28rpx 0; }

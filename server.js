@@ -2851,7 +2851,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.29',
+    version: '2026-07-25.30',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2907,7 +2907,10 @@ app.get('/api/health/order-management', (req, res) => {
     officialAlertEventTime: true,
     wechatMiniProgramApiV1: true,
     wechatErpTestLogin: true,
-    miniProgramReadOnlyOrders: true,
+    miniProgramHomeDashboard: true,
+    miniProgramOrderCostWrite: true,
+    miniProgramInquiryReply: true,
+    miniProgramAfterSalesReply: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -4813,13 +4816,18 @@ app.get('/api/admin/order-buyers/:buyer', requireOrderAccess, async (req, res) =
   res.json({ code: 0, data: { buyer: req.params.buyer, orders: rows, totals } });
 });
 
+async function updateOrderCostData(authUser,orderId,body = {}) {
+  const cost = Number(body?.cost);
+  if (!Number.isFinite(cost)) { const error=new Error('成本必须是有效数字，可填写负数'); error.status=400; throw error; }
+  const note = String(body?.note || '').trim().slice(0, 500);
+  const { rowCount } = await pool.query('UPDATE ml_orders SET product_cost=$1,cost_note=$2,updated_at=NOW() WHERE ml_order_id=$3 AND owner_username=$4', [cost,note,String(orderId),authUser.username]);
+  if (!rowCount) { const error=new Error('订单不存在或无权操作'); error.status=404; throw error; }
+  return { orderId:String(orderId),cost,note };
+}
+
 app.patch('/api/admin/orders/:orderId/cost', requireOrderAccess, async (req, res) => {
-  const cost = Number(req.body?.cost);
-  if (!Number.isFinite(cost)) return res.status(400).json({ code: 400, message: '成本必须是有效数字，可填写负数' });
-  const note = String(req.body?.note || '').trim().slice(0, 500);
-  const { rowCount } = await pool.query('UPDATE ml_orders SET product_cost=$1,cost_note=$2,updated_at=NOW() WHERE ml_order_id=$3 AND owner_username=$4', [cost, note, req.params.orderId,req.authUser.username]);
-  if (!rowCount) return res.status(404).json({ code: 404, message: '订单不存在' });
-  res.json({ code: 0 });
+  try { res.json({ code:0,data:await updateOrderCostData(req.authUser,req.params.orderId,req.body || {}) }); }
+  catch (error) { res.status(error.status || 500).json({ code:error.status || 500,message:error.message || '保存订单成本失败' }); }
 });
 
 app.patch('/api/admin/orders/:orderId/mark', requireOrderAccess, async (req, res) => {
@@ -4925,10 +4933,10 @@ app.get('/api/admin/order-profits', requireOrderAccess, async (req, res) => {
   res.json({ code: 0, data: { items: packedProfitRows, summary, exchangeRate } });
 });
 
-app.get('/api/admin/order-inquiries', requireOrderAccess, async (req, res) => {
-  try {
+async function getOrderInquiriesData(authUser,query = {}) {
+    const req={ authUser,query };
     const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
-    if (!context) return res.status(404).json({ code: 404, message: '当前账号没有可用的店铺授权' });
+    if (!context) { const error=new Error('当前账号没有可用的店铺授权'); error.status=404; throw error; }
     const { token, sellerId } = context;
     const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
     const unreadResponses = await Promise.all(marketplaceSellerIds.map(userId => axios.get('https://api.mercadolibre.com/marketplace/messages/unread', {
@@ -5005,17 +5013,22 @@ app.get('/api/admin/order-inquiries', requireOrderAccess, async (req, res) => {
       await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
         [req.authUser.username,String(linkedOrder.orderId),`买家 ${linkedOrder.buyer || ''} 发来新的订单咨询`,`inquiry:${sellerId}:${messageKey}`]);
     }
-    res.json({ code: 0, data: { count: itemMap.size, items: [...itemMap.values()], orders: [...orderMap.values()] } });
+    return { count:itemMap.size,items:[...itemMap.values()],orders:[...orderMap.values()] };
+}
+
+app.get('/api/admin/order-inquiries', requireOrderAccess, async (req, res) => {
+  try {
+    res.json({ code:0,data:await getOrderInquiriesData(req.authUser,req.query || {}) });
   } catch (e) {
-    const status = e.response?.status || 502;
+    const status = e.status || e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺暂不支持美客多售后消息接口' : (e.response?.data?.message || e.message) });
   }
 });
 
-app.get('/api/admin/order-after-sales', requireOrderAccess, async (req, res) => {
-  try {
+async function getOrderAfterSalesData(authUser,query = {}) {
+    const req={ authUser,query };
     const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
-    if (!context) return res.status(404).json({ code: 404, message: '当前账号没有可用的店铺授权' });
+    if (!context) { const error=new Error('当前账号没有可用的店铺授权'); error.status=404; throw error; }
     const { token, sellerId } = context;
     const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
     const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId => axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
@@ -5066,45 +5079,56 @@ app.get('/api/admin/order-after-sales', requireOrderAccess, async (req, res) => 
       await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
         [req.authUser.username,String(item.order.orderId),`订单 ${item.order.packId || item.order.orderId} 存在待处理售后申诉`,`claim:${sellerId}:${item.id}`]);
     }
-    res.json({ code: 0, data: { count: items.length, items, orders: items.map(item => item.order).filter(Boolean) } });
+    return { count:items.length,items,orders:items.map(item=>item.order).filter(Boolean) };
+}
+
+app.get('/api/admin/order-after-sales', requireOrderAccess, async (req, res) => {
+  try {
+    res.json({ code:0,data:await getOrderAfterSalesData(req.authUser,req.query || {}) });
   } catch (e) {
-    const status = e.response?.status || 502;
+    const status = e.status || e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺暂不支持售后申诉接口' : (e.response?.data?.message || e.message) });
   }
 });
 
-app.get('/api/admin/order-claims/:claimId/messages', requireOrderAccess, async (req, res) => {
-  try {
-    const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
-    if (!context) return res.status(404).json({ code: 404, message: '无法确定该售后线程所属店铺' });
+async function getOrderClaimMessagesData(authUser,claimId,storeId = '') {
+    const context = await resolveOrderStoreContext(authUser,String(storeId || ''));
+    if (!context) { const error=new Error('无法确定该售后线程所属店铺'); error.status=404; throw error; }
     const token = context.token;
-    const response = await axios.get(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(req.params.claimId)}/messages`, { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
-    const claimLink = await pool.query(`SELECT order_id FROM order_api_audits WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[req.authUser.username,String(req.params.claimId)]);
-    await saveOrderApiAudit(req.authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '','claim_messages',String(req.params.claimId),response.data);
-    if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[req.authUser.username,claimLink.rows[0].order_id]);
-    res.json({ code: 0, data: response.data });
-  } catch (e) { const status = e.response?.status || 502; res.status(status).json({ code: status, message: e.response?.data?.message || e.message }); }
+    const response = await axios.get(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(claimId)}/messages`, { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+    const claimLink = await pool.query(`SELECT order_id FROM order_api_audits WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[authUser.username,String(claimId)]);
+    await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '','claim_messages',String(claimId),response.data);
+    if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[authUser.username,claimLink.rows[0].order_id]);
+    return response.data;
+}
+
+app.get('/api/admin/order-claims/:claimId/messages', requireOrderAccess, async (req, res) => {
+  try { res.json({ code:0,data:await getOrderClaimMessagesData(req.authUser,req.params.claimId,req.query.storeId) }); }
+  catch (e) { const status=e.status || e.response?.status || 502; res.status(status).json({ code:status,message:e.response?.data?.message || e.message }); }
 });
+
+async function sendOrderClaimMessageData(authUser,claimId,body = {}) {
+    const text=String(body?.text || '').trim();
+    if (!text) { const error=new Error('回复内容不能为空'); error.status=400; throw error; }
+    if (text.length>5000) { const error=new Error('回复内容不能超过5000字'); error.status=400; throw error; }
+    const context = await resolveOrderStoreContext(authUser,String(body?.storeId || ''));
+    if (!context) { const error=new Error('无法确定该售后线程所属店铺'); error.status=404; throw error; }
+    const token = context.token;
+    const response = await axios.post(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(claimId)}/messages`, { receiver_role:'complainant',message:text }, { headers: { Authorization:`Bearer ${token}`,'Content-Type':'application/json' },timeout:20000 });
+    return response.data;
+}
 
 app.post('/api/admin/order-claims/:claimId/messages', requireOrderAccess, async (req, res) => {
-  const text = String(req.body?.text || '').trim();
-  if (!text) return res.status(400).json({ code: 400, message: '回复内容不能为空' });
-  try {
-    const context = await resolveOrderStoreContext(req.authUser, String(req.body?.storeId || ''));
-    if (!context) return res.status(404).json({ code: 404, message: '无法确定该售后线程所属店铺' });
-    const token = context.token;
-    const response = await axios.post(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(req.params.claimId)}/messages`, { receiver_role: 'complainant', message: text }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
-    res.json({ code: 0, data: response.data });
-  } catch (e) { const status = e.response?.status || 502; res.status(status).json({ code: status, message: e.response?.data?.message || e.message }); }
+  try { res.json({ code:0,data:await sendOrderClaimMessageData(req.authUser,req.params.claimId,req.body || {}) }); }
+  catch (e) { const status=e.status || e.response?.status || 502; res.status(status).json({ code:status,message:e.response?.data?.message || e.message }); }
 });
 
-app.post('/api/admin/translate', requireOrderAccess, async (req, res) => {
-  const text = String(req.body?.text || '').trim();
-  const source = String(req.body?.source || 'zh-CN');
-  const target = String(req.body?.target || 'en');
-  if (!text) return res.status(400).json({ code: 400, message: '翻译内容不能为空' });
-  if (text.length > 5000) return res.status(400).json({ code: 400, message: '单次翻译内容不能超过5000字' });
-  try {
+async function translateOrderTextData(body = {}) {
+  const text=String(body?.text || '').trim();
+  const source=String(body?.source || 'zh-CN');
+  const target=String(body?.target || 'en');
+  if (!text) { const error=new Error('翻译内容不能为空'); error.status=400; throw error; }
+  if (text.length>5000) { const error=new Error('单次翻译内容不能超过5000字'); error.status=400; throw error; }
     const response = await axios.get('https://translate.googleapis.com/translate_a/single', {
       params: { client: 'gtx', sl: source, tl: target, dt: 't', q: text },
       timeout: 15000
@@ -5113,10 +5137,12 @@ app.post('/api/admin/translate', requireOrderAccess, async (req, res) => {
       ? response.data[0].map(part => part?.[0] || '').join('')
       : '';
     if (!translated) throw new Error('翻译服务未返回结果');
-    res.json({ code: 0, data: { text: translated, source, target } });
-  } catch (e) {
-    res.status(502).json({ code: 502, message: `翻译失败：${e.response?.data?.message || e.message}` });
-  }
+    return { text:translated,source,target };
+}
+
+app.post('/api/admin/translate', requireOrderAccess, async (req, res) => {
+  try { res.json({ code:0,data:await translateOrderTextData(req.body || {}) }); }
+  catch (e) { const status=e.status || 502; res.status(status).json({ code:status,message:status===502 ? `翻译失败：${e.response?.data?.message || e.message}` : e.message }); }
 });
 
 app.get('/api/admin/order-alerts', requireOrderAccess, async (req, res) => {
@@ -5487,43 +5513,50 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
   }
 });
 
-app.get('/api/admin/orders/:orderId/messages', requireOrderAccess, async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [req.params.orderId,req.authUser.username]);
-    if (!rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
-    const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
-    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效' });
+async function getOrderMessagesData(authUser,orderId) {
+    const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [String(orderId),authUser.username]);
+    if (!rows[0]) { const error=new Error('订单不存在或无权查看'); error.status=404; throw error; }
+    const context = await getOrderStoreContext(authUser,rows[0].store_user_id);
+    if (!context) { const error=new Error('该订单所属店铺授权已失效'); error.status=403; throw error; }
     const token = context.token;
-    const packId = rows[0].pack_id || req.params.orderId;
+    const packId = rows[0].pack_id || String(orderId);
     const response = await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
       headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     });
-    await saveOrderApiAudit(req.authUser.username,rows[0].store_user_id,req.params.orderId,'order_messages',String(packId),response.data);
-    await pool.query(`INSERT INTO order_message_reads(owner_username,thread_type,thread_id,last_read_at) VALUES($1,'inquiry',$2,NOW()) ON CONFLICT(owner_username,thread_type,thread_id) DO UPDATE SET last_read_at=NOW()`, [req.authUser.username,String(packId)]);
-    await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='buyer_inquiry'`,[req.authUser.username,req.params.orderId]);
-    res.json({ code: 0, data: response.data });
-  } catch (e) {
-    const status = e.response?.status || 502;
+    await saveOrderApiAudit(authUser.username,rows[0].store_user_id,String(orderId),'order_messages',String(packId),response.data);
+    await pool.query(`INSERT INTO order_message_reads(owner_username,thread_type,thread_id,last_read_at) VALUES($1,'inquiry',$2,NOW()) ON CONFLICT(owner_username,thread_type,thread_id) DO UPDATE SET last_read_at=NOW()`, [authUser.username,String(packId)]);
+    await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='buyer_inquiry'`,[authUser.username,String(orderId)]);
+    return response.data;
+}
+
+app.get('/api/admin/orders/:orderId/messages', requireOrderAccess, async (req, res) => {
+  try { res.json({ code:0,data:await getOrderMessagesData(req.authUser,req.params.orderId) }); }
+  catch (e) {
+    const status = e.status || e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺或订单暂不支持美客多售后会话' : (e.response?.data?.message || e.message) });
   }
 });
 
-app.post('/api/admin/orders/:orderId/messages', requireOrderAccess, async (req, res) => {
-  const text = String(req.body?.text || '').trim();
-  if (!text) return res.status(400).json({ code: 400, message: '回复内容不能为空' });
-  try {
-    const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [req.params.orderId,req.authUser.username]);
-    if (!rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
-    const context = await getOrderStoreContext(req.authUser, rows[0].store_user_id);
-    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效' });
+async function sendOrderMessageData(authUser,orderId,body = {}) {
+    const text=String(body?.text || '').trim();
+    if (!text) { const error=new Error('回复内容不能为空'); error.status=400; throw error; }
+    if (text.length>5000) { const error=new Error('回复内容不能超过5000字'); error.status=400; throw error; }
+    const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [String(orderId),authUser.username]);
+    if (!rows[0]) { const error=new Error('订单不存在或无权操作'); error.status=404; throw error; }
+    const context = await getOrderStoreContext(authUser,rows[0].store_user_id);
+    if (!context) { const error=new Error('该订单所属店铺授权已失效'); error.status=403; throw error; }
     const token = context.token;
-    const packId = rows[0].pack_id || req.params.orderId;
+    const packId = rows[0].pack_id || String(orderId);
     const response = await axios.post(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
-      text, text_translated: String(req.body?.textTranslated || '') || undefined, attachments: []
+      text,text_translated:String(body?.textTranslated || '') || undefined,attachments:[]
     }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
-    res.json({ code: 0, data: response.data });
-  } catch (e) {
-    const status = e.response?.status || 502;
+    return response.data;
+}
+
+app.post('/api/admin/orders/:orderId/messages', requireOrderAccess, async (req, res) => {
+  try { res.json({ code:0,data:await sendOrderMessageData(req.authUser,req.params.orderId,req.body || {}) }); }
+  catch (e) {
+    const status = e.status || e.response?.status || 502;
     res.status(status).json({ code: status, message: status === 403 ? '该店铺或订单暂不支持美客多售后会话' : (e.response?.data?.message || e.message) });
   }
 });
@@ -5832,7 +5865,9 @@ async function start() {
   await initInternationalProductTable();
   await initOrderManagementTables();
   await initMiniProgramTables(pool);
-  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData });
+  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData,
+    updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
+    getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');

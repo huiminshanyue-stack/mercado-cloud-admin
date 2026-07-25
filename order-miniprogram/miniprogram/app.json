@@ -1,9 +1,15 @@
 {
   "pages": [
+    "pages/home/index",
     "pages/login/index",
     "pages/bind/index",
     "pages/orders/index",
-    "pages/order-detail/index"
+    "pages/order-detail/index",
+    "pages/cost/index",
+    "pages/inquiries/index",
+    "pages/inquiry-thread/index",
+    "pages/after-sales/index",
+    "pages/claim-thread/index"
   ],
   "window": {
     "navigationBarBackgroundColor": "#1677ff",

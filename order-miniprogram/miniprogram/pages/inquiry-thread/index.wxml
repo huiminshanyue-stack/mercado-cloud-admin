@@ -1,0 +1,14 @@
+<view class="thread-page">
+  <view class="thread-head">订单 {{orderNo}}</view>
+  <scroll-view class="messages" scroll-y enhanced>
+    <view wx:if="{{loading}}" class="empty">正在读取咨询记录…</view>
+    <view wx:elif="{{!messages.length}}" class="empty">美客多暂未返回可显示的咨询</view>
+    <view wx:for="{{messages}}" wx:key="key" class="message-row {{item.side}}"><view class="bubble"><view class="content">{{item.content || '（非文字消息）'}}</view><view class="meta">{{item.roleText}} · {{item.timeText}}</view></view></view>
+  </scroll-view>
+  <view class="composer">
+    <textarea class="textarea" maxlength="2000" value="{{chineseText}}" placeholder="第一步：输入中文回复" bindinput="onChinese" />
+    <button class="translate" loading="{{translating}}" bindtap="translate">中文转英文</button>
+    <textarea class="textarea english" maxlength="5000" value="{{englishText}}" placeholder="第二步：检查并修改英文回复" bindinput="onEnglish" />
+    <button class="primary-button send" loading="{{sending}}" bindtap="send">确认发送英文回复</button>
+  </view>
+</view>

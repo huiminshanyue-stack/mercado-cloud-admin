@@ -8,7 +8,7 @@ Page({
       try {
         const me = await request<any>({ path:'/api/miniprogram/v1/me' });
         if (me.bound) {
-          wx.reLaunch({ url:'/pages/orders/index' });
+          wx.reLaunch({ url:'/pages/home/index' });
           return;
         }
       } catch (_) { app.clearSession(); }
@@ -27,7 +27,7 @@ Page({
       const login = await new Promise<WechatMiniprogram.LoginSuccessCallbackResult>((resolve,reject) => wx.login({ success:resolve,fail:reject }));
       const result = await request<any>({ path:'/api/miniprogram/v1/auth/wechat-login',method:'POST',data:{ code:login.code },authenticated:false });
       getApp<IAppOption>().setSession(result.token,result.user || null);
-      wx.reLaunch({ url:result.bound ? '/pages/orders/index' : '/pages/bind/index' });
+      wx.reLaunch({ url:result.bound ? '/pages/home/index' : '/pages/bind/index' });
     } catch (error) { showError(error); }
     finally { this.setData({ loading:false }); }
   },
@@ -39,7 +39,7 @@ Page({
       const result = await request<any>({ path:'/api/auth/login',method:'POST',data:{ username:this.data.username,password:this.data.password },authenticated:false });
       getApp<IAppOption>().setSession(result.token,result.user);
       await request<any>({ path:'/api/miniprogram/v1/me' });
-      wx.reLaunch({ url:'/pages/orders/index' });
+      wx.reLaunch({ url:'/pages/home/index' });
     } catch (error) { showError(error); }
     finally { this.setData({ loading:false }); }
   }

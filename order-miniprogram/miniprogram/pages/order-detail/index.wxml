@@ -36,6 +36,7 @@
       <view class="row strong"><text>应回款</text><text class="success">{{order.payoutText}}</text></view>
       <view class="finance-hint">{{order.payoutHint}}，不使用销售额估算。</view>
       <view class="row"><text>商品成本</text><text>CNY {{order.costText}}</text></view>
+      <button class="cost-button" bindtap="openCost">查看或修改订单成本</button>
     </view>
 
     <view wx:if="{{order.dimensionsAvailable}}" class="card section">
@@ -52,6 +53,6 @@
       <view class="row"><text>Shipment ID</text><text user-select="true">{{order.shippingId || '-'}}</text></view>
       <view class="row"><text>24小时上网</text><text>{{order.onlineText}}</text></view>
     </view>
-    <view class="readonly">当前为只读内测版，回复消息、修改成本和提交代贴单将在确认权限后逐项开放。</view>
+    <view class="readonly">成本保存、售前咨询和售后回复已与服务器同步；代贴单等高风险操作仍未在小程序开放。</view>
   </block>
 </view>

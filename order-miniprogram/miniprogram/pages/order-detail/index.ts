@@ -2,14 +2,21 @@ import { request,showError } from '../../utils/request';
 import { cancellationText,countryInfo,deadlineText,dimensionSummary,formatDate,money,onlineDeadlineText,orderState,reputationReasonText } from '../../utils/format';
 
 Page({
-  data:{ loading:true,order:null as any },
+  data:{ loading:true,order:null as any,displayOrderId:'',loadedOnce:false },
   async onLoad(options:Record<string,string>) {
     if (!options.id) {
       wx.navigateBack();
       return;
     }
+    this.setData({ displayOrderId:options.id });
+    await this.loadOrder();
+    this.setData({ loadedOnce:true });
+  },
+  onShow() { if (this.data.loadedOnce) this.loadOrder(); },
+  async loadOrder() {
+    this.setData({ loading:true });
     try {
-      const raw = await request<any>({ path:`/api/miniprogram/v1/orders/${encodeURIComponent(options.id)}` });
+      const raw = await request<any>({ path:`/api/miniprogram/v1/orders/${encodeURIComponent(this.data.displayOrderId)}` });
       const country = countryInfo(raw.country);
       const products=(raw.items || []).map((product:any) => {
         const item=product.item || {};
@@ -39,5 +46,8 @@ Page({
     const images=(this.data.order?.products || []).map((item:any)=>item.image).filter(Boolean);
     const current=this.data.order?.products?.[Number(event.currentTarget.dataset.index || 0)]?.image;
     if (current) wx.previewImage({ current,urls:images });
+  },
+  openCost() {
+    wx.navigateTo({ url:`/pages/cost/index?id=${encodeURIComponent(this.data.order.displayOrderId)}` });
   }
 });

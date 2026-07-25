@@ -45,7 +45,15 @@ function registerMiniProgramRoutes(app, dependencies) {
     isUserExpired,
     loginRateLimit,
     getOrderListData,
-    getOrderStoresData
+    getOrderStoresData,
+    updateOrderCostData,
+    getOrderInquiriesData,
+    getOrderAfterSalesData,
+    getOrderMessagesData,
+    sendOrderMessageData,
+    getOrderClaimMessagesData,
+    sendOrderClaimMessageData,
+    translateOrderTextData
   } = dependencies;
   const appId = process.env.WECHAT_MINIPROGRAM_APPID || DEFAULT_APP_ID;
   const appSecret = process.env.WECHAT_MINIPROGRAM_SECRET || '';
@@ -116,7 +124,8 @@ function registerMiniProgramRoutes(app, dependencies) {
       appId,
       wechatLoginEnabled: Boolean(appSecret),
       erpTestLoginEnabled: true,
-      writeOperationsEnabled: false,
+      writeOperationsEnabled: true,
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply'],
       environment: process.env.NODE_ENV || 'production'
     } });
   });
@@ -178,7 +187,8 @@ function registerMiniProgramRoutes(app, dependencies) {
       bound: req.miniAuth.bound,
       authSource: req.miniAuth.source,
       user: req.authUser || null,
-      writeOperationsEnabled: false
+      writeOperationsEnabled: true,
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply']
     } });
   });
 
@@ -205,6 +215,57 @@ function registerMiniProgramRoutes(app, dependencies) {
       if (!data.items.length) return res.status(404).json({ code: 404, message: '订单不存在或无权查看' });
       res.json({ code: 0, data: data.items[0] });
     } catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单详情失败' }); }
+  });
+
+  app.get('/api/miniprogram/v1/home-summary',requireBoundOrderUser,async (req,res) => {
+    try {
+      const [orders,alerts] = await Promise.all([
+        pool.query(`SELECT COUNT(DISTINCT COALESCE(NULLIF(pack_id,''),ml_order_id))::int AS count FROM ml_orders WHERE owner_username=$1 AND hidden_at IS NULL`,[req.authUser.username]),
+        pool.query(`SELECT alert_type,COUNT(*)::int AS count FROM order_alerts WHERE owner_username=$1 AND is_read=FALSE AND alert_type IN ('buyer_inquiry','after_sales') GROUP BY alert_type`,[req.authUser.username])
+      ]);
+      const counts=Object.fromEntries(alerts.rows.map(row=>[row.alert_type,Number(row.count || 0)]));
+      res.json({ code:0,data:{ orderCount:Number(orders.rows[0]?.count || 0),inquiryCount:counts.buyer_inquiry || 0,afterSalesCount:counts.after_sales || 0 } });
+    } catch (error) { res.status(500).json({ code:500,message:error.message || '读取主页数据失败' }); }
+  });
+
+  app.patch('/api/miniprogram/v1/orders/:orderId/cost',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await updateOrderCostData(req.authUser,req.params.orderId,req.body || {}) }); }
+    catch (error) { const status=error.status || 500; res.status(status).json({ code:status,message:error.message || '保存订单成本失败' }); }
+  });
+
+  app.get('/api/miniprogram/v1/inquiries',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await getOrderInquiriesData(req.authUser,req.query || {}) }); }
+    catch (error) { const status=error.status || error.response?.status || 502; res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '读取售前咨询失败' }); }
+  });
+
+  app.get('/api/miniprogram/v1/inquiries/:orderId/messages',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await getOrderMessagesData(req.authUser,req.params.orderId) }); }
+    catch (error) { const status=error.status || error.response?.status || 502; res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '读取订单咨询失败' }); }
+  });
+
+  app.post('/api/miniprogram/v1/inquiries/:orderId/messages',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await sendOrderMessageData(req.authUser,req.params.orderId,req.body || {}) }); }
+    catch (error) { const status=error.status || error.response?.status || 502; res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '发送订单咨询回复失败' }); }
+  });
+
+  app.get('/api/miniprogram/v1/after-sales',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await getOrderAfterSalesData(req.authUser,req.query || {}) }); }
+    catch (error) { const status=error.status || error.response?.status || 502; res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '读取售后消息失败' }); }
+  });
+
+  app.get('/api/miniprogram/v1/after-sales/:claimId/messages',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await getOrderClaimMessagesData(req.authUser,req.params.claimId,req.query.storeId || '') }); }
+    catch (error) { const status=error.status || error.response?.status || 502; res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '读取售后会话失败' }); }
+  });
+
+  app.post('/api/miniprogram/v1/after-sales/:claimId/messages',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await sendOrderClaimMessageData(req.authUser,req.params.claimId,req.body || {}) }); }
+    catch (error) { const status=error.status || error.response?.status || 502; res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '发送售后回复失败' }); }
+  });
+
+  app.post('/api/miniprogram/v1/translate',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await translateOrderTextData(req.body || {}) }); }
+    catch (error) { const status=error.status || 502; res.status(status).json({ code:status,message:error.message || '翻译服务暂不可用' }); }
   });
 }
 

@@ -11,7 +11,7 @@ Page({
       const result = await request<any>({ path:'/api/miniprogram/v1/auth/bind',method:'POST',data:{ username:this.data.username,password:this.data.password } });
       const app = getApp<IAppOption>();
       app.setSession(app.globalData.token,result.user);
-      wx.reLaunch({ url:'/pages/orders/index' });
+      wx.reLaunch({ url:'/pages/home/index' });
     } catch (error) { showError(error); }
     finally { this.setData({ loading:false }); }
   }

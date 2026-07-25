@@ -19,7 +19,7 @@ function normalize(order:any) {
     productTitle:item.title || '商品信息待获取',productImage:item.picture_url || item.thumbnail || '',
     quantity:product.quantity || 1,sku:item.seller_sku || item.sku || '-',
     grossText:money(order.grossAmountUsd ?? order.paidAmount,'USD'),
-    payoutText:money(order.netAmountUsd,'USD')
+    payoutText:money(order.netAmountUsd,'USD'),costText:Number(order.productCost || 0).toFixed(2)
   };
 }
 
@@ -27,7 +27,7 @@ Page({
   data:{
     loading:false,page:1,size:20,total:0,hasMore:true,orders:[] as any[],stores:[] as any[],
     storeNames:['全部店铺'],storeIndex:0,statusNames:statusOptions.map(i=>i.name),statusIndex:0,
-    orderId:'',userName:'内测账号'
+    orderId:'',userName:'内测账号',loadedOnce:false
   },
   async onLoad() {
     const app = getApp<IAppOption>();
@@ -38,7 +38,9 @@ Page({
     this.setData({ userName:app.globalData.user?.nickname || app.globalData.user?.username || '内测账号' });
     await this.loadStores();
     await this.loadOrders(true);
+    this.setData({ loadedOnce:true });
   },
+  onShow() { if (this.data.loadedOnce) this.loadOrders(true); },
   async onPullDownRefresh() { await this.loadOrders(true); wx.stopPullDownRefresh(); },
   async onReachBottom() { if (this.data.hasMore && !this.data.loading) await this.loadOrders(false); },
   onOrderId(event:WechatMiniprogram.Input) { this.setData({ orderId:event.detail.value.trim() }); },
@@ -75,6 +77,9 @@ Page({
   },
   openOrder(event:WechatMiniprogram.TouchEvent) {
     wx.navigateTo({ url:`/pages/order-detail/index?id=${encodeURIComponent(event.currentTarget.dataset.id)}` });
+  },
+  openCost(event:WechatMiniprogram.TouchEvent) {
+    wx.navigateTo({ url:`/pages/cost/index?id=${encodeURIComponent(event.currentTarget.dataset.id)}` });
   },
   logout() {
     const app = getApp<IAppOption>();

@@ -1,0 +1,14 @@
+<view class="page">
+  <view wx:if="{{loading}}" class="empty">正在读取已保存成本…</view>
+  <block wx:else>
+    <view class="card product"><image class="image" mode="aspectFit" src="{{productImage}}" /><view class="main"><view class="title">{{productTitle}}</view><view class="muted">订单号：{{displayOrderId}}</view></view></view>
+    <view class="card form-card">
+      <view class="label">人民币成本（CNY）</view>
+      <input class="cost-input" type="text" value="{{cost}}" placeholder="支持正数、0和负数" bindinput="onCost" />
+      <view class="hint">负数成本会按你填写的真实数值保存；利润仍按“官方应回款 × 汇率－成本”计算。</view>
+      <view class="label note-label">成本备注</view>
+      <textarea class="note" maxlength="500" value="{{note}}" placeholder="例如采购价、包装费等说明" bindinput="onNote" />
+      <button class="primary-button save" loading="{{saving}}" bindtap="saveCost">保存并同步服务器</button>
+    </view>
+  </block>
+</view>

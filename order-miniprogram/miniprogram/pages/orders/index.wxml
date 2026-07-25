@@ -38,6 +38,7 @@
     <view class="money-row">
       <view><text class="label">商品金额</text><text class="amount">{{item.grossText}}</text></view>
       <view><text class="label">应回款</text><text class="amount payout">{{item.payoutText}}</text></view>
+      <view class="cost-column"><text class="label">成本 CNY {{item.costText}}</text><button class="cost-action" size="mini" data-id="{{item.displayOrderId}}" catchtap="openCost">填写成本</button></view>
     </view>
   </view>
   <view wx:if="{{loading && orders.length}}" class="loading-more">加载中…</view>
