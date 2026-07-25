@@ -277,6 +277,16 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_updated_at TIMESTAMPTZ');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS is_marked BOOLEAN NOT NULL DEFAULT FALSE');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ');
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_shipping_labels (
+    owner_username VARCHAR(120) NOT NULL,
+    shipment_id VARCHAR(80) NOT NULL,
+    order_id VARCHAR(80) NOT NULL,
+    store_user_id VARCHAR(80),
+    pdf_data BYTEA NOT NULL,
+    pdf_sha256 VARCHAR(64) NOT NULL,
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(owner_username,shipment_id)
+  )`);
   await pool.query(`CREATE TABLE IF NOT EXISTS ml_store_authorizations (
     id BIGSERIAL PRIMARY KEY,
     owner_username VARCHAR(120) NOT NULL,
@@ -2791,7 +2801,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.20',
+    version: '2026-07-25.21',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2827,6 +2837,9 @@ app.get('/api/health/order-management', (req, res) => {
     scheduledOrderSyncBeijing: '12:00,00:00',
     localOrderMarkAndSoftDelete: true,
     dimensionDetailsOnDemand: true,
+    cachedOfficialShippingLabels: true,
+    proactiveReadyToShipLabelCapture: true,
+    officialLogisticsTimeline: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3323,6 +3336,7 @@ async function syncOrdersForUser(authUser, body = {}) {
       }
       imported++;
     }
+    queueReadyToShipLabelCapture(req.authUser,String(me.id || sellerId),accessToken,sourceOrders);
     return { imported, available: response.data?.paging?.total || imported, sellerId, storeId: sellerId,
       account: { id: me.id, nickname: me.nickname || '', siteId: me.site_id || '', countryId: me.country_id || '',
         listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } };
@@ -5006,6 +5020,126 @@ function decodeOfficialLabelError(error) {
   return { status, message, auditData };
 }
 
+function officialLabelRequests(shipmentId) {
+  return [
+    { url: `https://api.mercadolibre.com/marketplace/shipments/${encodeURIComponent(shipmentId)}/labels`, params: undefined },
+    { url: 'https://api.mercadolibre.com/marketplace/shipment_labels', params: { shipment_ids: shipmentId, response_type: 'pdf' } },
+    { url: 'https://api.mercadolibre.com/shipment_labels', params: { shipment_ids: shipmentId, response_type: 'pdf' } }
+  ];
+}
+
+async function saveOfficialShippingLabel(ownerUsername,shipmentId,orderId,storeUserId,pdf) {
+  const hash = crypto.createHash('sha256').update(pdf).digest('hex');
+  await pool.query(`INSERT INTO order_shipping_labels(owner_username,shipment_id,order_id,store_user_id,pdf_data,pdf_sha256,fetched_at)
+    VALUES($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT(owner_username,shipment_id) DO UPDATE SET
+    order_id=EXCLUDED.order_id,store_user_id=EXCLUDED.store_user_id,pdf_data=EXCLUDED.pdf_data,
+    pdf_sha256=EXCLUDED.pdf_sha256,fetched_at=NOW()`,
+    [ownerUsername,String(shipmentId),String(orderId),String(storeUserId || ''),pdf,hash]);
+  return hash;
+}
+
+async function fetchOfficialLabelPdf(accessToken,shipmentId) {
+  let lastError;
+  for (const request of officialLabelRequests(shipmentId)) {
+    try {
+      const response = await axios.get(request.url, {
+        params: request.params,
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/pdf' },
+        responseType: 'arraybuffer', timeout: 30000
+      });
+      const pdf = Buffer.from(response.data || []);
+      if (pdf.subarray(0,5).toString('ascii') === '%PDF-') return { pdf, response };
+      lastError = Object.assign(new Error('美客多未返回有效的 PDF 面单'), { response: { status: 502, data: pdf } });
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error('美客多暂未生成该订单面单');
+}
+
+function queueReadyToShipLabelCapture(authUser,storeUserId,accessToken,orders) {
+  const eligible = (orders || []).filter(order => {
+    const shipment = order._shipment_detail || {};
+    const shipmentId = order.shipping?.id || shipment.id;
+    const status = String(shipment.status || order.shipping?.status || '').toLowerCase();
+    return shipmentId && ['ready_to_ship','handling','pending'].includes(status) && order.status !== 'cancelled';
+  }).slice(0,50);
+  if (!eligible.length) return;
+  setImmediate(async () => {
+    for (const order of eligible) {
+      const shipmentId = String(order.shipping?.id || order._shipment_detail?.id || '');
+      try {
+        const cached = await pool.query('SELECT 1 FROM order_shipping_labels WHERE owner_username=$1 AND shipment_id=$2',[authUser.username,shipmentId]);
+        if (cached.rowCount) continue;
+        const { pdf } = await fetchOfficialLabelPdf(accessToken,shipmentId);
+        await saveOfficialShippingLabel(authUser.username,shipmentId,String(order.id),storeUserId,pdf);
+        await saveOrderApiAudit(authUser.username,storeUserId,String(order.id),'shipment_label_cache',shipmentId,{ success: true, size: pdf.length });
+      } catch (error) {
+        await saveOrderApiAudit(authUser.username,storeUserId,String(order.id),'shipment_label_cache',shipmentId,
+          { success: false, officialError: decodeOfficialLabelError(error).auditData }).catch(() => {});
+      }
+    }
+  });
+}
+
+app.get('/api/admin/orders/:orderId/logistics', requireOrderAccess, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT ml_order_id,pack_id,shipping_id,store_user_id,shipment_data
+      FROM ml_orders WHERE owner_username=$1 AND (ml_order_id=$2 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$2)
+      ORDER BY date_created`,[req.authUser.username,String(req.params.orderId)]);
+    if (!rows.length) return res.status(404).json({ code: 404, message: '订单不存在或无权查看物流' });
+    const requestedShipmentId = String(req.query.shipmentId || '').trim();
+    const target = rows.find(row => String(row.shipping_id || '') === requestedShipmentId) || rows.find(row => row.shipping_id);
+    if (!target?.shipping_id) return res.status(404).json({ code: 404, message: '该订单暂无国际运单' });
+    const context = await getOrderStoreContext(req.authUser,target.store_user_id);
+    if (!context) return res.status(403).json({ code: 403, message: '该订单所属店铺授权已失效' });
+    const shipmentId = String(target.shipping_id);
+    let shipment = target.shipment_data || {}, tracking = {};
+    for (const path of [`marketplace/shipments/${shipmentId}`,`shipments/${shipmentId}`]) {
+      try {
+        const response = await axios.get(`https://api.mercadolibre.com/${path}`, {
+          headers: { Authorization: `Bearer ${context.token}`, 'x-format-new': 'true' }, timeout: 20000
+        });
+        shipment = response.data || shipment;
+        break;
+      } catch (error) { if (![403,404].includes(error.response?.status)) throw error; }
+    }
+    for (const path of [`marketplace/shipments/${shipmentId}/tracking`,`shipments/${shipmentId}/tracking`]) {
+      try {
+        const response = await axios.get(`https://api.mercadolibre.com/${path}`, {
+          headers: { Authorization: `Bearer ${context.token}` }, timeout: 15000
+        });
+        tracking = response.data || {};
+        break;
+      } catch (_) { /* 部分跨境站点不开放独立轨迹端点，仍使用 shipment.status_history */ }
+    }
+    const statusLabels = { ready_to_ship:'待发货',handling:'处理中',shipped:'运输中',delivered:'已送达',not_delivered:'未送达',cancelled:'已取消',pending:'待处理' };
+    const events = [];
+    const appendEvent = (status,date,description,location='') => {
+      if (!date) return;
+      events.push({ status: String(status || ''), statusText: statusLabels[String(status || '').toLowerCase()] || String(description || status || '物流更新'), description: String(description || ''), location: String(location || ''), date });
+    };
+    const history = shipment.status_history || {};
+    for (const [key,value] of Object.entries(history)) appendEvent(key.replace(/^date_/,''),value,'');
+    const trackingEvents = Array.isArray(tracking) ? tracking : (tracking.events || tracking.history || tracking.tracking_history || tracking.results || []);
+    for (const event of Array.isArray(trackingEvents) ? trackingEvents : []) appendEvent(event.status || event.type,event.date || event.datetime || event.created_at || event.timestamp,event.description || event.detail || event.message,event.location?.name || event.location || '');
+    events.sort((left,right) => new Date(right.date).getTime() - new Date(left.date).getTime());
+    const uniqueEvents = [...new Map(events.map(event => [`${event.status}:${event.date}:${event.description}`,event])).values()];
+    await saveOrderApiAudit(req.authUser.username,target.store_user_id,target.ml_order_id,'shipment_tracking',shipmentId,{ shipment, tracking });
+    res.json({ code: 0, data: {
+      orderId: target.pack_id || target.ml_order_id, shipmentId,
+      trackingNumber: shipment.tracking_number || tracking.tracking_number || '',
+      trackingMethod: shipment.tracking_method || shipment.shipping_option?.name || '',
+      logisticType: shipment.logistic?.type || shipment.logistic_type || '',
+      status: shipment.status || '', statusText: statusLabels[String(shipment.status || '').toLowerCase()] || shipment.status || '待获取',
+      substatus: shipment.substatus || '', lastUpdated: shipment.last_updated || shipment.date_last_updated || null,
+      estimatedDelivery: shipment.shipping_option?.estimated_delivery_time?.date || shipment.lead_time?.estimated_delivery_time?.date || null,
+      events: uniqueEvents
+    } });
+  } catch (error) {
+    const status = error.response?.status || 502;
+    res.status(status).json({ code: status, message: error.response?.data?.message || error.message || '物流轨迹获取失败' });
+  }
+});
+
 app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res) => {
   let audit = { storeUserId: '', shipmentIds: [] };
   try {
@@ -5018,6 +5152,18 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
       ? requestedShipmentId : shipmentIds[0];
     const targetRow = rows.find(row => String(row.shipping_id || '') === targetShipmentId) || rows[0];
     audit = { storeUserId: targetRow.store_user_id, shipmentIds, targetShipmentId };
+    const cachedLabel = await pool.query(`SELECT pdf_data,fetched_at FROM order_shipping_labels
+      WHERE owner_username=$1 AND shipment_id=$2 LIMIT 1`,[req.authUser.username,targetShipmentId]);
+    if (cachedLabel.rows[0]?.pdf_data) {
+      const pdf = Buffer.from(cachedLabel.rows[0].pdf_data);
+      res.setHeader('Content-Type', 'application/pdf');
+      const safeOrderId = String(req.params.orderId).replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,80) || 'order';
+      res.setHeader('Content-Disposition', `attachment; filename="mercado-label-${safeOrderId}.pdf"`);
+      res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+      res.setHeader('X-Label-Source', 'official-cache');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      return res.send(pdf);
+    }
     const authorizations = await listOrderStoreAuthorizations(req.authUser);
     const orderedAuthorizations = [...authorizations].sort((left,right) => {
       const expected = String(targetRow.store_user_id || '');
@@ -5045,11 +5191,7 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
     let pdfResponse;
     let successfulContext;
     const officialErrors = [];
-    const labelRequests = [
-      { url: `https://api.mercadolibre.com/marketplace/shipments/${encodeURIComponent(targetShipmentId)}/labels`, params: undefined },
-      { url: 'https://api.mercadolibre.com/marketplace/shipment_labels', params: { shipment_ids: targetShipmentId, response_type: 'pdf' } },
-      { url: 'https://api.mercadolibre.com/shipment_labels', params: { shipment_ids: targetShipmentId, response_type: 'pdf' } }
-    ];
+    const labelRequests = officialLabelRequests(targetShipmentId);
     for (const context of contexts) {
       for (const request of labelRequests) {
         try {
@@ -5092,6 +5234,7 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
       await pool.query('UPDATE ml_orders SET store_user_id=$1,updated_at=NOW() WHERE owner_username=$2 AND shipping_id=$3',
         [successfulContext.sellerId,req.authUser.username,targetShipmentId]);
     }
+    await saveOfficialShippingLabel(req.authUser.username,targetShipmentId,req.params.orderId,successfulContext.sellerId,pdf);
     await saveOrderApiAudit(req.authUser.username,audit.storeUserId,req.params.orderId,'shipment_label',req.params.orderId,
       { success: true, shipmentIds, targetShipmentId, callerId: successfulContext.callerId, attemptedStoreUserIds: audit.attemptedStoreUserIds, contentType: pdfResponse.headers?.['content-type'] || 'application/pdf', size: pdf.length });
     res.setHeader('Content-Type', 'application/pdf');
