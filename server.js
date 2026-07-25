@@ -2791,7 +2791,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.19',
+    version: '2026-07-25.20',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2826,6 +2826,7 @@ app.get('/api/health/order-management', (req, res) => {
     singleOrderStatusSync: true,
     scheduledOrderSyncBeijing: '12:00,00:00',
     localOrderMarkAndSoftDelete: true,
+    dimensionDetailsOnDemand: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
