@@ -7,7 +7,8 @@
     "start": "node server.js",
     "dev": "node server.js",
     "test:order-payout": "node scripts/test-order-payout.js",
-    "test:order-alerts": "node scripts/test-order-alert-policy.js"
+    "test:order-alerts": "node scripts/test-order-alert-policy.js",
+    "test:order-sync": "node scripts/test-order-sync-policy.js"
   },
   "dependencies": {
     "axios": "^1.18.1",

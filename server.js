@@ -6,6 +6,7 @@ const path = require('path');
 const { Pool } = require('pg');
 const { resolveOfficialOrderPayout } = require('./order-payout');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert } = require('./order-alert-policy');
+const { orderSyncPageDecision } = require('./order-sync-policy');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -2842,7 +2843,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.26',
+    version: '2026-07-25.27',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2891,6 +2892,8 @@ app.get('/api/health/order-management', (req, res) => {
     terminalOrderAlertCleanup: true,
     recentActiveOrderAlertsOnly: true,
     singlePlayVoiceAlerts: true,
+    fullDateRangeOrderPagination: true,
+    syncInsertedAndUpdatedCounts: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3114,15 +3117,46 @@ async function syncOrdersForUser(authUser, body = {}) {
       directOrderIds = [...new Set(directRows.rows.map(row => String(row.ml_order_id)).filter(Boolean))];
       if (!directOrderIds.length) directOrderIds = [requestedOrderId];
     }
-    let response, sourceOrders;
+    const fullRangeSync = !requestedOrderId && Boolean(dateFrom || dateTo);
+    const maxSearchOffset = 10000;
+    let response, sourceOrders, pagesFetched = 0, syncTruncated = false;
+    const fetchSearchPages = async fetchPage => {
+      const collected = [];
+      let currentOffset = offset;
+      let officialTotal = null;
+      while (true) {
+        const pageResponse = await fetchPage(currentOffset);
+        if (!response) response = pageResponse;
+        pagesFetched++;
+        const pageResults = Array.isArray(pageResponse.data?.results) ? pageResponse.data.results : [];
+        collected.push(...pageResults);
+        const pagingTotal = Number(pageResponse.data?.paging?.total);
+        if (Number.isFinite(pagingTotal)) officialTotal = pagingTotal;
+        currentOffset += limit;
+        const decision = orderSyncPageDecision({
+          fullRangeSync,
+          pageResultCount: pageResults.length,
+          pageSize: limit,
+          nextOffset: currentOffset,
+          officialTotal,
+          maxOffset: maxSearchOffset
+        });
+        if (!decision.continue) {
+          syncTruncated ||= decision.truncated;
+          break;
+        }
+      }
+      return collected;
+    };
     if (me.site_id === 'CBT') {
       if (directOrderIds.length) response = { data: { paging: { total: directOrderIds.length }, results: [] } };
-      else response = await axios.get('https://api.mercadolibre.com/marketplace/orders/search', {
-        params: { sort: 'date_desc', limit, offset, ...dateParams }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
-      });
-      const orderIds = directOrderIds.length ? directOrderIds : [...new Set((response.data?.results || []).flatMap(pack =>
+      const searchResults = directOrderIds.length ? [] : await fetchSearchPages(currentOffset =>
+        axios.get('https://api.mercadolibre.com/marketplace/orders/search', {
+          params: { sort: 'date_desc', limit, offset: currentOffset, ...dateParams }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+        }));
+      const orderIds = directOrderIds.length ? directOrderIds : [...new Set(searchResults.flatMap(pack =>
         (pack.orders || []).map(order => order.id).filter(Boolean)
-      ))].slice(0, limit);
+      ))];
       sourceOrders = [];
       for (let i = 0; i < orderIds.length; i += 5) {
         const batch = await Promise.all(orderIds.slice(i, i + 5).map(id =>
@@ -3160,11 +3194,10 @@ async function syncOrdersForUser(authUser, body = {}) {
           sourceOrders.push(...batch.filter(Boolean));
         }
       } else {
-        response = await axios.get('https://api.mercadolibre.com/orders/search', {
-          params: { seller: sellerId, sort: 'date_desc', limit, offset, ...dateParams },
+        sourceOrders = await fetchSearchPages(currentOffset => axios.get('https://api.mercadolibre.com/orders/search', {
+          params: { seller: sellerId, sort: 'date_desc', limit, offset: currentOffset, ...dateParams },
           headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
-        });
-        sourceOrders = response.data?.results || [];
+        }));
       }
     }
     const itemIds = [...new Set(sourceOrders.flatMap(order =>
@@ -3256,6 +3289,7 @@ async function syncOrdersForUser(authUser, body = {}) {
       }));
     }
     let imported = 0;
+    const insertedDisplayOrderIds = new Set(), updatedDisplayOrderIds = new Set();
     for (const order of sourceOrders) {
       const shipment = order._shipment_detail || {};
       const orderItems = (order.order_items || []).map(entry => {
@@ -3329,6 +3363,9 @@ async function syncOrdersForUser(authUser, body = {}) {
       const refundAmountUsd = usdRate === null ? null : Number((Number(refundAmount || 0) * usdRate).toFixed(2));
       const finalNetAmountUsd = finalNetAmount === null || usdRate === null ? null : Number((Number(finalNetAmount) * usdRate).toFixed(2));
       const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
+      const displayOrderId = String(order.pack_id || order.id);
+      if (previous.rows.length) updatedDisplayOrderIds.add(displayOrderId);
+      else insertedDisplayOrderIds.add(displayOrderId);
       await pool.query(`
         INSERT INTO ml_orders
           (ml_order_id,status,date_created,date_closed,buyer_id,buyer_nickname,currency,total_amount,paid_amount,shipping_id,items,raw_data,
@@ -3416,9 +3453,12 @@ async function syncOrdersForUser(authUser, body = {}) {
       }
       imported++;
     }
+    for (const id of insertedDisplayOrderIds) updatedDisplayOrderIds.delete(id);
     queueReadyToShipLabelCapture(req.authUser,String(me.id || sellerId),accessToken,sourceOrders);
     queuePendingOfficialPayoutBackfill(req.authUser,String(me.id || sellerId),accessToken);
-    return { imported, available: response.data?.paging?.total || imported, sellerId, storeId: sellerId,
+    const matched = new Set(sourceOrders.map(order => String(order.pack_id || order.id))).size;
+    return { imported, matched, available: matched, inserted: insertedDisplayOrderIds.size,
+      updated: updatedDisplayOrderIds.size, pagesFetched, truncated: syncTruncated, sellerId, storeId: sellerId,
       account: { id: me.id, nickname: me.nickname || '', siteId: me.site_id || '', countryId: me.country_id || '',
         listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } };
   } catch (e) {
