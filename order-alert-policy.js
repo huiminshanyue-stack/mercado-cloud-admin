@@ -1,6 +1,6 @@
 'use strict';
 
-const NEW_ORDER_ALERT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const ONLINE_GRACE_PERIOD_MS = 24 * 60 * 60 * 1000;
 const FULFILLMENT_FINISHED_ORDER_STATUSES = new Set(['cancelled', 'refunded']);
 const FULFILLMENT_FINISHED_SHIPMENT_STATUSES = new Set(['shipped', 'delivered', 'cancelled']);
 
@@ -10,16 +10,29 @@ function isFulfillmentFinished({ orderStatus, shipmentStatus, refundAmount = 0 }
     || FULFILLMENT_FINISHED_SHIPMENT_STATUSES.has(String(shipmentStatus || '').toLowerCase());
 }
 
-function shouldCreateNewOrderAlert({ existed, orderStatus, shipmentStatus, refundAmount, dateCreated, now = Date.now() }) {
-  if (existed || isFulfillmentFinished({ orderStatus, shipmentStatus, refundAmount })) return false;
+function isWithinOrderAlertWindow({ dateCreated, handlingDeadline, now = Date.now() }) {
   const createdAt = new Date(dateCreated || 0).getTime();
-  if (!Number.isFinite(createdAt) || createdAt <= 0) return false;
-  const age = now - createdAt;
-  return age >= 0 && age <= NEW_ORDER_ALERT_MAX_AGE_MS;
+  const deadlineAt = new Date(handlingDeadline || 0).getTime();
+  if (!Number.isFinite(createdAt) || createdAt <= 0 || !Number.isFinite(deadlineAt) || deadlineAt <= 0) return false;
+  return now >= createdAt && now <= deadlineAt + ONLINE_GRACE_PERIOD_MS;
+}
+
+function shouldCreateNewOrderAlert({ existed, orderStatus, shipmentStatus, refundAmount, dateCreated, handlingDeadline, now = Date.now() }) {
+  if (existed || isFulfillmentFinished({ orderStatus, shipmentStatus, refundAmount })) return false;
+  return isWithinOrderAlertWindow({ dateCreated, handlingDeadline, now });
+}
+
+function shouldCreateCancellationAlert({ existed, previousStatus, orderStatus, shipmentStatus, dateCreated, handlingDeadline, now = Date.now() }) {
+  if (!existed || String(previousStatus || '').toLowerCase() === 'cancelled') return false;
+  if (String(orderStatus || '').toLowerCase() !== 'cancelled') return false;
+  if (['shipped','delivered'].includes(String(shipmentStatus || '').toLowerCase())) return false;
+  return isWithinOrderAlertWindow({ dateCreated, handlingDeadline, now });
 }
 
 module.exports = {
-  NEW_ORDER_ALERT_MAX_AGE_MS,
+  ONLINE_GRACE_PERIOD_MS,
   isFulfillmentFinished,
-  shouldCreateNewOrderAlert
+  isWithinOrderAlertWindow,
+  shouldCreateNewOrderAlert,
+  shouldCreateCancellationAlert
 };
