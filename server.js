@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const path = require('path');
 const { Pool } = require('pg');
+const { resolveOfficialOrderPayout } = require('./order-payout');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -399,6 +400,18 @@ async function initOrderManagementTables() {
       WHERE alert_type='deadline' AND event_key LIKE 'deadline:%'`);
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_deadline_rule_version',$1,NOW())
       ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [deadlineRuleVersion]);
+  }
+  // Repair the regression that treated gross sales as payout when a commission
+  // debit and its cancellation credit cancelled each other out. This migration is
+  // intentionally limited to orders cancelled before dispatch.
+  const payoutRepairVersion = '2026-07-25-cancelled-before-dispatch-v1';
+  const payoutRepairSetting = await pool.query("SELECT value FROM settings WHERE key='order_payout_repair_version'");
+  if (payoutRepairSetting.rows[0]?.value !== payoutRepairVersion) {
+    await pool.query(`UPDATE ml_orders SET net_amount=0,net_amount_usd=0,updated_at=NOW()
+      WHERE LOWER(COALESCE(status,''))='cancelled'
+        AND LOWER(COALESCE(shipment_status,'')) NOT IN ('shipped','delivered')`);
+    await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_payout_repair_version',$1,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [payoutRepairVersion]);
   }
   await pool.query(`UPDATE erp_connectors SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
   await pool.query(`UPDATE fulfillment_services SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
@@ -2615,8 +2628,9 @@ async function aggregatePackedOrders(rows) {
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
-    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, grossAmountUsd: 0, netAmountUsd: 0, refundAmountUsd: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _hasGrossAmountUsd: false, _hasNetAmountUsd: false, _hasRefundAmountUsd: false, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialLedgerDelta: 0, _hasOfficialLedger: false, _shippingBuyerPaid: 0, _shippingSellerCharge: 0, _shippingAdjustmentEvidence: false, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
+    if (!groups.has(groupId)) groups.set(groupId, { ...row, displayOrderId: groupId, internalOrderIds: [], shipmentIds: [], items: [], paidAmount: 0, totalAmount: 0, grossAmountUsd: 0, netAmountUsd: 0, refundAmountUsd: 0, saleFee: 0, shippingFee: 0, otherFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0, refundAmount: 0, productCost: 0, financeIsOfficial: false, billingBreakdown: [], _fallbackNetAmount: 0, _hasFallbackNetAmount: false, _hasGrossAmountUsd: false, _hasNetAmountUsd: false, _hasRefundAmountUsd: false, _rowCount: 0, _netAmountCount: 0, _netAmountUsdCount: 0, _billingEntryIds: new Set(), _officialEntryCount: 0, _officialLedgerDelta: 0, _hasOfficialLedger: false, _shippingBuyerPaid: 0, _shippingSellerCharge: 0, _shippingAdjustmentEvidence: false, _officialFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 }, _officialSignedFees: { saleFee: 0, shippingFee: 0, paymentFee: 0, transferFee: 0, cancellationFee: 0, taxFee: 0, adjustmentFee: 0, bonusAmount: 0 } });
     const group = groups.get(groupId);
+    group._rowCount++;
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
     group.items.push(...(Array.isArray(row.items) ? row.items : []));
@@ -2643,7 +2657,9 @@ async function aggregatePackedOrders(rows) {
     if (row.netAmount !== null && row.netAmount !== undefined) {
       group._fallbackNetAmount += Number(row.netAmount || 0);
       group._hasFallbackNetAmount = true;
+      group._netAmountCount++;
     }
+    if (row.netAmountUsd !== null && row.netAmountUsd !== undefined) group._netAmountUsdCount++;
     group.financeIsOfficial ||= Boolean(row.financeIsOfficial);
     const parsed = parseOrderBilling(row.billingData, Number(row.paidAmount || 0));
     if (parsed?.hasOfficialLedger) group._hasOfficialLedger = true;
@@ -2700,31 +2716,14 @@ async function aggregatePackedOrders(rows) {
     }
     for (const field of ['saleFee','shippingFee','paymentFee','transferFee','cancellationFee','taxFee','adjustmentFee','bonusAmount']) group[field] = Number(group[field].toFixed(2));
     if (group._officialEntryCount) group.otherFee = group.cancellationFee;
-    group.netAmount = group._hasFallbackNetAmount ? Number(group._fallbackNetAmount.toFixed(2)) : null;
+    group.netAmount = group._hasFallbackNetAmount && group._netAmountCount === group._rowCount ? Number(group._fallbackNetAmount.toFixed(2)) : null;
     group.grossAmountUsd = group._hasGrossAmountUsd ? Number(group.grossAmountUsd.toFixed(2)) : null;
-    group.netAmountUsd = group._hasNetAmountUsd ? Number(group.netAmountUsd.toFixed(2)) : null;
+    group.netAmountUsd = group._hasNetAmountUsd && group._netAmountUsdCount === group._rowCount ? Number(group.netAmountUsd.toFixed(2)) : null;
     group.refundAmountUsd = group._hasRefundAmountUsd ? Number(group.refundAmountUsd.toFixed(2)) : null;
-    if (group._hasOfficialLedger && !group.billingCurrencyMismatch) {
-      const payoutLocal = Number((Number(group.paidAmount || 0) - Number(group.refundAmount || 0) + group._officialLedgerDelta).toFixed(2));
-      const payoutFxRate = await getBillingFxRate(group.currency, 'USD');
-      if (payoutFxRate === null) group.billingCurrencyMismatch = true;
-      else {
-        group.netAmount = payoutLocal;
-        group.netAmountUsd = Number((payoutLocal * payoutFxRate).toFixed(2));
-        group.payoutSource = 'official_billing_ledger';
-        group.payoutCalculation = {
-          paidAmount: Number(group.paidAmount || 0),
-          refundAmount: Number(group.refundAmount || 0),
-          officialLedgerDelta: Number(group._officialLedgerDelta.toFixed(2)),
-          currency: group.currency,
-          usdRate: payoutFxRate
-        };
-      }
-    }
     group.payoutIsOfficial = group.netAmountUsd !== null;
-    if (!group.payoutSource && group.payoutIsOfficial) group.payoutSource = 'official_net_amount';
+    if (group.payoutIsOfficial) group.payoutSource = 'cached_official_order_payout';
     group.dimensionsChanged = dimensionSnapshotsDiffer(group.dimensionsOriginal,group.dimensionsLatest);
-    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialLedgerDelta; delete group._hasOfficialLedger; delete group._shippingBuyerPaid; delete group._shippingSellerCharge; delete group._shippingAdjustmentEvidence; delete group._officialFees; delete group._officialSignedFees;
+    delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._rowCount; delete group._netAmountCount; delete group._netAmountUsdCount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialLedgerDelta; delete group._hasOfficialLedger; delete group._shippingBuyerPaid; delete group._shippingSellerCharge; delete group._shippingAdjustmentEvidence; delete group._officialFees; delete group._officialSignedFees;
   }
   return [...groups.values()];
 }
@@ -2801,7 +2800,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.22',
+    version: '2026-07-25.23',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2843,6 +2842,9 @@ app.get('/api/health/order-management', (req, res) => {
     preserveCachedOfficialPayout: true,
     backgroundOfficialPayoutBackfill: true,
     officialLargeProductImages: true,
+    reversalSafeOfficialPayout: true,
+    cachedPayoutAggregationOnly: true,
+    cancelledBeforeDispatchPayoutRepair: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3262,13 +3264,19 @@ async function syncOrdersForUser(authUser, body = {}) {
       const finalSaleFee = officialFinance ? officialFinance.saleFee : saleFee;
       const finalShippingFee = officialFinance ? officialFinance.shippingFee : shippingFee;
       const otherFee = officialFinance ? officialFinance.otherFee : null;
-      // 应回款只接受官方明确返回的净额；不能用销售额减费用伪造，也不能因取消直接强制归零。
+      // 应回款优先采用官方明确净额；取消未发货和全额退款为 0，其他冲销场景不按销售额猜测。
       const paymentOfficialNet = netParts.length ? netParts.reduce((sum, value) => sum + Number(value || 0), 0) : null;
-      const hasReversal = order.status === 'cancelled' || Number(refundAmount || 0) > 0;
-      const officialLedgerNet = officialFinance?.hasOfficialLedger
-        ? Number((grossAmount - Number(refundAmount || 0) + Number(officialFinance.ledgerDelta || 0)).toFixed(2))
-        : null;
-      const finalNetAmount = officialFinance?.netAmount ?? officialLedgerNet ?? (hasReversal ? null : paymentOfficialNet) ?? null;
+      const payoutResolution = resolveOfficialOrderPayout({
+        orderStatus: order.status,
+        shipmentStatus: shipment.status,
+        grossAmount,
+        refundAmount,
+        explicitOfficialNet: officialFinance?.netAmount,
+        hasOfficialLedger: officialFinance?.hasOfficialLedger,
+        officialLedgerDelta: officialFinance?.ledgerDelta,
+        paymentOfficialNet
+      });
+      const finalNetAmount = payoutResolution.amount;
       const orderCurrency = String(order.currency_id || '').toUpperCase();
       const usdRate = await getBillingFxRate(orderCurrency, 'USD');
       const grossAmountUsd = usdRate === null ? null : Number((grossAmount * usdRate).toFixed(2));
@@ -3293,14 +3301,20 @@ async function syncOrdersForUser(authUser, body = {}) {
           store_user_id=EXCLUDED.store_user_id,
           sale_fee=CASE WHEN EXCLUDED.finance_is_official OR NOT ml_orders.finance_is_official THEN EXCLUDED.sale_fee ELSE ml_orders.sale_fee END,
           shipping_fee=CASE WHEN EXCLUDED.finance_is_official OR NOT ml_orders.finance_is_official THEN EXCLUDED.shipping_fee ELSE ml_orders.shipping_fee END,
-          net_amount=COALESCE(EXCLUDED.net_amount,ml_orders.net_amount),refund_amount=EXCLUDED.refund_amount,
+          net_amount=CASE
+            WHEN LOWER(COALESCE(EXCLUDED.status,''))='cancelled' OR EXCLUDED.refund_amount>0 THEN EXCLUDED.net_amount
+            ELSE COALESCE(EXCLUDED.net_amount,ml_orders.net_amount)
+          END,refund_amount=EXCLUDED.refund_amount,
           other_fee=CASE WHEN EXCLUDED.finance_is_official OR NOT ml_orders.finance_is_official THEN EXCLUDED.other_fee ELSE ml_orders.other_fee END,
           billing_data=CASE WHEN EXCLUDED.finance_is_official THEN EXCLUDED.billing_data ELSE ml_orders.billing_data END,
           finance_is_official=(ml_orders.finance_is_official OR EXCLUDED.finance_is_official),
           finance_synced_at=CASE WHEN EXCLUDED.finance_is_official THEN EXCLUDED.finance_synced_at ELSE ml_orders.finance_synced_at END,
           owner_username=EXCLUDED.owner_username,
           gross_amount_usd=COALESCE(EXCLUDED.gross_amount_usd,ml_orders.gross_amount_usd),
-          net_amount_usd=COALESCE(EXCLUDED.net_amount_usd,ml_orders.net_amount_usd),
+          net_amount_usd=CASE
+            WHEN LOWER(COALESCE(EXCLUDED.status,''))='cancelled' OR EXCLUDED.refund_amount>0 THEN EXCLUDED.net_amount_usd
+            ELSE COALESCE(EXCLUDED.net_amount_usd,ml_orders.net_amount_usd)
+          END,
           refund_amount_usd=EXCLUDED.refund_amount_usd,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
@@ -5097,8 +5111,14 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
   payoutBackfillRunning.add(key);
   setImmediate(async () => {
     try {
-      const pending = await pool.query(`SELECT ml_order_id,paid_amount,refund_amount,currency,raw_data
-        FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND net_amount_usd IS NULL
+      const pending = await pool.query(`SELECT ml_order_id,status,shipment_status,paid_amount,refund_amount,currency,raw_data
+        FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND (
+          net_amount_usd IS NULL OR (
+            LOWER(COALESCE(status,''))='cancelled'
+            AND LOWER(COALESCE(shipment_status,'')) NOT IN ('shipped','delivered')
+            AND net_amount_usd<>0
+          )
+        )
         ORDER BY date_created DESC LIMIT 200`,[authUser.username,String(storeUserId)]);
       const groups = new Map();
       for (const order of pending.rows) {
@@ -5121,11 +5141,22 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
               const grossAmount = Number(order.paid_amount || 0), refundAmount = Number(order.refund_amount || 0);
               const officialFinance = parseOrderBilling(detail,grossAmount);
               if (!officialFinance?.hasOfficialLedger) continue;
-              const netAmount = officialFinance.netAmount ?? Number((grossAmount - refundAmount + Number(officialFinance.ledgerDelta || 0)).toFixed(2));
+              const payoutResolution = resolveOfficialOrderPayout({
+                orderStatus: order.status,
+                shipmentStatus: order.shipment_status,
+                grossAmount,
+                refundAmount,
+                explicitOfficialNet: officialFinance.netAmount,
+                hasOfficialLedger: officialFinance.hasOfficialLedger,
+                officialLedgerDelta: officialFinance.ledgerDelta,
+                paymentOfficialNet: null
+              });
+              const netAmount = payoutResolution.amount;
+              if (netAmount === null) continue;
               const usdRate = await getBillingFxRate(String(order.currency || '').toUpperCase(),'USD');
               const netAmountUsd = usdRate === null ? null : Number((netAmount * usdRate).toFixed(2));
               await pool.query(`UPDATE ml_orders SET sale_fee=$1,shipping_fee=$2,other_fee=$3,net_amount=$4,
-                net_amount_usd=COALESCE($5,net_amount_usd),billing_data=$6::jsonb,finance_is_official=TRUE,
+                net_amount_usd=$5,billing_data=$6::jsonb,finance_is_official=TRUE,
                 finance_synced_at=NOW(),updated_at=NOW() WHERE owner_username=$7 AND ml_order_id=$8`,
                 [officialFinance.saleFee,officialFinance.shippingFee,officialFinance.otherFee,netAmount,netAmountUsd,JSON.stringify(detail),authUser.username,String(order.ml_order_id)]);
               await saveOrderApiAudit(authUser.username,storeUserId,String(order.ml_order_id),'billing_backfill',String(order.ml_order_id),detail);
