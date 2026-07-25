@@ -86,7 +86,8 @@ async function testRoutes() {
       claimSendCalls.push({ user,claimId,body });
       return { id:'claim-message-1' };
     },
-    translateOrderTextData:async body=>({ text:body.text })
+    translateOrderTextData:async body=>({ text:body.text }),
+    getOrderRealtimeStateData:async user=>({ version:3,lastTopic:'orders_v2',lastOrderId:'order-1',owner:user.username })
   });
 
   const configRes=responseRecorder();
@@ -131,6 +132,12 @@ async function testRoutes() {
     headers:{ authorization:'Bearer cntoro-token' }
   },homeRes);
   assert.deepEqual(homeRes.body.data,{ orderCount:7,inquiryCount:2,afterSalesCount:1 });
+
+  const realtimeRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/realtime-state'),{
+    headers:{ authorization:'Bearer cntoro-token' }
+  },realtimeRes);
+  assert.deepEqual(realtimeRes.body.data,{ version:3,lastTopic:'orders_v2',lastOrderId:'order-1',owner:'CNTORO' });
 
   const inquirySendRes=responseRecorder();
   await runHandlers(routes.get('POST /api/miniprogram/v1/inquiries/:orderId/messages'),{

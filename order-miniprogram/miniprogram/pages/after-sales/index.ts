@@ -1,5 +1,8 @@
 import { request,showError } from '../../utils/request';
 import { countryInfo,formatDate,reputationReasonText } from '../../utils/format';
+import { createRealtimeWatcher } from '../../utils/realtime';
+
+const realtimeWatcher=createRealtimeWatcher();
 
 function normalize(claim:any,storeNames:Map<string,string>) {
   const order=claim.order || {},item=order.items?.[0]?.item || {},country=countryInfo(order.country),storeId=String(claim.storeId || order.storeId || '');
@@ -8,7 +11,12 @@ function normalize(claim:any,storeNames:Map<string,string>) {
 
 Page({
   data:{ loading:false,claims:[] as any[],errors:[] as string[] },
-  onShow() { this.loadData(); },
+  onShow() {
+    this.loadData();
+    realtimeWatcher.start(state=>{ if (state.lastTopic === 'claims') return this.loadData(); });
+  },
+  onHide() { realtimeWatcher.stop(); },
+  onUnload() { realtimeWatcher.stop(); },
   async onPullDownRefresh() { await this.loadData(); wx.stopPullDownRefresh(); },
   async loadData() {
     if (this.data.loading) return;

@@ -1,5 +1,8 @@
 import { request,showError } from '../../utils/request';
 import { countryInfo,formatDate,money,orderState } from '../../utils/format';
+import { createRealtimeWatcher } from '../../utils/realtime';
+
+const realtimeWatcher=createRealtimeWatcher();
 
 const statusOptions = [
   { name:'全部状态',value:'' },{ name:'待发货',value:'ready_to_ship' },{ name:'运输中',value:'shipped' },
@@ -40,7 +43,14 @@ Page({
     await this.loadOrders(true);
     this.setData({ loadedOnce:true });
   },
-  onShow() { if (this.data.loadedOnce) this.loadOrders(true); },
+  onShow() {
+    if (this.data.loadedOnce) this.loadOrders(true);
+    realtimeWatcher.start(state=>{
+      if (state.lastTopic === 'orders_v2' || state.lastTopic === 'shipments') return this.loadOrders(true);
+    });
+  },
+  onHide() { realtimeWatcher.stop(); },
+  onUnload() { realtimeWatcher.stop(); },
   async onPullDownRefresh() { await this.loadOrders(true); wx.stopPullDownRefresh(); },
   async onReachBottom() { if (this.data.hasMore && !this.data.loading) await this.loadOrders(false); },
   onOrderId(event:WechatMiniprogram.Input) { this.setData({ orderId:event.detail.value.trim() }); },

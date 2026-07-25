@@ -1,4 +1,7 @@
 import { request,showError } from '../../utils/request';
+import { createRealtimeWatcher } from '../../utils/realtime';
+
+const realtimeWatcher=createRealtimeWatcher();
 
 Page({
   data:{ userName:'内测账号',loading:false,summary:{ orderCount:0,inquiryCount:0,afterSalesCount:0 } },
@@ -7,7 +10,10 @@ Page({
     if (!app.globalData.token) { wx.reLaunch({ url:'/pages/login/index' }); return; }
     this.setData({ userName:app.globalData.user?.nickname || app.globalData.user?.username || '内测账号' });
     this.loadSummary();
+    realtimeWatcher.start(()=>this.loadSummary());
   },
+  onHide() { realtimeWatcher.stop(); },
+  onUnload() { realtimeWatcher.stop(); },
   async onPullDownRefresh() { await this.loadSummary(); wx.stopPullDownRefresh(); },
   async loadSummary() {
     if (this.data.loading) return;

@@ -53,7 +53,8 @@ function registerMiniProgramRoutes(app, dependencies) {
     sendOrderMessageData,
     getOrderClaimMessagesData,
     sendOrderClaimMessageData,
-    translateOrderTextData
+    translateOrderTextData,
+    getOrderRealtimeStateData
   } = dependencies;
   const appId = process.env.WECHAT_MINIPROGRAM_APPID || DEFAULT_APP_ID;
   const appSecret = process.env.WECHAT_MINIPROGRAM_SECRET || '';
@@ -207,6 +208,11 @@ function registerMiniProgramRoutes(app, dependencies) {
   app.get('/api/miniprogram/v1/orders',requireBoundOrderUser,async (req,res) => {
     try { res.json({ code: 0, data: await getOrderListData(req.authUser,req.query || {}) }); }
     catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单失败' }); }
+  });
+
+  app.get('/api/miniprogram/v1/realtime-state',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await getOrderRealtimeStateData(req.authUser) }); }
+    catch (error) { res.status(500).json({ code:500,message:error.message || 'Failed to read realtime order state' }); }
   });
 
   app.get('/api/miniprogram/v1/orders/:orderId',requireBoundOrderUser,async (req,res) => {

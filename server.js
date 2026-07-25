@@ -8,6 +8,7 @@ const { resolveOfficialOrderPayout } = require('./order-payout');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
+const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -2851,7 +2852,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.31',
+    version: '2026-07-25.32',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2912,6 +2913,9 @@ app.get('/api/health/order-management', (req, res) => {
     miniProgramInquiryReply: true,
     miniProgramAfterSalesReply: true,
     officialClaimSearchUsesCurrentStoreIdentity: true,
+    mercadoLibreWebhookTopics: ['orders_v2','shipments','messages','claims'],
+    persistentWebhookQueue: true,
+    realtimeOrderStatePolling: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3106,10 +3110,10 @@ async function syncOrdersForUser(authUser, body = {}) {
     const requestedStoreId = String(req.body?.storeId || '').trim();
     const requestedOrderId = String(req.body?.orderId || '').trim();
     const authorizations = await listOrderStoreAuthorizations(req.authUser, requestedStoreId);
-    if (!authorizations.length) return res.status(401).json({ code: 401, message: '当前账号尚未授权可同步的美客多店铺' });
+    if (!authorizations.length) { const error=new Error('当前账号尚未授权可同步的美客多店铺'); error.status=401; throw error; }
     const selectedAuthorization = authorizations[0];
     const accessToken = await getStoreAuthorizationToken(selectedAuthorization);
-    if (!accessToken) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权' });
+    if (!accessToken) { const error=new Error('店铺授权已失效，请重新授权'); error.status=401; throw error; }
     const sellerId = String(selectedAuthorization.ml_user_id);
     const [accountResponse, listingsResponse] = await Promise.all([
       axios.get('https://api.mercadolibre.com/users/me', { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }),
@@ -5810,6 +5814,152 @@ app.get('/api/health', async (req, res) => {
 // ========== 订单定时同步（北京时间 00:00 / 12:00） ==========
 let scheduledOrderSyncTimer = null;
 let scheduledOrderSyncRunning = false;
+let mercadoLibreWebhookService = null;
+
+async function resolveMercadoLibreWebhookTargets(notificationUserId) {
+  const userId = String(notificationUserId || '').trim();
+  if (!userId) return [];
+  const { rows } = await pool.query(`SELECT DISTINCT a.owner_username,a.ml_user_id,u.role
+    FROM ml_store_authorizations a
+    LEFT JOIN users u ON LOWER(u.username)=LOWER(a.owner_username)
+    WHERE a.enabled=TRUE AND (
+      a.ml_user_id=$1 OR EXISTS (
+        SELECT 1 FROM ml_orders o
+        WHERE o.owner_username=a.owner_username AND o.store_user_id=a.ml_user_id
+          AND COALESCE(NULLIF(o.raw_data->'seller'->>'id',''),o.store_user_id)=$1
+      )
+    )`,[userId]);
+  return rows.map(row => ({
+    ownerUsername: row.owner_username,
+    storeUserId: String(row.ml_user_id),
+    role: row.role || 'user'
+  }));
+}
+
+async function findOrderIdsForShipment(target,shipmentId) {
+  const authUser={ username:target.ownerUsername,role:target.role };
+  const local = await pool.query(`SELECT DISTINCT ml_order_id FROM ml_orders
+    WHERE owner_username=$1 AND store_user_id=$2 AND shipping_id=$3`,
+  [authUser.username,target.storeUserId,String(shipmentId)]);
+  const orderIds=local.rows.map(row=>String(row.ml_order_id || '')).filter(Boolean);
+  if (orderIds.length) return orderIds;
+
+  const context=await getOrderStoreContext(authUser,target.storeUserId);
+  if (!context) throw Object.assign(new Error('Store authorization is unavailable for shipment synchronization'),{ status:401 });
+  let shipment=null,lastError=null;
+  for (const path of [`marketplace/shipments/${encodeURIComponent(shipmentId)}`,`shipments/${encodeURIComponent(shipmentId)}`]) {
+    try {
+      const response=await axios.get(`https://api.mercadolibre.com/${path}`,{
+        headers:{ Authorization:`Bearer ${context.token}`,'x-format-new':'true' },timeout:20000
+      });
+      shipment=response.data || {};
+      break;
+    } catch (error) {
+      lastError=error;
+      if (![403,404].includes(error.response?.status)) break;
+    }
+  }
+  if (!shipment) throw lastError || new Error('Official shipment resource is unavailable');
+  await saveOrderApiAudit(authUser.username,target.storeUserId,'','shipment',String(shipmentId),shipment);
+  return [...new Set([
+    shipment.order_id,shipment.order?.id,
+    ...(Array.isArray(shipment.orders) ? shipment.orders.map(order=>order?.id) : [])
+  ].map(value=>String(value || '')).filter(Boolean))];
+}
+
+function webhookOrderReferences(payload) {
+  const references=[
+    payload?.pack_id,payload?.packId,payload?.order_id,payload?.orderId,
+    payload?.resource_id,payload?.resource?.id,
+    typeof payload?.resource === 'string' ? payload.resource.split('/').pop() : ''
+  ];
+  for (const resource of payload?.message_resources || payload?.resources || []) {
+    references.push(resource?.id,resource?.resource_id,resource?.name?.split('/')?.pop());
+  }
+  return [...new Set(references.map(value=>String(value || '').trim()).filter(value=>/^\d{8,}$/.test(value)))];
+}
+
+async function fetchWebhookResource(target,event) {
+  const authUser={ username:target.ownerUsername,role:target.role || 'user' };
+  const context=await getOrderStoreContext(authUser,target.storeUserId);
+  if (!context) throw Object.assign(new Error('Store authorization is unavailable for notification processing'),{ status:401 });
+  const resourcePath=String(event.resource || '').startsWith('/') ? String(event.resource) : `/${event.resource}`;
+  const response=await axios.get(`https://api.mercadolibre.com${resourcePath}`,{
+    headers:{ Authorization:`Bearer ${context.token}` },timeout:20000
+  });
+  return response.data || {};
+}
+
+async function processMercadoLibreWebhookEvent(event,target) {
+  const authUser={ username:target.ownerUsername,role:target.role || 'user' };
+  if (event.topic === 'orders_v2') {
+    if (!event.resourceId) throw new Error('Order notification does not include an order id');
+    const result=await syncOrdersForUser(authUser,{
+      storeId:target.storeUserId,orderId:event.resourceId,limit:1,automatic:true
+    });
+    await touchOrderRealtimeState(pool,authUser.username,event.topic,event.resourceId);
+    return { storeId:target.storeUserId,orderId:event.resourceId,imported:result.imported || 0 };
+  }
+
+  if (event.topic === 'shipments') {
+    if (!event.resourceId) throw new Error('Shipment notification does not include a shipment id');
+    const orderIds=await findOrderIdsForShipment(target,event.resourceId);
+    if (!orderIds.length) {
+      // A shipment can arrive before the order event. Pull only the newest page as a bounded recovery.
+      const result=await syncOrdersForUser(authUser,{ storeId:target.storeUserId,limit:10,automatic:true });
+      await touchOrderRealtimeState(pool,authUser.username,event.topic,'');
+      return { storeId:target.storeUserId,shipmentId:event.resourceId,recovered:result.imported || 0 };
+    }
+    let imported=0;
+    for (const orderId of orderIds) {
+      const result=await syncOrdersForUser(authUser,{ storeId:target.storeUserId,orderId,limit:1,automatic:true });
+      imported+=Number(result.imported || 0);
+    }
+    await touchOrderRealtimeState(pool,authUser.username,event.topic,orderIds[0] || '');
+    return { storeId:target.storeUserId,shipmentId:event.resourceId,orderIds,imported };
+  }
+
+  if (event.topic === 'messages') {
+    const message=await fetchWebhookResource(target,event);
+    const refs=webhookOrderReferences(message);
+    const linked=refs.length ? await pool.query(`SELECT ml_order_id,COALESCE(NULLIF(pack_id,''),ml_order_id) AS display_id
+      FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2
+        AND (ml_order_id=ANY($3::varchar[]) OR pack_id=ANY($3::varchar[]))
+      ORDER BY date_created DESC LIMIT 1`,[authUser.username,target.storeUserId,refs]) : { rows:[] };
+    const orderId=String(linked.rows[0]?.ml_order_id || '');
+    await saveOrderApiAudit(authUser.username,target.storeUserId,orderId,'message_notification',String(event.resourceId || event.id),message);
+    if (orderId) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
+      VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
+    [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的买家咨询`,`inquiry:webhook:${event.id}`]);
+    await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
+    return { storeId:target.storeUserId,orderId,stored:true };
+  }
+
+  if (event.topic === 'claims') {
+    const claim=await fetchWebhookResource(target,event);
+    const reference=String(claimOrderReference(claim) || '');
+    const linked=reference ? await pool.query(`SELECT ml_order_id,COALESCE(NULLIF(pack_id,''),ml_order_id) AS display_id
+      FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND (ml_order_id=$3 OR pack_id=$3)
+      ORDER BY date_created DESC LIMIT 1`,[authUser.username,target.storeUserId,reference]) : { rows:[] };
+    const orderId=String(linked.rows[0]?.ml_order_id || '');
+    await saveOrderApiAudit(authUser.username,target.storeUserId,orderId,'claim_notification',String(event.resourceId || event.id),claim);
+    if (orderId) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
+      VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
+    [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的售后申诉`,`claim:webhook:${event.id}`]);
+    await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
+    return { storeId:target.storeUserId,orderId,stored:true };
+  }
+  return { ignored:true };
+}
+
+async function getOrderRealtimeStateData(authUser) {
+  return getOrderRealtimeState(pool,authUser.username);
+}
+
+app.get('/api/admin/orders/realtime-state',requireOrderAccess,async (req,res) => {
+  try { res.json({ code:0,data:await getOrderRealtimeStateData(req.authUser) }); }
+  catch (error) { res.status(500).json({ code:500,message:error.message || 'Failed to read realtime order state' }); }
+});
 
 function nextBeijingOrderSyncAt(nowMs = Date.now()) {
   const beijingNow = new Date(nowMs + 8 * 3600000);
@@ -5866,9 +6016,17 @@ async function start() {
   await initInternationalProductTable();
   await initOrderManagementTables();
   await initMiniProgramTables(pool);
+  mercadoLibreWebhookService=createMercadoLibreWebhookService({
+    pool,
+    expectedApplicationId:ML_CLIENT_ID,
+    resolveTargets:resolveMercadoLibreWebhookTargets,
+    processEvent:processMercadoLibreWebhookEvent
+  });
+  await mercadoLibreWebhookService.init();
+  mercadoLibreWebhookService.registerRoutes(app);
   registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
-    getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData });
+    getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,getOrderRealtimeStateData });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');
@@ -5877,10 +6035,12 @@ async function start() {
     console.log(`  管理页面: http://localhost:${PORT}/`);
     console.log('============================================');
   });
+  mercadoLibreWebhookService.start();
   scheduleNextOrderSync();
   const shutdown = signal => {
     console.log(`[Server] ${signal} received, closing gracefully`);
     if (scheduledOrderSyncTimer) clearTimeout(scheduledOrderSyncTimer);
+    mercadoLibreWebhookService?.stop();
     server.close(async () => {
       try { await pool?.end(); } catch (error) { console.error('[DB] close error:', error.message); }
       process.exit(0);
