@@ -20,5 +20,8 @@
   <view class="menu-card after-menu" bindtap="openAfterSales">
     <view class="icon">售</view><view class="menu-main"><view class="menu-title">售后消息</view><view class="menu-desc">处理申诉和售后线程，不受退款状态限制</view></view><view class="badge red" wx:if="{{summary.afterSalesCount}}">{{summary.afterSalesCount}}</view><view class="arrow">›</view>
   </view>
+  <view class="menu-card notification-menu" bindtap="openNotifications">
+    <view class="icon">醒</view><view class="menu-main"><view class="menu-title">公众号消息提醒</view><view class="menu-desc">关注“山月跨境”，设置新订单、取消、退款及消息提醒</view></view><view class="arrow">›</view>
+  </view>
   <view class="security">所有数据均按当前 ERP 账号的授权店铺隔离</view>
 </view>

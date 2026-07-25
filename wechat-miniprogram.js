@@ -54,7 +54,10 @@ function registerMiniProgramRoutes(app, dependencies) {
     getOrderClaimMessagesData,
     sendOrderClaimMessageData,
     translateOrderTextData,
-    getOrderRealtimeStateData
+    getOrderRealtimeStateData,
+    getOfficialNotificationPreferences,
+    updateOfficialNotificationPreferences,
+    getOfficialAccountBindingStatus
   } = dependencies;
   const appId = process.env.WECHAT_MINIPROGRAM_APPID || DEFAULT_APP_ID;
   const appSecret = process.env.WECHAT_MINIPROGRAM_SECRET || '';
@@ -147,7 +150,11 @@ function registerMiniProgramRoutes(app, dependencies) {
       const identity = await pool.query(`INSERT INTO wechat_miniprogram_identities(app_id,open_id,union_id,updated_at)
         VALUES($1,$2,$3,NOW()) ON CONFLICT(app_id,open_id) DO UPDATE SET
         union_id=COALESCE(EXCLUDED.union_id,wechat_miniprogram_identities.union_id),updated_at=NOW()
-        RETURNING id,erp_username`,[appId,String(data.openid),data.unionid ? String(data.unionid) : null]);
+        RETURNING id,erp_username,union_id`,[appId,String(data.openid),data.unionid ? String(data.unionid) : null]);
+      if (identity.rows[0].erp_username && identity.rows[0].union_id) {
+        await pool.query(`UPDATE wechat_official_followers SET erp_username=$1,updated_at=NOW()
+          WHERE union_id=$2 AND subscribed=TRUE`,[identity.rows[0].erp_username,identity.rows[0].union_id]);
+      }
       const rawToken = crypto.randomBytes(32).toString('hex');
       await pool.query(`INSERT INTO wechat_miniprogram_sessions(token_hash,identity_id,expires_at)
         VALUES($1,$2,NOW()+($3::int*INTERVAL '1 day'))`,[tokenHash(rawToken),identity.rows[0].id,MINI_SESSION_DAYS]);
@@ -179,7 +186,10 @@ function registerMiniProgramRoutes(app, dependencies) {
     if (!user || !bcrypt.compareSync(password,user.password)) return res.status(401).json({ code: 401, message: 'ERP账号或密码错误' });
     if (!canTestOrders(user)) return res.status(403).json({ code: 403, message: '当前仅允许管理员及CNTORO内测账号绑定' });
     if (isUserExpired(user)) return res.status(403).json({ code: 403, message: 'ERP账号已到期，请联系管理员' });
-    await pool.query('UPDATE wechat_miniprogram_identities SET erp_username=$1,updated_at=NOW() WHERE id=$2',[user.username,req.miniAuth.identityId]);
+    const identity=await pool.query(`UPDATE wechat_miniprogram_identities SET erp_username=$1,updated_at=NOW()
+      WHERE id=$2 RETURNING union_id`,[user.username,req.miniAuth.identityId]);
+    if (identity.rows[0]?.union_id) await pool.query(`UPDATE wechat_official_followers SET erp_username=$1,updated_at=NOW()
+      WHERE union_id=$2 AND subscribed=TRUE`,[user.username,identity.rows[0].union_id]);
     res.json({ code: 0, data: { bound: true,user: { username:user.username,nickname:user.nickname,role:user.role,validUntil:user.validuntil || null } } });
   });
 
@@ -191,6 +201,21 @@ function registerMiniProgramRoutes(app, dependencies) {
       writeOperationsEnabled: true,
       allowedWrites: ['order_cost','inquiry_reply','after_sales_reply']
     } });
+  });
+
+  app.get('/api/miniprogram/v1/notification-preferences',requireBoundOrderUser,async (req,res) => {
+    try {
+      const [preferences,binding]=await Promise.all([
+        getOfficialNotificationPreferences(req.authUser.username),
+        getOfficialAccountBindingStatus(req.authUser.username)
+      ]);
+      res.json({ code:0,data:{ preferences,binding } });
+    } catch (error) { res.status(500).json({ code:500,message:error.message || '读取公众号提醒设置失败' }); }
+  });
+
+  app.put('/api/miniprogram/v1/notification-preferences',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await updateOfficialNotificationPreferences(req.authUser.username,req.body || {}) }); }
+    catch (error) { res.status(500).json({ code:500,message:error.message || '保存公众号提醒设置失败' }); }
   });
 
   app.post('/api/miniprogram/v1/auth/logout',requireMiniAuth,async (req,res) => {

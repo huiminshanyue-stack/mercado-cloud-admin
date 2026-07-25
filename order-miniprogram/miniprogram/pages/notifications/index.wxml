@@ -1,0 +1,30 @@
+<view class="page notification-page">
+  <view class="binding-card card {{binding.bound > 0 ? 'bound' : ''}}">
+    <view class="binding-head">
+      <view>
+        <view class="account-name">山月跨境</view>
+        <view class="account-type">微信认证服务号</view>
+      </view>
+      <view class="binding-state">{{binding.bound > 0 ? '已绑定' : '待绑定'}}</view>
+    </view>
+    <view wx:if="{{binding.bound > 0}}" class="binding-message">当前微信已与 ERP 账号匹配，公众号可按下方设置接收提醒。</view>
+    <view wx:else class="binding-message">请先关注公众号“山月跨境”，再重新进入小程序。公众号和小程序需绑定在同一微信开放平台后，系统会通过 UnionID 自动匹配，不需要填写订单账号。</view>
+    <button class="refresh-button" size="mini" loading="{{loading}}" bindtap="loadSettings">刷新绑定状态</button>
+  </view>
+
+  <view class="section-title">提醒设置</view>
+  <view class="settings card">
+    <view class="setting-row main-setting">
+      <view><view class="setting-title">公众号提醒总开关</view><view class="setting-desc">关闭后不再发送以下业务提醒</view></view>
+      <switch checked="{{preferences.enabled}}" data-key="enabled" bindchange="onSwitch" color="#16a66a" />
+    </view>
+    <view class="divider"></view>
+    <view class="setting-row"><view><view class="setting-title">新订单</view><view class="setting-desc">新订单同步到服务器后提醒</view></view><switch checked="{{preferences.newOrder}}" data-key="newOrder" bindchange="onSwitch" color="#1677ff" /></view>
+    <view class="setting-row"><view><view class="setting-title">订单取消</view><view class="setting-desc">订单状态确认取消时提醒</view></view><switch checked="{{preferences.cancelled}}" data-key="cancelled" bindchange="onSwitch" color="#1677ff" /></view>
+    <view class="setting-row"><view><view class="setting-title">即将延误</view><view class="setting-desc">仅待发货订单进入截止前 24 小时时提醒</view></view><switch checked="{{preferences.deadline}}" data-key="deadline" bindchange="onSwitch" color="#1677ff" /></view>
+    <view class="setting-row"><view><view class="setting-title">订单退款</view><view class="setting-desc">官方退款金额增加时提醒</view></view><switch checked="{{preferences.refund}}" data-key="refund" bindchange="onSwitch" color="#1677ff" /></view>
+    <view class="setting-row"><view><view class="setting-title">订单咨询</view><view class="setting-desc">收到新的买家售前咨询时提醒</view></view><switch checked="{{preferences.buyerInquiry}}" data-key="buyerInquiry" bindchange="onSwitch" color="#1677ff" /></view>
+    <view class="setting-row"><view><view class="setting-title">售后消息</view><view class="setting-desc">收到申诉或售后待回复消息时提醒</view></view><switch checked="{{preferences.afterSales}}" data-key="afterSales" bindchange="onSwitch" color="#1677ff" /></view>
+  </view>
+  <view class="privacy-note">提醒只发送给当前 ERP 账号匹配的公众号关注者，不会跨用户或跨店铺发送。微信可能依据平台规则限制发送频率。</view>
+</view>

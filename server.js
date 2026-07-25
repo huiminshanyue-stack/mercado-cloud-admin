@@ -9,6 +9,7 @@ const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellati
 const { orderSyncPageDecision } = require('./order-sync-policy');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
+const { createOfficialAccountService } = require('./wechat-official-account');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -2852,7 +2853,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.34',
+    version: '2026-07-25.35',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2916,6 +2917,9 @@ app.get('/api/health/order-management', (req, res) => {
     mercadoLibreWebhookTopics: ['orders_v2','shipments','messages','claims'],
     persistentWebhookQueue: true,
     realtimeOrderStatePolling: true,
+    wechatOfficialAccountNotifications: ['new_order','cancelled','deadline','refund','buyer_inquiry','after_sales'],
+    wechatOfficialAccountUnionIdBinding: true,
+    wechatOfficialAccountPersistentOutbox: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3384,7 +3388,7 @@ async function syncOrdersForUser(authUser, body = {}) {
       const grossAmountUsd = usdRate === null ? null : Number((grossAmount * usdRate).toFixed(2));
       const refundAmountUsd = usdRate === null ? null : Number((Number(refundAmount || 0) * usdRate).toFixed(2));
       const finalNetAmountUsd = finalNetAmount === null || usdRate === null ? null : Number((Number(finalNetAmount) * usdRate).toFixed(2));
-      const previous = await pool.query('SELECT status,shipment_status FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
+      const previous = await pool.query('SELECT status,shipment_status,refund_amount FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
       const displayOrderId = String(order.pack_id || order.id);
       if (previous.rows.length) updatedDisplayOrderIds.add(displayOrderId);
       else insertedDisplayOrderIds.add(displayOrderId);
@@ -3475,6 +3479,13 @@ async function syncOrdersForUser(authUser, body = {}) {
         dateCreated: order.date_created,
         handlingDeadline
       })) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'cancelled','订单已取消',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'}订单已被取消`, `cancelled:${order.id}`]);
+      if (old && Number(refundAmount || 0)>Number(old.refund_amount || 0)+0.000001) {
+        await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
+          VALUES($1,$2,'refund','订单发生退款',$3,$4) ON CONFLICT(event_key) DO NOTHING`,[
+          req.authUser.username,String(order.id),`${country || '未知站点'} · ${order.currency_id || ''} ${Number(refundAmount || 0).toFixed(2)}`,
+          `refund:${order.id}:${Number(refundAmount || 0).toFixed(2)}`
+        ]);
+      }
       const deadlineFinished = fulfillmentFinished;
       if (deadlineFinished) await pool.query(`UPDATE order_alerts SET is_read=TRUE
         WHERE owner_username=$1 AND order_id=$2 AND alert_type IN ('new_order','deadline')`, [req.authUser.username,String(order.id)]);
@@ -5815,6 +5826,7 @@ app.get('/api/health', async (req, res) => {
 let scheduledOrderSyncTimer = null;
 let scheduledOrderSyncRunning = false;
 let mercadoLibreWebhookService = null;
+let officialAccountService = null;
 
 async function resolveMercadoLibreWebhookTargets(notificationUserId) {
   const userId = String(notificationUserId || '').trim();
@@ -5930,7 +5942,8 @@ async function processMercadoLibreWebhookEvent(event,target) {
     await saveOrderApiAudit(authUser.username,target.storeUserId,orderId,'message_notification',String(event.resourceId || event.id),message);
     if (orderId) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
       VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
-    [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的买家咨询`,`inquiry:webhook:${event.id}`]);
+    [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的买家咨询`,
+      `inquiry:${target.storeUserId}:${event.resourceId || event.id}`]);
     await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
     return { storeId:target.storeUserId,orderId,stored:true };
   }
@@ -5945,7 +5958,8 @@ async function processMercadoLibreWebhookEvent(event,target) {
     await saveOrderApiAudit(authUser.username,target.storeUserId,orderId,'claim_notification',String(event.resourceId || event.id),claim);
     if (orderId) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
       VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
-    [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的售后申诉`,`claim:webhook:${event.id}`]);
+    [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的售后申诉`,
+      `claim:${target.storeUserId}:${event.resourceId || event.id}`]);
     await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
     return { storeId:target.storeUserId,orderId,stored:true };
   }
@@ -6016,6 +6030,9 @@ async function start() {
   await initInternationalProductTable();
   await initOrderManagementTables();
   await initMiniProgramTables(pool);
+  officialAccountService=createOfficialAccountService({ pool,requireAdmin });
+  await officialAccountService.init();
+  officialAccountService.registerRoutes(app);
   mercadoLibreWebhookService=createMercadoLibreWebhookService({
     pool,
     expectedApplicationId:ML_CLIENT_ID,
@@ -6026,7 +6043,10 @@ async function start() {
   mercadoLibreWebhookService.registerRoutes(app);
   registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
-    getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,getOrderRealtimeStateData });
+    getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,getOrderRealtimeStateData,
+    getOfficialNotificationPreferences:officialAccountService.getPreferences,
+    updateOfficialNotificationPreferences:officialAccountService.updatePreferences,
+    getOfficialAccountBindingStatus:officialAccountService.getBindingStatus });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');
@@ -6036,11 +6056,13 @@ async function start() {
     console.log('============================================');
   });
   mercadoLibreWebhookService.start();
+  officialAccountService.start();
   scheduleNextOrderSync();
   const shutdown = signal => {
     console.log(`[Server] ${signal} received, closing gracefully`);
     if (scheduledOrderSyncTimer) clearTimeout(scheduledOrderSyncTimer);
     mercadoLibreWebhookService?.stop();
+    officialAccountService?.stop();
     server.close(async () => {
       try { await pool?.end(); } catch (error) { console.error('[DB] close error:', error.message); }
       process.exit(0);

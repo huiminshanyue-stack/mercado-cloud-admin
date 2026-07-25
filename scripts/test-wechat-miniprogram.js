@@ -40,6 +40,7 @@ async function testRoutes() {
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
+    put(path,...handlers) { routes.set(`PUT ${path}`,handlers); },
     patch(path,...handlers) { routes.set(`PATCH ${path}`,handlers); }
   };
   const pool={
@@ -87,7 +88,10 @@ async function testRoutes() {
       return { id:'claim-message-1' };
     },
     translateOrderTextData:async body=>({ text:body.text }),
-    getOrderRealtimeStateData:async user=>({ version:3,lastTopic:'orders_v2',lastOrderId:'order-1',owner:user.username })
+    getOrderRealtimeStateData:async user=>({ version:3,lastTopic:'orders_v2',lastOrderId:'order-1',owner:user.username }),
+    getOfficialNotificationPreferences:async()=>({ enabled:true,newOrder:true,cancelled:true,deadline:true,refund:true,buyerInquiry:true,afterSales:true }),
+    updateOfficialNotificationPreferences:async (user,body)=>({ owner:user, ...body }),
+    getOfficialAccountBindingStatus:async()=>({ followers:1,subscribed:1,bound:1 })
   });
 
   const configRes=responseRecorder();
@@ -138,6 +142,13 @@ async function testRoutes() {
     headers:{ authorization:'Bearer cntoro-token' }
   },realtimeRes);
   assert.deepEqual(realtimeRes.body.data,{ version:3,lastTopic:'orders_v2',lastOrderId:'order-1',owner:'CNTORO' });
+
+  const preferenceRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/notification-preferences'),{
+    headers:{ authorization:'Bearer cntoro-token' }
+  },preferenceRes);
+  assert.equal(preferenceRes.body.data.preferences.newOrder,true);
+  assert.equal(preferenceRes.body.data.binding.bound,1);
 
   const inquirySendRes=responseRecorder();
   await runHandlers(routes.get('POST /api/miniprogram/v1/inquiries/:orderId/messages'),{

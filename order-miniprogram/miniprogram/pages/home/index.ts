@@ -25,6 +25,7 @@ Page({
   openOrders() { wx.navigateTo({ url:'/pages/orders/index' }); },
   openInquiries() { wx.navigateTo({ url:'/pages/inquiries/index' }); },
   openAfterSales() { wx.navigateTo({ url:'/pages/after-sales/index' }); },
+  openNotifications() { wx.navigateTo({ url:'/pages/notifications/index' }); },
   logout() {
     const app=getApp<IAppOption>();
     request({ path:'/api/miniprogram/v1/auth/logout',method:'POST' }).catch(()=>{});

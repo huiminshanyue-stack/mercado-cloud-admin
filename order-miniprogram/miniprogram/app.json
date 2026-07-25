@@ -9,7 +9,8 @@
     "pages/inquiries/index",
     "pages/inquiry-thread/index",
     "pages/after-sales/index",
-    "pages/claim-thread/index"
+    "pages/claim-thread/index",
+    "pages/notifications/index"
   ],
   "window": {
     "navigationBarBackgroundColor": "#1677ff",

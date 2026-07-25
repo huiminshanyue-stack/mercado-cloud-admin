@@ -1,0 +1,19 @@
+.notification-page { padding-bottom:52rpx; }
+.binding-card { padding:32rpx; border:2rpx solid transparent; }
+.binding-card.bound { border-color:#a8e5ca; background:#f7fffb; }
+.binding-head { display:flex; align-items:center; justify-content:space-between; }
+.account-name { font-size:34rpx; font-weight:750; }
+.account-type { margin-top:8rpx; color:#7f8b98; font-size:23rpx; }
+.binding-state { padding:9rpx 18rpx; color:#b56b00; background:#fff3dc; border-radius:24rpx; font-size:23rpx; }
+.bound .binding-state { color:#07834d; background:#dcf8eb; }
+.binding-message { margin-top:25rpx; color:#5f6d7b; font-size:25rpx; line-height:1.7; }
+.refresh-button { margin:24rpx 0 0; color:#1677ff; background:#eef5ff; }
+.section-title { margin:35rpx 4rpx 18rpx; font-size:31rpx; font-weight:700; }
+.settings { overflow:hidden; padding:0 30rpx; }
+.setting-row { display:flex; min-height:116rpx; align-items:center; justify-content:space-between; gap:24rpx; border-bottom:1rpx solid #edf0f4; }
+.setting-row:last-child { border-bottom:0; }
+.main-setting { min-height:132rpx; }
+.setting-title { font-size:29rpx; font-weight:650; }
+.setting-desc { margin-top:7rpx; color:#8a97a6; font-size:22rpx; line-height:1.45; }
+.divider { height:12rpx; margin:0 -30rpx; background:#f3f6fa; }
+.privacy-note { padding:27rpx 12rpx; color:#929da8; font-size:22rpx; line-height:1.65; }
