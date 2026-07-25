@@ -402,14 +402,36 @@ async function initOrderManagementTables() {
       ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [deadlineRuleVersion]);
   }
   // Repair the regression that treated gross sales as payout when a commission
-  // debit and its cancellation credit cancelled each other out. This migration is
-  // intentionally limited to orders cancelled before dispatch.
-  const payoutRepairVersion = '2026-07-25-cancelled-before-dispatch-v1';
+  // debit and its cancellation credit cancelled each other out. Recalculate each
+  // cancelled-before-dispatch order from its cached official ledger so real
+  // cancellation charges remain negative instead of being flattened to zero.
+  const payoutRepairVersion = '2026-07-25-cancelled-before-dispatch-v2';
   const payoutRepairSetting = await pool.query("SELECT value FROM settings WHERE key='order_payout_repair_version'");
   if (payoutRepairSetting.rows[0]?.value !== payoutRepairVersion) {
-    await pool.query(`UPDATE ml_orders SET net_amount=0,net_amount_usd=0,updated_at=NOW()
+    const { rows: cancelledRows } = await pool.query(`SELECT ml_order_id,status,shipment_status,paid_amount,
+        refund_amount,currency,billing_data
+      FROM ml_orders
       WHERE LOWER(COALESCE(status,''))='cancelled'
         AND LOWER(COALESCE(shipment_status,'')) NOT IN ('shipped','delivered')`);
+    for (const row of cancelledRows) {
+      const parsed = parseOrderBilling(row.billing_data,Number(row.paid_amount || 0));
+      const resolved = resolveOfficialOrderPayout({
+        orderStatus: row.status,
+        shipmentStatus: row.shipment_status,
+        grossAmount: row.paid_amount,
+        refundAmount: row.refund_amount,
+        explicitOfficialNet: parsed?.netAmount,
+        hasOfficialLedger: parsed?.hasOfficialLedger,
+        officialLedgerDelta: parsed?.ledgerDelta,
+        paymentOfficialNet: null
+      });
+      const usdRate = resolved.amount === null ? null : await getBillingFxRate(row.currency,'USD');
+      const netAmountUsd = resolved.amount === null || usdRate === null
+        ? null
+        : Number((resolved.amount * usdRate).toFixed(2));
+      await pool.query(`UPDATE ml_orders SET net_amount=$1,net_amount_usd=$2,updated_at=NOW()
+        WHERE ml_order_id=$3`,[resolved.amount,netAmountUsd,String(row.ml_order_id)]);
+    }
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_payout_repair_version',$1,NOW())
       ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [payoutRepairVersion]);
   }
@@ -2800,7 +2822,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.23',
+    version: '2026-07-25.24',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -5140,7 +5162,7 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
               if (!detail) continue;
               const grossAmount = Number(order.paid_amount || 0), refundAmount = Number(order.refund_amount || 0);
               const officialFinance = parseOrderBilling(detail,grossAmount);
-              if (!officialFinance?.hasOfficialLedger) continue;
+              if (!officialFinance) continue;
               const payoutResolution = resolveOfficialOrderPayout({
                 orderStatus: order.status,
                 shipmentStatus: order.shipment_status,

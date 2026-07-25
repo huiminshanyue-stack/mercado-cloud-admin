@@ -17,15 +17,18 @@ const resolve = overrides => resolveOfficialOrderPayout({
 
 assert.deepEqual(resolve({ orderStatus: 'cancelled' }), {
   amount: 0,
-  source: 'cancelled_before_dispatch'
+  source: 'cancelled_before_dispatch_ledger'
 });
 assert.deepEqual(resolve({ orderStatus: 'cancelled', grossAmount: 27.24, officialLedgerDelta: 0 }), {
   amount: 0,
-  source: 'cancelled_before_dispatch'
+  source: 'cancelled_before_dispatch_ledger'
 });
+assert.equal(resolve({ orderStatus: 'cancelled', officialLedgerDelta: -2.5 }).amount, -2.5);
+assert.equal(resolve({ orderStatus: 'cancelled', hasOfficialLedger: false }).amount, null);
 assert.equal(resolve({ orderStatus: 'cancelled', shipmentStatus: 'shipped' }).amount, null);
 assert.equal(resolve({ orderStatus: 'cancelled', explicitOfficialNet: 4.22 }).amount, 4.22);
 assert.equal(resolve({ refundAmount: 40.86 }).amount, 0);
+assert.equal(resolve({ refundAmount: 40.86, officialLedgerDelta: -1.25 }).amount, -1.25);
 assert.equal(resolve({ refundAmount: 10 }).amount, null);
 assert.equal(resolve({ officialLedgerDelta: -7.53 }).amount, 33.33);
 assert.equal(resolve({ hasOfficialLedger: false, paymentOfficialNet: 35.7 }).amount, 35.7);

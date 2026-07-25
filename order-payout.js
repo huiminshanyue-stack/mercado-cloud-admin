@@ -38,14 +38,22 @@ function resolveOfficialOrderPayout({
   const dispatched = isDispatchedShipment(shipmentStatus);
   const fullyRefunded = gross > 0 && refunded >= gross - 0.01;
 
-  // An order cancelled before dispatch has no sale principal to settle. Fee debit
-  // and credit entries are cancellation reversals, not evidence of a gross payout.
+  // An order cancelled before dispatch has no sale principal to settle. Its payout
+  // is only the official fee/credit ledger balance (normally 0 after reversal).
   if (cancelled && !dispatched) {
-    return { amount: 0, source: 'cancelled_before_dispatch' };
+    if (hasOfficialLedger) {
+      const delta = finiteNumber(officialLedgerDelta) ?? 0;
+      return { amount: Number(delta.toFixed(2)), source: 'cancelled_before_dispatch_ledger' };
+    }
+    return { amount: null, source: 'awaiting_cancelled_order_settlement' };
   }
 
   if (fullyRefunded) {
-    return { amount: 0, source: 'official_full_refund' };
+    if (hasOfficialLedger) {
+      const delta = finiteNumber(officialLedgerDelta) ?? 0;
+      return { amount: Number(delta.toFixed(2)), source: 'official_full_refund_ledger' };
+    }
+    return { amount: null, source: 'awaiting_full_refund_settlement' };
   }
 
   // For dispatched cancellations and partial refunds, wait for Mercado Libre's
