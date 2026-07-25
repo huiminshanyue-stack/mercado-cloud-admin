@@ -9,6 +9,7 @@
     "test:order-payout": "node scripts/test-order-payout.js",
     "test:order-alerts": "node scripts/test-order-alert-policy.js",
     "test:order-sync": "node scripts/test-order-sync-policy.js",
+    "test:order-logistics": "node scripts/test-order-logistics.js",
     "test:miniprogram": "node scripts/test-wechat-miniprogram.js",
     "test:webhook": "node scripts/test-mercadolibre-webhook.js",
     "test:wechat-official": "node scripts/test-wechat-official-account.js"

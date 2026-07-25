@@ -6,6 +6,7 @@ const path = require('path');
 const { Pool } = require('pg');
 const { resolveOfficialOrderPayout } = require('./order-payout');
 const { normalizeOfficialMoneyAmount,normalizeParsedOrderBilling } = require('./order-billing-normalization');
+const { normalizeOfficialTrackingNumber,buildExternalTrackingUrl } = require('./order-logistics');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
@@ -501,6 +502,19 @@ async function initOrderManagementTables() {
     }
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_mixed_currency_repair_version',$1,NOW())
       ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`,[mixedCurrencyRepairVersion]);
+  }
+  const trackingNumberCleanupVersion='2026-07-26-tracking-number-cleanup-v1';
+  const trackingNumberCleanupSetting=await pool.query("SELECT value FROM settings WHERE key='order_tracking_number_cleanup_version'");
+  if (trackingNumberCleanupSetting.rows[0]?.value!==trackingNumberCleanupVersion) {
+    const { rows:trackingRows }=await pool.query(`SELECT ml_order_id,tracking_number FROM ml_orders
+      WHERE tracking_number IS NOT NULL AND tracking_number<>''`);
+    for (const row of trackingRows) {
+      const normalized=normalizeOfficialTrackingNumber(row.tracking_number);
+      if (normalized!==row.tracking_number) await pool.query(`UPDATE ml_orders SET tracking_number=$1,updated_at=NOW()
+        WHERE ml_order_id=$2`,[normalized,String(row.ml_order_id)]);
+    }
+    await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_tracking_number_cleanup_version',$1,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`,[trackingNumberCleanupVersion]);
   }
   // Historical imports must remain in the message center, but once fulfillment is
   // finished their new-order/deadline notices are no longer actionable or audible.
@@ -2976,7 +2990,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.38',
+    version: '2026-07-26.39',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3019,6 +3033,8 @@ app.get('/api/health/order-management', (req, res) => {
     cachedOfficialShippingLabels: true,
     proactiveReadyToShipLabelCapture: true,
     officialLogisticsTimeline: true,
+    carrierSpecificTrackingLookup: ['MEL Distribution:17TRACK','CainiaoExpress:Cainiao Global'],
+    normalizedOfficialTrackingNumber: true,
     preserveCachedOfficialPayout: true,
     backgroundOfficialPayoutBackfill: true,
     officialLargeProductImages: true,
@@ -3563,7 +3579,7 @@ async function syncOrdersForUser(authUser, body = {}) {
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
           JSON.stringify(orderItems), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
-          shipment.tracking_number || '', shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
+          normalizeOfficialTrackingNumber(shipment.tracking_number), shipment.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
           order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, !officialHandlingDeadline,
           String(cancellationReason).slice(0, 500), JSON.stringify(shipment), String(me.id || sellerId),
           finalSaleFee, finalShippingFee, finalNetAmount, refundAmount, otherFee, JSON.stringify(billingDetail || {}), Boolean(billingDetail),
@@ -5532,10 +5548,11 @@ app.get('/api/admin/orders/:orderId/logistics', requireOrderAccess, async (req, 
     events.sort((left,right) => new Date(right.date).getTime() - new Date(left.date).getTime());
     const uniqueEvents = [...new Map(events.map(event => [`${event.status}:${event.date}:${event.description}`,event])).values()];
     await saveOrderApiAudit(req.authUser.username,target.store_user_id,target.ml_order_id,'shipment_tracking',shipmentId,{ shipment, tracking });
+    const trackingNumber=normalizeOfficialTrackingNumber(shipment.tracking_number || tracking.tracking_number || '');
+    const trackingMethod=shipment.tracking_method || shipment.shipping_option?.name || '';
     res.json({ code: 0, data: {
       orderId: target.pack_id || target.ml_order_id, shipmentId,
-      trackingNumber: shipment.tracking_number || tracking.tracking_number || '',
-      trackingMethod: shipment.tracking_method || shipment.shipping_option?.name || '',
+      trackingNumber,trackingMethod,externalTrackingUrl:buildExternalTrackingUrl(trackingMethod,trackingNumber),
       logisticType: shipment.logistic?.type || shipment.logistic_type || '',
       status: shipment.status || '', statusText: statusLabels[String(shipment.status || '').toLowerCase()] || shipment.status || '待获取',
       substatus: shipment.substatus || '', lastUpdated: shipment.last_updated || shipment.date_last_updated || null,
