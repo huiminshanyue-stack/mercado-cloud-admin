@@ -7,7 +7,8 @@ const { Pool } = require('pg');
 const { resolveOfficialOrderPayout } = require('./order-payout');
 const { normalizeOfficialMoneyAmount,normalizeParsedOrderBilling } = require('./order-billing-normalization');
 const { normalizeOfficialTrackingNumber,buildExternalTrackingUrl,collectTrackingNumberCandidates,
-  isMelDistribution,chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf } = require('./order-logistics');
+  isMelDistribution,chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf,
+  publicOfficialTrackingNumber } = require('./order-logistics');
 const { dimensionSnapshotsDiffer } = require('./order-dimensions');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
@@ -2935,6 +2936,10 @@ async function aggregatePackedOrders(rows) {
         group.payoutPendingReason='官方结算净额尚未返回，服务器会继续自动补抓';
       }
     }
+    const storedTrackingNumber=normalizeOfficialTrackingNumber(group.trackingNumber);
+    const publicTrackingNumber=publicOfficialTrackingNumber(group.trackingMethod,storedTrackingNumber);
+    group.trackingNumberPending=Boolean(isMelDistribution(group.trackingMethod) && storedTrackingNumber && !publicTrackingNumber);
+    group.trackingNumber=publicTrackingNumber;
     group.dimensionsChanged = dimensionSnapshotsDiffer(group.dimensionsOriginal,group.dimensionsLatest);
     delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._rowCount; delete group._netAmountCount; delete group._netAmountUsdCount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialLedgerDelta; delete group._hasOfficialLedger; delete group._shippingBuyerPaid; delete group._shippingSellerCharge; delete group._shippingAdjustmentEvidence; delete group._officialFees; delete group._officialSignedFees;
   }
@@ -3013,7 +3018,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.41',
+    version: '2026-07-26.42',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3063,6 +3068,8 @@ app.get('/api/health/order-management', (req, res) => {
     melPublicTrackingNumberPreferred: true,
     melLabelTrackingRecovery: true,
     opaqueTrackingIdentifierSuppression: true,
+    globalMelTrackingBackfill: true,
+    melOpaqueTrackingHiddenUntilResolved: true,
     preserveCachedOfficialPayout: true,
     backgroundOfficialPayoutBackfill: true,
     officialLargeProductImages: true,
@@ -3654,6 +3661,7 @@ async function syncOrdersForUser(authUser, body = {}) {
     }
     for (const id of insertedDisplayOrderIds) updatedDisplayOrderIds.delete(id);
     queueReadyToShipLabelCapture(req.authUser,String(me.id || sellerId),accessToken,sourceOrders);
+    wakeMelPublicTrackingBackfill();
     queuePendingOfficialPayoutBackfill(req.authUser,String(me.id || sellerId),accessToken);
     const matched = new Set(sourceOrders.map(order => String(order.pack_id || order.id))).size;
     return { imported, matched, available: matched, inserted: insertedDisplayOrderIds.size,
@@ -5369,7 +5377,7 @@ function decodeOfficialLabelError(error) {
     ? parsed.cause.map(item => item?.message || item?.description || item?.code).filter(Boolean).join('；')
     : '';
   const officialCode = parsed?.error || parsed?.code || '';
-  const reason = parsed?.message || parsed?.description || causes || '';
+  const reason = parsed?.message || parsed?.description || causes || error?.message || '';
   let message = reason
     ? `${officialCode ? `${officialCode}：` : ''}${reason}`
     : `美客多面单接口返回 HTTP ${status}`;
@@ -5457,6 +5465,113 @@ function queueReadyToShipLabelCapture(authUser,storeUserId,accessToken,orders) {
       }
     }
   });
+}
+
+let melTrackingBackfillTimer=null;
+let melTrackingBackfillRunning=false;
+
+async function updateMelPublicTrackingNumber(row,value,source) {
+  const trackingNumber=normalizeOfficialTrackingNumber(value);
+  if (!/^\d{8,20}$/.test(trackingNumber)) return false;
+  await pool.query(`UPDATE ml_orders SET tracking_number=$1,updated_at=NOW()
+    WHERE owner_username=$2 AND shipping_id=$3`,[trackingNumber,row.owner_username,String(row.shipping_id)]);
+  await saveOrderApiAudit(row.owner_username,row.store_user_id,String(row.ml_order_id),'mel_tracking_backfill',
+    String(row.shipping_id),{ success:true,source,trackingNumberLength:trackingNumber.length });
+  return true;
+}
+
+async function repairMelPublicTrackingCandidate(row) {
+  const shipmentId=String(row.shipping_id || '');
+  const excluded=[row.ml_order_id,row.pack_id,shipmentId];
+  const cached=await pool.query(`SELECT pdf_data FROM order_shipping_labels
+    WHERE owner_username=$1 AND shipment_id=$2 LIMIT 1`,[row.owner_username,shipmentId]);
+  if (cached.rows[0]?.pdf_data) {
+    const extracted=extractMelTrackingNumberFromPdf(cached.rows[0].pdf_data,excluded);
+    if (await updateMelPublicTrackingNumber(row,extracted,'cached_official_label')) return true;
+  }
+
+  const authUser={ username:row.owner_username,role:row.role || 'user' };
+  const context=await getOrderStoreContext(authUser,row.store_user_id);
+  if (!context) throw new Error('店铺授权不可用，无法补取真实运单号');
+  const candidates=[row.tracking_number,
+    ...collectTrackingNumberCandidates(row.raw_data),...collectTrackingNumberCandidates(row.shipment_data)];
+  for (const path of [`marketplace/shipments/${encodeURIComponent(shipmentId)}`,
+    `shipments/${encodeURIComponent(shipmentId)}`,
+    `marketplace/shipments/${encodeURIComponent(shipmentId)}/tracking`,
+    `shipments/${encodeURIComponent(shipmentId)}/tracking`]) {
+    try {
+      const response=await axios.get(`https://api.mercadolibre.com/${path}`,{
+        headers:{ Authorization:`Bearer ${context.token}`,'x-format-new':'true' },timeout:20000
+      });
+      candidates.push(...collectTrackingNumberCandidates(response.data || {}));
+      const immediateCandidate=chooseOfficialTrackingNumber(row.tracking_method,candidates);
+      if (await updateMelPublicTrackingNumber(row,immediateCandidate,'official_shipment_resource')) return true;
+    } catch (error) {
+      if (![403,404].includes(error.response?.status)) console.warn('[Orders] MEL 真实运单号字段补取失败:',shipmentId,path,error.response?.status || error.message);
+    }
+  }
+  const officialCandidate=chooseOfficialTrackingNumber(row.tracking_method,candidates);
+  if (await updateMelPublicTrackingNumber(row,officialCandidate,'official_shipment_resource')) return true;
+
+  const { pdf }=await fetchOfficialLabelPdf(context.token,shipmentId);
+  await saveOfficialShippingLabel(row.owner_username,shipmentId,String(row.ml_order_id),row.store_user_id,pdf);
+  const extracted=extractMelTrackingNumberFromPdf(pdf,excluded);
+  if (await updateMelPublicTrackingNumber(row,extracted,'fresh_official_label')) return true;
+  throw new Error('官方面单已取得，但未识别到数字型公开运单号');
+}
+
+async function runMelPublicTrackingBackfill(batchSize=5) {
+  if (melTrackingBackfillRunning) return 0;
+  melTrackingBackfillRunning=true;
+  let processed=0;
+  try {
+    const { rows }=await pool.query(`WITH candidates AS (
+      SELECT DISTINCT ON (o.owner_username,o.shipping_id)
+        o.ml_order_id,o.pack_id,o.owner_username,o.store_user_id,o.shipping_id,o.tracking_number,
+        o.tracking_method,o.raw_data,o.shipment_data,o.date_created,u.role
+      FROM ml_orders o
+      JOIN ml_store_authorizations a ON a.owner_username=o.owner_username
+        AND a.ml_user_id=o.store_user_id AND a.enabled=TRUE
+      LEFT JOIN users u ON LOWER(u.username)=LOWER(o.owner_username)
+      WHERE o.shipping_id IS NOT NULL AND o.shipping_id<>''
+        AND LOWER(COALESCE(o.tracking_method,'')) LIKE '%mel%distribution%'
+        AND COALESCE(o.tracking_number,'') !~ '^[0-9]{8,20}$'
+        AND NOT EXISTS (SELECT 1 FROM order_api_audits audit
+          WHERE audit.owner_username=o.owner_username
+            AND audit.api_type='mel_tracking_backfill' AND audit.external_id=o.shipping_id
+            AND audit.fetched_at>=NOW()-INTERVAL '12 hours')
+      ORDER BY o.owner_username,o.shipping_id,o.date_created DESC
+    ) SELECT * FROM candidates ORDER BY date_created DESC LIMIT $1`,[Math.max(1,Math.min(10,Number(batchSize)||5))]);
+    for (const row of rows) {
+      try {
+        await repairMelPublicTrackingCandidate(row);
+      } catch (error) {
+        const officialError=decodeOfficialLabelError(error);
+        await saveOrderApiAudit(row.owner_username,row.store_user_id,String(row.ml_order_id),'mel_tracking_backfill',
+          String(row.shipping_id),{ success:false,message:officialError.message,auditData:officialError.auditData }).catch(()=>{});
+      }
+      processed++;
+      await new Promise(resolve=>setTimeout(resolve,800));
+    }
+    return processed;
+  } finally {
+    melTrackingBackfillRunning=false;
+  }
+}
+
+function scheduleMelPublicTrackingBackfill(delayMs=5000) {
+  if (melTrackingBackfillTimer) clearTimeout(melTrackingBackfillTimer);
+  melTrackingBackfillTimer=setTimeout(async()=>{
+    let processed=0;
+    try { processed=await runMelPublicTrackingBackfill(5); }
+    catch (error) { console.error('[Orders] MEL 真实运单号批量补取异常:',error.message); }
+    scheduleMelPublicTrackingBackfill(processed ? 60000 : 300000);
+  },Math.max(1000,Number(delayMs)||5000));
+  melTrackingBackfillTimer.unref?.();
+}
+
+function wakeMelPublicTrackingBackfill() {
+  if (!melTrackingBackfillRunning) scheduleMelPublicTrackingBackfill(1500);
 }
 
 const payoutBackfillRunning = new Set();
@@ -5583,15 +5698,17 @@ app.get('/api/admin/orders/:orderId/logistics', requireOrderAccess, async (req, 
       if (cached.rows[0]?.pdf_data) trackingCandidates.unshift(extractMelTrackingNumberFromPdf(
         cached.rows[0].pdf_data,[target.ml_order_id,target.pack_id,shipmentId]));
     }
-    const trackingNumber=chooseOfficialTrackingNumber(trackingMethod,trackingCandidates);
-    if (trackingNumber && trackingNumber!==normalizeOfficialTrackingNumber(target.tracking_number)) {
+    const resolvedTrackingNumber=chooseOfficialTrackingNumber(trackingMethod,trackingCandidates);
+    if (resolvedTrackingNumber && resolvedTrackingNumber!==normalizeOfficialTrackingNumber(target.tracking_number)) {
       await pool.query(`UPDATE ml_orders SET tracking_number=$1,tracking_method=COALESCE(NULLIF($2,''),tracking_method),updated_at=NOW()
         WHERE owner_username=$3 AND shipping_id=$4`,
-      [trackingNumber,trackingMethod,req.authUser.username,shipmentId]);
+      [resolvedTrackingNumber,trackingMethod,req.authUser.username,shipmentId]);
     }
+    const trackingNumber=publicOfficialTrackingNumber(trackingMethod,resolvedTrackingNumber);
     res.json({ code: 0, data: {
       orderId: target.pack_id || target.ml_order_id, shipmentId,
       trackingNumber,trackingMethod,externalTrackingUrl:buildExternalTrackingUrl(trackingMethod,trackingNumber),
+      trackingNumberPending:Boolean(isMelDistribution(trackingMethod) && resolvedTrackingNumber && !trackingNumber),
       logisticType: shipment.logistic?.type || shipment.logistic_type || '',
       status: shipment.status || '', statusText: statusLabels[String(shipment.status || '').toLowerCase()] || shipment.status || '待获取',
       substatus: shipment.substatus || '', lastUpdated: shipment.last_updated || shipment.date_last_updated || null,
@@ -6250,10 +6367,12 @@ async function start() {
   });
   mercadoLibreWebhookService.start();
   officialAccountService.start();
+  scheduleMelPublicTrackingBackfill(3000);
   scheduleNextOrderSync();
   const shutdown = signal => {
     console.log(`[Server] ${signal} received, closing gracefully`);
     if (scheduledOrderSyncTimer) clearTimeout(scheduledOrderSyncTimer);
+    if (melTrackingBackfillTimer) clearTimeout(melTrackingBackfillTimer);
     mercadoLibreWebhookService?.stop();
     officialAccountService?.stop();
     server.close(async () => {

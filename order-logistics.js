@@ -25,7 +25,7 @@ function collectTrackingNumberCandidates(value,result=[],seen=new Set()) {
     return result;
   }
   for (const [key,child] of Object.entries(value)) {
-    if (/^(tracking_number|trackingnumber|mail_no|mailno|waybill_number|waybillnumber)$/i.test(key)) {
+    if (/^(tracking_number|trackingnumber|tracking_id|trackingid|tracking_code|trackingcode|external_tracking_number|externaltrackingnumber|carrier_tracking_number|carriertrackingnumber|logistic_tracking_number|logistictrackingnumber|mail_no|mailno|waybill_number|waybillnumber)$/i.test(key)) {
       const normalized=normalizeOfficialTrackingNumber(child);
       if (normalized) result.push(normalized);
     }
@@ -40,6 +40,12 @@ function isMelDistribution(method) {
 
 function isMelPublicTrackingNumber(value) {
   return /^\d{8,20}$/.test(normalizeOfficialTrackingNumber(value));
+}
+
+function publicOfficialTrackingNumber(method,value) {
+  const normalized=normalizeOfficialTrackingNumber(value);
+  if (isMelDistribution(method) && !isMelPublicTrackingNumber(normalized)) return '';
+  return normalized;
 }
 
 function chooseOfficialTrackingNumber(method,candidates) {
@@ -86,5 +92,5 @@ function buildExternalTrackingUrl(method,trackingNumber) {
 }
 
 module.exports={ normalizeOfficialTrackingNumber,trackingLookupProvider,buildExternalTrackingUrl,
-  collectTrackingNumberCandidates,isMelDistribution,isMelPublicTrackingNumber,
+  collectTrackingNumberCandidates,isMelDistribution,isMelPublicTrackingNumber,publicOfficialTrackingNumber,
   chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf };

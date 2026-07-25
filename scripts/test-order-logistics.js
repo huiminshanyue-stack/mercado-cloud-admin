@@ -4,7 +4,7 @@ const assert=require('node:assert/strict');
 const zlib=require('node:zlib');
 const { normalizeOfficialTrackingNumber,trackingLookupProvider,buildExternalTrackingUrl,
   collectTrackingNumberCandidates,isMelPublicTrackingNumber,chooseOfficialTrackingNumber,
-  extractMelTrackingNumberFromPdf }=require('../order-logistics');
+  extractMelTrackingNumberFromPdf,publicOfficialTrackingNumber }=require('../order-logistics');
 
 assert.equal(normalizeOfficialTrackingNumber('  J4I\u200bJWABM BHC\ufeffTNQN5VFTUV\ufffd '),'J4IJWABMBHCTNQN5VFTUV');
 assert.equal(trackingLookupProvider('MEL Distribution'),'17track');
@@ -17,8 +17,13 @@ assert.equal(buildExternalTrackingUrl('CainiaoExpress','J4IJWABMBHCTNQN5VFTUV'),
 assert.equal(buildExternalTrackingUrl('J&T Slow','310927815768'),'');
 assert.deepEqual(collectTrackingNumberCandidates({ tracking_number:'INTERNALLETTERS',nested:{ mail_no:'310920988843' } }),
   ['INTERNALLETTERS','310920988843']);
+assert.deepEqual(collectTrackingNumberCandidates({ tracking_id:'OPAQUE',nested:{ external_tracking_number:'310920988844' } }),
+  ['OPAQUE','310920988844']);
 assert.equal(isMelPublicTrackingNumber('310920988843'),true);
 assert.equal(isMelPublicTrackingNumber('IQIUSGVLMZHHWMHCNNO'),false);
+assert.equal(publicOfficialTrackingNumber('MEL Distribution','IQIUSGVLMZHHWMHCNNO'),'');
+assert.equal(publicOfficialTrackingNumber('MEL Distribution','310920988843'),'310920988843');
+assert.equal(publicOfficialTrackingNumber('CainiaoExpress','LP00827753088971'),'LP00827753088971');
 assert.equal(chooseOfficialTrackingNumber('MEL Distribution',['IQIUSGVLMZHHWMHCNNO','310920988843']),
   '310920988843');
 assert.equal(chooseOfficialTrackingNumber('CainiaoExpress',['LP00827753088971','310920988843']),
