@@ -8,6 +8,7 @@ const { resolveOfficialOrderPayout } = require('./order-payout');
 const { normalizeOfficialMoneyAmount,normalizeParsedOrderBilling } = require('./order-billing-normalization');
 const { normalizeOfficialTrackingNumber,buildExternalTrackingUrl,collectTrackingNumberCandidates,
   isMelDistribution,chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf } = require('./order-logistics');
+const { dimensionSnapshotsDiffer } = require('./order-dimensions');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
@@ -3012,7 +3013,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.40',
+    version: '2026-07-26.41',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3038,6 +3039,8 @@ app.get('/api/health/order-management', (req, res) => {
     combinedSalesCommission: true,
     orderDimensionSnapshots: true,
     dimensionDeclaredVsCurrent: true,
+    dimensionDeclaredVsVerifiedPackage: true,
+    dimensionSourceLabels: ['seller_order_snapshot','mercado_verified_package','current_listing_reference','billable_weight_reference'],
     dimensionMissingValueLabels: true,
     compactDimensionCard: true,
     statisticsIndependentFilters: true,
@@ -3152,12 +3155,10 @@ function findBillableWeight(value) {
 }
 
 function itemDimensions(item) {
-  const billableWeight = findBillableWeight(item?._shipping_cost_info);
-  const officialWeight = dimensionNumber(billableWeight);
   const direct = typeof item?.shipping?.dimensions === 'string'
     ? parseDimensionString(item.shipping.dimensions)
     : (typeof item?.dimensions === 'string' ? parseDimensionString(item.dimensions) : null);
-  if (direct) return officialWeight === null ? direct : { ...direct, weight: officialWeight, weightUnit: billableWeight?.unit || direct.weightUnit || 'g' };
+  if (direct) return direct;
   const attributes = new Map((Array.isArray(item?.attributes) ? item.attributes : []).map(attribute => [String(attribute.id || '').toUpperCase(), attribute]));
   const attributeValue = (...ids) => {
     for (const id of ids) {
@@ -3171,14 +3172,14 @@ function itemDimensions(item) {
   const width = attributeValue('PACKAGE_WIDTH','WIDTH');
   const height = attributeValue('PACKAGE_HEIGHT','HEIGHT');
   const weight = attributeValue('PACKAGE_WEIGHT','WEIGHT');
-  if ([length,width,height,weight].every(entry => entry.value === null) && officialWeight === null) return null;
+  if ([length,width,height,weight].every(entry => entry.value === null)) return null;
   return {
     length: length.value,
     width: width.value,
     height: height.value,
-    weight: officialWeight ?? weight.value,
+    weight: weight.value,
     dimensionUnit: length.unit || width.unit || height.unit || 'cm',
-    weightUnit: billableWeight?.unit || weight.unit || 'g'
+    weightUnit: weight.unit || 'g'
   };
 }
 
@@ -3204,13 +3205,21 @@ function buildOrderDimensionSnapshot(shipments, items) {
     const itemId = String(item?.id || '');
     const fromShipment = shipmentItemDimensions.get(itemId);
     const fromItem = itemDimensions(item);
+    const billableWeightRaw = findBillableWeight(item?._shipping_cost_info);
+    const billableWeightValue = dimensionNumber(billableWeightRaw);
+    const billableWeight = billableWeightValue === null ? null : {
+      weight: billableWeightValue,
+      weightUnit: String(billableWeightRaw?.unit || 'g'),
+      source: 'shipping_options.cost.billable_weight'
+    };
     const dimensions = fromItem || fromShipment;
-    return dimensions ? {
+    return (dimensions || billableWeight) ? {
       itemId,
       title: String(item?.title || ''),
       dimensions,
       orderDimensions: fromShipment || null,
       listingDimensions: fromItem || null,
+      billableWeight,
       source: fromItem ? 'item.attributes' : 'shipment.shipping_items.dimensions'
     } : null;
   }).filter(Boolean);
@@ -3221,43 +3230,12 @@ function buildOrderDimensionSnapshot(shipments, items) {
     packages: packageRecords,
     items: itemRecords,
     orderRecorded: itemRecords.find(item => item.orderDimensions)?.orderDimensions || null,
+    declaredAtOrder: itemRecords.find(item => item.orderDimensions)?.orderDimensions || null,
+    verifiedPackage: packageRecords[0]?.dimensions || null,
+    currentListing: itemRecords.find(item => item.listingDimensions)?.listingDimensions || null,
+    billableWeight: itemRecords.find(item => item.billableWeight)?.billableWeight || null,
     available: Boolean(packageRecords.length || itemRecords.length)
   };
-}
-
-function dimensionSnapshotComparable(snapshot) {
-  return {
-    package: snapshot?.package?.dimensions || null,
-    items: (snapshot?.items || []).map(item => ({ itemId: item.itemId, dimensions: item.dimensions })).sort((a,b) => String(a.itemId).localeCompare(String(b.itemId)))
-  };
-}
-
-function normalizedComparableDimensions(value) {
-  if (!value || typeof value !== 'object') return null;
-  const dimensionUnit = String(value.dimensionUnit || 'cm').trim().toLowerCase();
-  const weightUnit = String(value.weightUnit || 'g').trim().toLowerCase();
-  const lengthFactor = dimensionUnit === 'mm' ? 0.1 : (dimensionUnit === 'm' ? 100 : (['in','inch','inches'].includes(dimensionUnit) ? 2.54 : 1));
-  const weightFactor = ['kg','kilogram','kilograms'].includes(weightUnit) ? 1000
-    : (['lb','lbs','pound','pounds'].includes(weightUnit) ? 453.59237
-      : (['oz','ounce','ounces'].includes(weightUnit) ? 28.349523125 : 1));
-  const normalize = (raw,factor) => {
-    const number = dimensionNumber(raw);
-    return number === null ? null : Number((number * factor).toFixed(3));
-  };
-  return {
-    lengthCm: normalize(value.length,lengthFactor),
-    widthCm: normalize(value.width,lengthFactor),
-    heightCm: normalize(value.height,lengthFactor),
-    weightG: normalize(value.weight,weightFactor)
-  };
-}
-
-function dimensionSnapshotsDiffer(original, latest) {
-  if (!original?.available || !latest?.available) return false;
-  const originalValue = original.orderRecorded || original.items?.[0]?.orderDimensions || original.items?.[0]?.dimensions || original.package?.dimensions || null;
-  const latestValue = latest.items?.[0]?.listingDimensions || latest.items?.[0]?.dimensions || latest.package?.dimensions || null;
-  if (!originalValue || !latestValue) return JSON.stringify(dimensionSnapshotComparable(original)) !== JSON.stringify(dimensionSnapshotComparable(latest));
-  return JSON.stringify(normalizedComparableDimensions(originalValue)) !== JSON.stringify(normalizedComparableDimensions(latestValue));
 }
 
 async function fetchOfficialItemDetail(accessToken, itemId, marketplaceFirst = true) {
@@ -3792,8 +3770,10 @@ app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, as
       dimensionsUpdatedAt: snapshot.fetchedAt,
       dimensionsChanged: changed,
       note: changed
-        ? '美客多当前计费尺寸/重量与下单时申报记录不同。按平台机制，发货后的称重和尺寸验证可能自动更新商品数据；是否产生额外运费以官方账单实际收费项目为准。'
-        : '美客多当前计费尺寸/重量与下单时申报记录一致。',
+        ? '美客多返回的该订单包裹核验值与卖家下单时申报快照不同。商品当前刊登值与计费重量已单独标明；是否产生额外运费，以官方账单实际收费项目为准。'
+        : (snapshot.verifiedPackage
+          ? '美客多返回的该订单包裹核验值与卖家下单时申报快照一致。'
+          : '已更新商品当前刊登值，但美客多暂未返回该订单包裹核验值，系统不会把刊登值冒充核验值。'),
       failures
     } });
   } catch (error) {
