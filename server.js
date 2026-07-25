@@ -275,6 +275,8 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_original JSONB NOT NULL DEFAULT \'{}\'::jsonb');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_latest JSONB NOT NULL DEFAULT \'{}\'::jsonb');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_updated_at TIMESTAMPTZ');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS is_marked BOOLEAN NOT NULL DEFAULT FALSE');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ');
   await pool.query(`CREATE TABLE IF NOT EXISTS ml_store_authorizations (
     id BIGSERIAL PRIMARY KEY,
     owner_username VARCHAR(120) NOT NULL,
@@ -2613,6 +2615,7 @@ async function aggregatePackedOrders(rows) {
       group.dimensionsLatest = row.dimensionsLatest;
       group.dimensionsUpdatedAt = row.dimensionsUpdatedAt || row.dimensionsLatest.fetchedAt || null;
     }
+    group.isMarked ||= Boolean(row.isMarked);
     if (row.reputationImpact === true) {
       group.reputationImpact = true;
       group.reputationFeedback ||= row.reputationFeedback || '';
@@ -2788,7 +2791,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.18',
+    version: '2026-07-25.19',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2819,6 +2822,10 @@ app.get('/api/health/order-management', (req, res) => {
     signedOrderCost: true,
     shipmentScopedLabelAuthorization: true,
     labelAuthorizationAutoMatch: true,
+    lightweightManualOrderSync: true,
+    singleOrderStatusSync: true,
+    scheduledOrderSyncBeijing: '12:00,00:00',
+    localOrderMarkAndSoftDelete: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3007,9 +3014,11 @@ async function fetchOfficialItemDetail(accessToken, itemId, marketplaceFirst = t
   throw lastError || new Error('商品尺寸接口未返回数据');
 }
 
-app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
+async function syncOrdersForUser(authUser, body = {}) {
+  const req = { authUser, body };
   try {
     const requestedStoreId = String(req.body?.storeId || '').trim();
+    const requestedOrderId = String(req.body?.orderId || '').trim();
     const authorizations = await listOrderStoreAuthorizations(req.authUser, requestedStoreId);
     if (!authorizations.length) return res.status(401).json({ code: 401, message: '当前账号尚未授权可同步的美客多店铺' });
     const selectedAuthorization = authorizations[0];
@@ -3018,7 +3027,7 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
     const sellerId = String(selectedAuthorization.ml_user_id);
     const [accountResponse, listingsResponse] = await Promise.all([
       axios.get('https://api.mercadolibre.com/users/me', { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }),
-      axios.get(`https://api.mercadolibre.com/users/${sellerId}/items/search`, { params: { limit: 1 }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }).catch(() => null)
+      requestedOrderId ? Promise.resolve(null) : axios.get(`https://api.mercadolibre.com/users/${sellerId}/items/search`, { params: { limit: 1 }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }).catch(() => null)
     ]);
     const me = accountResponse.data || {};
     await pool.query(`INSERT INTO ml_stores(ml_user_id,owner_username,nickname,site_id,updated_at) VALUES($1,$2,$3,$4,NOW())
@@ -3026,12 +3035,27 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
       [String(me.id || sellerId), req.authUser.username, me.nickname || '', me.site_id || '']);
     const limit = Math.min(50, Math.max(1, Number(req.body?.limit) || 50));
     const offset = Math.min(5000,Math.max(0,Number(req.body?.offset)||0));
+    const dateFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.dateFrom || '')) ? `${req.body.dateFrom}T00:00:00.000+08:00` : '';
+    const dateTo = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.dateTo || '')) ? `${req.body.dateTo}T23:59:59.999+08:00` : '';
+    const dateParams = {
+      ...(dateFrom ? { 'order.date_created.from': dateFrom } : {}),
+      ...(dateTo ? { 'order.date_created.to': dateTo } : {})
+    };
+    let directOrderIds = [];
+    if (requestedOrderId) {
+      const directRows = await pool.query(`SELECT ml_order_id FROM ml_orders
+        WHERE owner_username=$1 AND store_user_id=$2 AND (ml_order_id=$3 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$3)`,
+        [req.authUser.username,String(me.id || sellerId),requestedOrderId]);
+      directOrderIds = [...new Set(directRows.rows.map(row => String(row.ml_order_id)).filter(Boolean))];
+      if (!directOrderIds.length) directOrderIds = [requestedOrderId];
+    }
     let response, sourceOrders;
     if (me.site_id === 'CBT') {
-      response = await axios.get('https://api.mercadolibre.com/marketplace/orders/search', {
-        params: { sort: 'date_desc', limit, offset }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+      if (directOrderIds.length) response = { data: { paging: { total: directOrderIds.length }, results: [] } };
+      else response = await axios.get('https://api.mercadolibre.com/marketplace/orders/search', {
+        params: { sort: 'date_desc', limit, offset, ...dateParams }, headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
       });
-      const orderIds = [...new Set((response.data?.results || []).flatMap(pack =>
+      const orderIds = directOrderIds.length ? directOrderIds : [...new Set((response.data?.results || []).flatMap(pack =>
         (pack.orders || []).map(order => order.id).filter(Boolean)
       ))].slice(0, limit);
       sourceOrders = [];
@@ -3061,11 +3085,22 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
         }));
       }
     } else {
-      response = await axios.get('https://api.mercadolibre.com/orders/search', {
-        params: { seller: sellerId, sort: 'date_desc', limit, offset },
-        headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
-      });
-      sourceOrders = response.data?.results || [];
+      if (directOrderIds.length) {
+        response = { data: { paging: { total: directOrderIds.length }, results: [] } };
+        sourceOrders = [];
+        for (let i = 0; i < directOrderIds.length; i += 5) {
+          const batch = await Promise.all(directOrderIds.slice(i,i+5).map(id => axios.get(`https://api.mercadolibre.com/orders/${encodeURIComponent(id)}`, {
+            headers: { Authorization: `Bearer ${accessToken}` }, timeout: 20000
+          }).then(result => result.data).catch(() => null)));
+          sourceOrders.push(...batch.filter(Boolean));
+        }
+      } else {
+        response = await axios.get('https://api.mercadolibre.com/orders/search', {
+          params: { seller: sellerId, sort: 'date_desc', limit, offset, ...dateParams },
+          headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+        });
+        sourceOrders = response.data?.results || [];
+      }
     }
     const itemIds = [...new Set(sourceOrders.flatMap(order =>
       (order.order_items || []).map(entry => entry.item?.id).filter(Boolean)
@@ -3287,18 +3322,27 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
       }
       imported++;
     }
-    res.json({ code: 0, data: { imported, available: response.data?.paging?.total || imported, sellerId, storeId: sellerId,
+    return { imported, available: response.data?.paging?.total || imported, sellerId, storeId: sellerId,
       account: { id: me.id, nickname: me.nickname || '', siteId: me.site_id || '', countryId: me.country_id || '',
-        listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } } });
+        listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } };
   } catch (e) {
     console.error('[Orders] 同步失败:', e.response?.data || e.message);
+    throw e;
+  }
+}
+
+app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
+  try {
+    const data = await syncOrdersForUser(req.authUser,req.body || {});
+    res.json({ code: 0, data });
+  } catch (e) {
     res.status(502).json({ code: 502, message: e.response?.data?.message || e.message });
   }
 });
 
 app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
-  const params = [req.authUser.username], where = ['o.owner_username=$1'];
+  const params = [req.authUser.username], where = ['o.owner_username=$1','o.hidden_at IS NULL'];
   if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
   if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`o.push_status = $${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country = $${params.length}`); }
@@ -3318,7 +3362,7 @@ app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
     SELECT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) AS display_id,MAX(o.date_created) AS group_date
     FROM ml_orders o ${clause} GROUP BY COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)
     ORDER BY group_date DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}
-  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.shipping_dimensions_original AS "dimensionsOriginal",o.shipping_dimensions_latest AS "dimensionsLatest",o.shipping_dimensions_updated_at AS "dimensionsUpdatedAt"
+  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",o.is_marked AS "isMarked",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.shipping_dimensions_original AS "dimensionsOriginal",o.shipping_dimensions_latest AS "dimensionsLatest",o.shipping_dimensions_updated_at AS "dimensionsUpdatedAt"
     FROM page_groups pg JOIN ml_orders o ON COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)=pg.display_id AND o.owner_username=$1
     LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ORDER BY pg.group_date DESC NULLS LAST,o.date_created`, params);
   const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE owner_username=$2 AND ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId),req.authUser.username]) : { rows: [] };
@@ -4609,6 +4653,42 @@ app.patch('/api/admin/orders/:orderId/cost', requireOrderAccess, async (req, res
   res.json({ code: 0 });
 });
 
+app.patch('/api/admin/orders/:orderId/mark', requireOrderAccess, async (req, res) => {
+  const marked = Boolean(req.body?.marked);
+  const { rowCount } = await pool.query(`UPDATE ml_orders SET is_marked=$1,updated_at=NOW()
+    WHERE owner_username=$2 AND (ml_order_id=$3 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$3)`,
+    [marked,req.authUser.username,String(req.params.orderId)]);
+  if (!rowCount) return res.status(404).json({ code: 404, message: '订单不存在或无权操作' });
+  res.json({ code: 0, data: { marked } });
+});
+
+app.delete('/api/admin/orders/:orderId', requireOrderAccess, async (req, res) => {
+  const { rowCount } = await pool.query(`UPDATE ml_orders SET hidden_at=NOW(),updated_at=NOW()
+    WHERE owner_username=$1 AND (ml_order_id=$2 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$2) AND hidden_at IS NULL`,
+    [req.authUser.username,String(req.params.orderId)]);
+  if (!rowCount) return res.status(404).json({ code: 404, message: '订单不存在、已删除或无权操作' });
+  res.json({ code: 0, data: { hiddenLocally: true } });
+});
+
+app.get('/api/admin/orders-hidden/list', requireOrderAccess, async (req, res) => {
+  const { rows } = await pool.query(`SELECT DISTINCT ON (COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))
+    o.ml_order_id AS "orderId",COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) AS "displayOrderId",
+    o.date_created AS "dateCreated",o.hidden_at AS "hiddenAt",o.store_user_id AS "storeId",
+    COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'授权店铺') AS "storeName"
+    FROM ml_orders o LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id
+    WHERE o.owner_username=$1 AND o.hidden_at IS NOT NULL
+    ORDER BY COALESCE(NULLIF(o.pack_id,''),o.ml_order_id),o.hidden_at DESC LIMIT 200`,[req.authUser.username]);
+  res.json({ code: 0, data: rows });
+});
+
+app.post('/api/admin/orders/:orderId/restore', requireOrderAccess, async (req, res) => {
+  const { rowCount } = await pool.query(`UPDATE ml_orders SET hidden_at=NULL,updated_at=NOW()
+    WHERE owner_username=$1 AND (ml_order_id=$2 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$2)`,
+    [req.authUser.username,String(req.params.orderId)]);
+  if (!rowCount) return res.status(404).json({ code: 404, message: '未找到可恢复订单' });
+  res.json({ code: 0, data: { restored: true } });
+});
+
 const usdCnyRateCache = new Map();
 function orderExchangeRateKey(username) {
   return `usd_cny_rate:${String(username || '').trim().toLowerCase()}`;
@@ -5320,6 +5400,54 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// ========== 订单定时同步（北京时间 00:00 / 12:00） ==========
+let scheduledOrderSyncTimer = null;
+let scheduledOrderSyncRunning = false;
+
+function nextBeijingOrderSyncAt(nowMs = Date.now()) {
+  const beijingNow = new Date(nowMs + 8 * 3600000);
+  const year = beijingNow.getUTCFullYear(), month = beijingNow.getUTCMonth(), day = beijingNow.getUTCDate();
+  const toUtc = (dayOffset,hour) => Date.UTC(year,month,day + dayOffset,hour,0,0,0) - 8 * 3600000;
+  const todayNoon = toUtc(0,12);
+  if (nowMs < todayNoon) return todayNoon;
+  return toUtc(1,0);
+}
+
+async function runScheduledOrderSync() {
+  if (scheduledOrderSyncRunning) return;
+  scheduledOrderSyncRunning = true;
+  try {
+    const { rows: owners } = await pool.query(`SELECT DISTINCT a.owner_username,u.role
+      FROM ml_store_authorizations a LEFT JOIN users u ON LOWER(u.username)=LOWER(a.owner_username)
+      WHERE a.enabled=TRUE AND (u.role='admin' OR UPPER(a.owner_username)='CNTORO')`);
+    for (const owner of owners) {
+      const authUser = { username: owner.owner_username, role: owner.role || 'user' };
+      const authorizations = await listOrderStoreAuthorizations(authUser);
+      for (const authorization of authorizations) {
+        try {
+          const result = await syncOrdersForUser(authUser,{ storeId: authorization.ml_user_id, limit: 50, automatic: true });
+          console.log('[Orders] 定时同步完成:', authUser.username, authorization.ml_user_id, result.imported);
+        } catch (error) {
+          console.error('[Orders] 定时同步失败:', authUser.username, authorization.ml_user_id, error.response?.data || error.message);
+        }
+      }
+    }
+  } finally {
+    scheduledOrderSyncRunning = false;
+  }
+}
+
+function scheduleNextOrderSync() {
+  const target = nextBeijingOrderSyncAt();
+  const delay = Math.max(1000,target - Date.now());
+  console.log('[Orders] 下次服务器定时同步:', new Date(target).toISOString(), '北京时间', new Date(target + 8 * 3600000).toISOString().slice(0,16).replace('T',' '));
+  scheduledOrderSyncTimer = setTimeout(async () => {
+    await runScheduledOrderSync().catch(error => console.error('[Orders] 定时任务异常:', error.message));
+    scheduleNextOrderSync();
+  },delay);
+  scheduledOrderSyncTimer.unref?.();
+}
+
 // ========== 启动 ==========
 async function start() {
   await connectDB();
@@ -5338,8 +5466,10 @@ async function start() {
     console.log(`  管理页面: http://localhost:${PORT}/`);
     console.log('============================================');
   });
+  scheduleNextOrderSync();
   const shutdown = signal => {
     console.log(`[Server] ${signal} received, closing gracefully`);
+    if (scheduledOrderSyncTimer) clearTimeout(scheduledOrderSyncTimer);
     server.close(async () => {
       try { await pool?.end(); } catch (error) { console.error('[DB] close error:', error.message); }
       process.exit(0);
