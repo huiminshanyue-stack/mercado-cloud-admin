@@ -6,6 +6,7 @@ const {
   assertLockedPayoutInvariant,
   resolveOfficialOrderPayout
 } = require('../order-payout');
+const { LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE,normalizeParsedOrderBilling } = require('../order-billing-normalization');
 
 const resolve = overrides => resolveOfficialOrderPayout({
   orderStatus: 'paid',
@@ -18,6 +19,8 @@ const resolve = overrides => resolveOfficialOrderPayout({
   paymentOfficialNet: null,
   ...overrides
 });
+
+(async()=>{
 
 assert.deepEqual(resolve({ orderStatus: 'cancelled' }), {
   amount: 0,
@@ -44,4 +47,30 @@ assert.deepEqual(LOCKED_PAYOUT_EXAMPLE, {
   expectedPayout: 7.83
 });
 
+// LOCKED MIXED-CURRENCY REGRESSION — official Chile example confirmed by
+// the product owner. CLP 4,536 buyer shipping credit is officially USD 4.99;
+// its raw CLP number must never enter a USD payout calculation.
+const chileBilling=await normalizeParsedOrderBilling({
+  netAmount:null,netCurrency:'',hasOfficialLedger:true,entries:[
+    { detail_amount:LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.buyerShippingOriginalAmount,detail_type:'CREDIT',
+      detail_sub_type:'RECEIVER_SHIPPING_COST',concept_type:'SHIPPING',
+      _currencyId:LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.buyerShippingOriginalCurrency,
+      _normalizedUsdAmount:LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.buyerShippingUsdCredit,_ledgerDirection:'credit' },
+    { detail_amount:LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.salesCommission,detail_type:'CHARGE',detail_sub_type:'CV',_currencyId:'USD' },
+    { detail_amount:LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.sellerShippingCharge,detail_type:'CHARGE',
+      detail_sub_type:'CXD',concept_type:'SHIPPING',_currencyId:'USD' }
+  ]
+},'USD',async (from,to)=>from===to ? 1 : null);
+assert.equal(chileBilling.currencyMismatch,false);
+assert.equal(Number(chileBilling.ledgerDelta.toFixed(2)),-2.27);
+assert.equal(Number(chileBilling.saleFee.toFixed(2)),0.77);
+assert.equal(Number(chileBilling.shippingFee.toFixed(2)),6.49);
+const chilePayout=resolve({ grossAmount:LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.grossAmount,officialLedgerDelta:chileBilling.ledgerDelta });
+assert.equal(chilePayout.amount,LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.expectedPayoutUsd);
+assert.equal(Number((LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.grossAmount-
+  LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.salesCommission-LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.sellerShippingCharge+
+  LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.buyerShippingOriginalAmount).toFixed(2)),
+LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE.forbiddenPollutedPayoutUsd);
+
 console.log('order payout regression tests passed');
+})().catch(error=>{ console.error(error);process.exitCode=1; });
