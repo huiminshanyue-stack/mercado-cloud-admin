@@ -5,12 +5,30 @@ const countryMap: Record<string,{ name:string;flag:string }> = {
   BO:{ name:'玻利维亚',flag:'🇧🇴' },PY:{ name:'巴拉圭',flag:'🇵🇾' }
 };
 
+function parseTimestamp(value: unknown): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : Number.NaN;
+  const text=String(value || '').trim();
+  const match=text.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?)?(?:(Z)|([+-])(\d{2}):?(\d{2}))?$/i);
+  if (!match) return Number.NaN;
+  const year=Number(match[1]),month=Number(match[2])-1,day=Number(match[3]);
+  const hour=Number(match[4] || 0),minute=Number(match[5] || 0),second=Number(match[6] || 0);
+  const millisecond=Number(String(match[7] || '0').padEnd(3,'0'));
+  if (!match[8] && !match[9]) return new Date(year,month,day,hour,minute,second,millisecond).getTime();
+  let timestamp=Date.UTC(year,month,day,hour,minute,second,millisecond);
+  if (match[9]) {
+    const offset=(Number(match[10] || 0)*60+Number(match[11] || 0))*60000;
+    timestamp += match[9] === '+' ? -offset : offset;
+  }
+  return timestamp;
+}
+
 export function formatDate(value?: string | null): string {
   if (!value) return '-';
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return '-';
+  const timestamp=parseTimestamp(value);
+  if (!Number.isFinite(timestamp)) return '-';
+  const date = new Date(timestamp+8*3600000);
   const pad = (n:number) => String(n).padStart(2,'0');
-  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth()+1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
 }
 
 export function money(value: unknown,currency = 'USD'): string {
@@ -64,7 +82,7 @@ export function deadlineText(order:any): string {
   const state=orderState(order);
   if (state!=='待发货') return state;
   if (!order.handlingDeadline) return '待发货时间：同步后计算';
-  const deadline=new Date(order.handlingDeadline).getTime();
+  const deadline=parseTimestamp(order.handlingDeadline);
   if (!Number.isFinite(deadline)) return '待发货时间：同步后计算';
   const prefix=order.deadlineIsEstimated ? '预计' : '官方';
   const remaining=deadline-Date.now();
@@ -76,7 +94,7 @@ export function deadlineText(order:any): string {
 export function onlineDeadlineText(order:any): string {
   if (orderState(order)!=='待发货') return '已结束计时';
   if (!order.handlingDeadline) return '待获取基础时效';
-  const base=new Date(order.handlingDeadline).getTime();
+  const base=parseTimestamp(order.handlingDeadline);
   if (!Number.isFinite(base)) return '待获取基础时效';
   if (Date.now()<base) return `基础时效结束后开始（${formatDate(order.handlingDeadline)}）`;
   const remaining=base+24*3600000-Date.now();
