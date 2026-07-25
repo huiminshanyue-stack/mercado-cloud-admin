@@ -157,7 +157,8 @@ function createMercadoLibreWebhookService({ pool,expectedApplicationId,resolveTa
       }
     });
     app.get('/api/health/mercadolibre-webhook',(req,res) => res.json({ code:0,data:{
-      enabled:Boolean(expectedApplicationId),topics:[...SUPPORTED_TOPICS],queueRunning:running,callback:'/api/webhooks/mercadolibre'
+      enabled:Boolean(expectedApplicationId),topics:[...SUPPORTED_TOPICS],queueRunning:Boolean(timer) && !stopped,
+      processing:running,callback:'/api/webhooks/mercadolibre'
     } }));
   }
 
