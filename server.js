@@ -2851,7 +2851,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.30',
+    version: '2026-07-25.31',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2911,6 +2911,7 @@ app.get('/api/health/order-management', (req, res) => {
     miniProgramOrderCostWrite: true,
     miniProgramInquiryReply: true,
     miniProgramAfterSalesReply: true,
+    officialClaimSearchUsesCurrentStoreIdentity: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3263,7 +3264,7 @@ async function syncOrdersForUser(authUser, body = {}) {
       const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
       const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId =>
         axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
-          params: { seller_id: localSellerId, sort: 'last_updated:desc', limit: 100 },
+          params: { user_id: localSellerId, role: 'respondent', sort: 'last_updated:desc', limit: 100 },
           headers: { Authorization: `Bearer ${accessToken}` }, timeout: 20000
         }).catch(() => null)));
       const claims = [...new Map(claimResponses.flatMap(response => {
@@ -5032,7 +5033,7 @@ async function getOrderAfterSalesData(authUser,query = {}) {
     const { token, sellerId } = context;
     const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
     const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId => axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
-      params: { status: 'opened', seller_id: localSellerId, sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+      params: { status: 'opened', user_id: localSellerId, role: 'respondent', sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     }).catch(error => ({ error }))));
     if (claimResponses.every(response => response.error)) throw claimResponses[0].error;
     let claims = [...new Map(claimResponses.flatMap(response => {
