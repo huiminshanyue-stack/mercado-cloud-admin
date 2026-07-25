@@ -2801,7 +2801,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.21',
+    version: '2026-07-25.22',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2840,6 +2840,9 @@ app.get('/api/health/order-management', (req, res) => {
     cachedOfficialShippingLabels: true,
     proactiveReadyToShipLabelCapture: true,
     officialLogisticsTimeline: true,
+    preserveCachedOfficialPayout: true,
+    backgroundOfficialPayoutBackfill: true,
+    officialLargeProductImages: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3125,7 +3128,7 @@ async function syncOrdersForUser(authUser, body = {}) {
         try {
           const item = await fetchOfficialItemDetail(accessToken,id,me.site_id === 'CBT');
           if (Object.keys(item).length) itemDetails.set(String(id), item);
-          const picture = item.thumbnail || item.secure_thumbnail || item.pictures?.[0]?.secure_url || item.pictures?.[0]?.url || item.picture_url || '';
+          const picture = item.pictures?.[0]?.secure_url || item.pictures?.[0]?.url || item.picture_url || item.secure_thumbnail || item.thumbnail || '';
           if (picture) itemPictures.set(String(id), picture.replace(/^http:/, 'https:'));
         } catch (error) {
           console.warn('[Orders] 商品图片读取失败:', id, error.response?.status || error.message);
@@ -3207,10 +3210,10 @@ async function syncOrdersForUser(authUser, body = {}) {
     let imported = 0;
     for (const order of sourceOrders) {
       const shipment = order._shipment_detail || {};
-      const orderItems = (order.order_items || []).map(entry => ({
-        ...entry,
-        item: { ...entry.item, thumbnail: entry.item?.thumbnail || entry.item?.secure_thumbnail || entry.item?.picture_url || entry.item?.pictures?.[0]?.secure_url || entry.item?.pictures?.[0]?.url || itemPictures.get(String(entry.item?.id)) || '' }
-      }));
+      const orderItems = (order.order_items || []).map(entry => {
+        const officialPicture = itemPictures.get(String(entry.item?.id)) || entry.item?.pictures?.[0]?.secure_url || entry.item?.pictures?.[0]?.url || entry.item?.picture_url || entry.item?.secure_thumbnail || entry.item?.thumbnail || '';
+        return { ...entry, item: { ...entry.item, thumbnail: officialPicture, picture_url: officialPicture } };
+      });
       const itemId = order.order_items?.[0]?.item?.id || '';
       const siteId = shipment.source?.site_id || shipment.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '';
       const country = ({ MLM:'MX', MLB:'BR', MLC:'CL', MCO:'CO', MLA:'AR' })[siteId] || siteId;
@@ -3287,11 +3290,17 @@ async function syncOrdersForUser(authUser, body = {}) {
           logistic_type=EXCLUDED.logistic_type,pack_id=EXCLUDED.pack_id,
           handling_deadline=EXCLUDED.handling_deadline,deadline_is_estimated=EXCLUDED.deadline_is_estimated,
           cancellation_reason=EXCLUDED.cancellation_reason,shipment_data=EXCLUDED.shipment_data,
-          store_user_id=EXCLUDED.store_user_id,sale_fee=EXCLUDED.sale_fee,shipping_fee=EXCLUDED.shipping_fee,
-          net_amount=EXCLUDED.net_amount,refund_amount=EXCLUDED.refund_amount,other_fee=EXCLUDED.other_fee,
-          billing_data=EXCLUDED.billing_data,finance_is_official=EXCLUDED.finance_is_official,
-          finance_synced_at=EXCLUDED.finance_synced_at,owner_username=EXCLUDED.owner_username,
-          gross_amount_usd=EXCLUDED.gross_amount_usd,net_amount_usd=EXCLUDED.net_amount_usd,
+          store_user_id=EXCLUDED.store_user_id,
+          sale_fee=CASE WHEN EXCLUDED.finance_is_official OR NOT ml_orders.finance_is_official THEN EXCLUDED.sale_fee ELSE ml_orders.sale_fee END,
+          shipping_fee=CASE WHEN EXCLUDED.finance_is_official OR NOT ml_orders.finance_is_official THEN EXCLUDED.shipping_fee ELSE ml_orders.shipping_fee END,
+          net_amount=COALESCE(EXCLUDED.net_amount,ml_orders.net_amount),refund_amount=EXCLUDED.refund_amount,
+          other_fee=CASE WHEN EXCLUDED.finance_is_official OR NOT ml_orders.finance_is_official THEN EXCLUDED.other_fee ELSE ml_orders.other_fee END,
+          billing_data=CASE WHEN EXCLUDED.finance_is_official THEN EXCLUDED.billing_data ELSE ml_orders.billing_data END,
+          finance_is_official=(ml_orders.finance_is_official OR EXCLUDED.finance_is_official),
+          finance_synced_at=CASE WHEN EXCLUDED.finance_is_official THEN EXCLUDED.finance_synced_at ELSE ml_orders.finance_synced_at END,
+          owner_username=EXCLUDED.owner_username,
+          gross_amount_usd=COALESCE(EXCLUDED.gross_amount_usd,ml_orders.gross_amount_usd),
+          net_amount_usd=COALESCE(EXCLUDED.net_amount_usd,ml_orders.net_amount_usd),
           refund_amount_usd=EXCLUDED.refund_amount_usd,updated_at=NOW()`,
         [String(order.id), order.status || '', order.date_created || null, order.date_closed || null,
           order.buyer?.id ? String(order.buyer.id) : null, order.buyer?.nickname || '', order.currency_id || '',
@@ -3337,6 +3346,7 @@ async function syncOrdersForUser(authUser, body = {}) {
       imported++;
     }
     queueReadyToShipLabelCapture(req.authUser,String(me.id || sellerId),accessToken,sourceOrders);
+    queuePendingOfficialPayoutBackfill(req.authUser,String(me.id || sellerId),accessToken);
     return { imported, available: response.data?.paging?.total || imported, sellerId, storeId: sellerId,
       account: { id: me.id, nickname: me.nickname || '', siteId: me.site_id || '', countryId: me.country_id || '',
         listings: listingsResponse?.data?.paging?.total ?? listingsResponse?.data?.results?.length ?? null } };
@@ -5076,6 +5086,57 @@ function queueReadyToShipLabelCapture(authUser,storeUserId,accessToken,orders) {
         await saveOrderApiAudit(authUser.username,storeUserId,String(order.id),'shipment_label_cache',shipmentId,
           { success: false, officialError: decodeOfficialLabelError(error).auditData }).catch(() => {});
       }
+    }
+  });
+}
+
+const payoutBackfillRunning = new Set();
+function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
+  const key = `${String(authUser.username).toLowerCase()}:${storeUserId}`;
+  if (payoutBackfillRunning.has(key)) return;
+  payoutBackfillRunning.add(key);
+  setImmediate(async () => {
+    try {
+      const pending = await pool.query(`SELECT ml_order_id,paid_amount,refund_amount,currency,raw_data
+        FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND net_amount_usd IS NULL
+        ORDER BY date_created DESC LIMIT 200`,[authUser.username,String(storeUserId)]);
+      const groups = new Map();
+      for (const order of pending.rows) {
+        const localSellerId = String(order.raw_data?.seller?.id || storeUserId);
+        if (!groups.has(localSellerId)) groups.set(localSellerId,[]);
+        groups.get(localSellerId).push(order);
+      }
+      for (const [localSellerId,orders] of groups) {
+        for (let index = 0; index < orders.length; index += 60) {
+          const batch = orders.slice(index,index + 60);
+          try {
+            const response = await axios.get('https://api.mercadolibre.com/billing/integration/group/ML/order/details', {
+              params: { order_ids: batch.map(order => order.ml_order_id).join(','), seller_id: localSellerId },
+              headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
+            });
+            const details = new Map((response.data?.results || []).map(detail => [String(detail.order_id),detail]));
+            for (const order of batch) {
+              const detail = details.get(String(order.ml_order_id));
+              if (!detail) continue;
+              const grossAmount = Number(order.paid_amount || 0), refundAmount = Number(order.refund_amount || 0);
+              const officialFinance = parseOrderBilling(detail,grossAmount);
+              if (!officialFinance?.hasOfficialLedger) continue;
+              const netAmount = officialFinance.netAmount ?? Number((grossAmount - refundAmount + Number(officialFinance.ledgerDelta || 0)).toFixed(2));
+              const usdRate = await getBillingFxRate(String(order.currency || '').toUpperCase(),'USD');
+              const netAmountUsd = usdRate === null ? null : Number((netAmount * usdRate).toFixed(2));
+              await pool.query(`UPDATE ml_orders SET sale_fee=$1,shipping_fee=$2,other_fee=$3,net_amount=$4,
+                net_amount_usd=COALESCE($5,net_amount_usd),billing_data=$6::jsonb,finance_is_official=TRUE,
+                finance_synced_at=NOW(),updated_at=NOW() WHERE owner_username=$7 AND ml_order_id=$8`,
+                [officialFinance.saleFee,officialFinance.shippingFee,officialFinance.otherFee,netAmount,netAmountUsd,JSON.stringify(detail),authUser.username,String(order.ml_order_id)]);
+              await saveOrderApiAudit(authUser.username,storeUserId,String(order.ml_order_id),'billing_backfill',String(order.ml_order_id),detail);
+            }
+          } catch (error) {
+            console.warn('[Orders] 历史应回款补抓失败:', localSellerId, error.response?.status || error.message);
+          }
+        }
+      }
+    } finally {
+      payoutBackfillRunning.delete(key);
     }
   });
 }
