@@ -443,22 +443,27 @@ async function initOrderManagementTables() {
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_payout_repair_version',$1,NOW())
       ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [payoutRepairVersion]);
   }
-  // LOCKED REPAIR: receiver_shipping_cost can be reported in the buyer site's
-  // local currency while CBT orders and the rest of their ledger are USD. Older
-  // code cached the raw local number as USD. Rebuild only rows containing that
-  // official field; the payout resolver itself remains unchanged.
-  const mixedCurrencyRepairVersion='2026-07-25-receiver-shipping-currency-v1';
+  // LOCKED REPAIR: every official amount, including an explicit settlement net,
+  // must carry its source currency before it reaches payout. Rebuild all cached
+  // official billing rows with the shared currency boundary. Unknown-currency
+  // outliers are cleared to pending instead of being mislabeled as USD.
+  const mixedCurrencyRepairVersion='2026-07-26-all-official-money-currency-v2';
   const mixedCurrencyRepairSetting=await pool.query("SELECT value FROM settings WHERE key='order_mixed_currency_repair_version'");
   if (mixedCurrencyRepairSetting.rows[0]?.value!==mixedCurrencyRepairVersion) {
     const { rows:mixedCurrencyRows }=await pool.query(`SELECT ml_order_id,status,shipment_status,paid_amount,
-        refund_amount,currency,billing_data
-      FROM ml_orders WHERE finance_is_official=TRUE AND billing_data<>'{}'::jsonb
-        AND billing_data::text ILIKE '%receiver_shipping_cost%'`);
+        refund_amount,currency,billing_data,gross_amount_usd,net_amount_usd
+      FROM ml_orders WHERE finance_is_official=TRUE AND billing_data<>'{}'::jsonb`);
     for (const row of mixedCurrencyRows) {
       const normalized=await normalizeParsedOrderBilling(
         parseOrderBilling(row.billing_data,Number(row.paid_amount || 0)),row.currency,getBillingFxRate
       );
-      if (!normalized || normalized.currencyMismatch) continue;
+      if (!normalized || normalized.currencyMismatch) {
+        const cached=Math.abs(Number(row.net_amount_usd || 0));
+        const gross=Math.abs(Number(row.gross_amount_usd ?? row.paid_amount ?? 0));
+        if (cached>Math.max(1000,gross*20)) await pool.query(`UPDATE ml_orders SET net_amount=NULL,
+          net_amount_usd=NULL,updated_at=NOW() WHERE ml_order_id=$1`,[String(row.ml_order_id)]);
+        continue;
+      }
       const resolved=resolveOfficialOrderPayout({
         orderStatus:row.status,shipmentStatus:row.shipment_status,grossAmount:row.paid_amount,
         refundAmount:row.refund_amount,explicitOfficialNet:normalized.netAmount,
@@ -466,6 +471,8 @@ async function initOrderManagementTables() {
       });
       const usdRate=resolved.amount===null ? null : await getBillingFxRate(row.currency,'USD');
       const netAmountUsd=resolved.amount===null || usdRate===null ? null : Number((resolved.amount*usdRate).toFixed(2));
+      if (resolved.amount===null && !['cancelled','refunded'].includes(String(row.status || '').toLowerCase()) &&
+          Number(row.refund_amount || 0)<=0) continue;
       await pool.query(`UPDATE ml_orders SET sale_fee=$1,shipping_fee=$2,other_fee=$3,
         net_amount=$4,net_amount_usd=$5,updated_at=NOW() WHERE ml_order_id=$6`,[
         normalized.saleFee,normalized.shippingFee,normalized.otherFee,resolved.amount,netAmountUsd,String(row.ml_order_id)
@@ -2565,6 +2572,9 @@ async function getMLSellerId(accessToken) {
 function parseOrderBilling(detail, grossAmount) {
   if (!detail || typeof detail !== 'object') return null;
   let localToUsdRate = null, billingItemId = '';
+  const currencyOf = (value,inherited='') => String(value?.currency_info?.currency_id || value?.currency_info?.id ||
+    value?.currency_id || value?.currency || inherited || '').toUpperCase();
+  const rootCurrency=currencyOf(detail);
   const inspectBillingContext = value => {
     if (Array.isArray(value)) return value.forEach(inspectBillingContext);
     if (!value || typeof value !== 'object') return;
@@ -2578,13 +2588,19 @@ function parseOrderBilling(detail, grossAmount) {
   const localCurrencyBySite = { MLB:'BRL',MLM:'MXN',MLC:'CLP',MCO:'COP',MLA:'ARS' };
   const receiverCurrency = localCurrencyBySite[billingItemId.match(/^(MLB|MLM|MLC|MCO|MLA)/)?.[1]] || '';
   const seen = new Set(), receiverShippingSeen = new Set(), entries = [];
-  const walk = (value, inheritedCurrency = '') => {
+  const walk = (value, inheritedCurrency = rootCurrency) => {
     if (Array.isArray(value)) return value.forEach(item => walk(item, inheritedCurrency));
     if (!value || typeof value !== 'object') return;
     const currency = String(value.currency_info?.currency_id || value.currency_info?.id || value.currency_id || inheritedCurrency || '').toUpperCase();
     if (value.detail_amount !== undefined && value.detail_amount !== null) {
       const key = String(value.detail_id || `${value.detail_sub_type || ''}:${value.detail_description || ''}:${value.detail_amount}`);
-      if (!seen.has(key)) { seen.add(key); entries.push({ ...value, _currencyId: currency }); }
+      if (!seen.has(key)) {
+        seen.add(key);
+        entries.push({ ...value,_currencyId:currency,_currencyUnknown:!currency,
+          _normalizedUsdAmount:currency && currency===receiverCurrency && localToUsdRate
+            ? Math.abs(Number(value.detail_amount || 0))*localToUsdRate
+            : value._normalizedUsdAmount });
+      }
     }
     const receiverShippingCost = Number(value.shipping_info?.receiver_shipping_cost);
     if (Number.isFinite(receiverShippingCost) && receiverShippingCost !== 0) {
@@ -2641,14 +2657,22 @@ function parseOrderBilling(detail, grossAmount) {
     if (!entries.length) ledgerDelta -= Math.abs(explicitShipping);
   }
   const netCandidates = [
-    detail.net_received_amount, detail.net_amount, detail.total_net_amount,
-    detail.settlement_amount, detail.amount_to_receive,
-    detail.amounts?.net, detail.amounts?.net_amount, detail.summary?.net_amount
+    { value:detail.net_received_amount,currency:rootCurrency },
+    { value:detail.net_amount,currency:rootCurrency },
+    { value:detail.total_net_amount,currency:rootCurrency },
+    { value:detail.settlement_amount,currency:rootCurrency },
+    { value:detail.amount_to_receive,currency:rootCurrency },
+    { value:detail.amounts?.net,currency:currencyOf(detail.amounts,rootCurrency) },
+    { value:detail.amounts?.net_amount,currency:currencyOf(detail.amounts,rootCurrency) },
+    { value:detail.summary?.net_amount,currency:currencyOf(detail.summary,rootCurrency) }
   ];
-  const officialNetValue = netCandidates.find(value => value !== undefined && value !== null && Number.isFinite(Number(value)));
+  const officialNet = netCandidates.find(candidate => candidate.value !== undefined && candidate.value !== null && Number.isFinite(Number(candidate.value)));
+  const officialNetValue=officialNet?.value;
   const hasOfficialLedger = entries.length > 0 || explicitSaleFee !== 0 || explicitShipping !== 0 || officialNetValue !== undefined;
   return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, ledgerDelta, hasOfficialLedger,
-    netAmount: officialNetValue === undefined ? null : Number(officialNetValue), entries };
+    netAmount: officialNetValue === undefined ? null : Number(officialNetValue),
+    netAmountCurrency:String(officialNet?.currency || ''),netAmountCurrencyUnknown:Boolean(officialNet && !officialNet.currency),
+    ledgerCurrency:rootCurrency,localToUsdRate,receiverCurrency,grossAmount:Number(grossAmount || 0),entries };
 }
 
 function billingEntryLedgerDirection(entry) {
@@ -2738,15 +2762,28 @@ async function aggregatePackedOrders(rows) {
       group.reputationReason = [group.reputationReason, row.reputationReason].filter(Boolean).join('；');
     }
     for (const field of ['paidAmount','totalAmount','saleFee','shippingFee','otherFee','refundAmount','productCost']) group[field] += Number(row[field] || 0);
-    for (const [field, flag] of [['grossAmountUsd','_hasGrossAmountUsd'],['netAmountUsd','_hasNetAmountUsd'],['refundAmountUsd','_hasRefundAmountUsd']]) {
+    for (const [field, flag] of [['grossAmountUsd','_hasGrossAmountUsd'],['refundAmountUsd','_hasRefundAmountUsd']]) {
       if (row[field] !== null && row[field] !== undefined) { group[field] += Number(row[field] || 0); group[flag] = true; }
+    }
+    if (row.netAmountUsd !== null && row.netAmountUsd !== undefined) {
+      const rowPayout=Math.abs(Number(row.netAmountUsd || 0));
+      const rowGross=Math.abs(Number(row.grossAmountUsd ?? row.paidAmount ?? 0));
+      if (rowPayout>Math.max(1000,rowGross*20)) {
+        // Last-resort presentation boundary: never expose a cached COP/CLP/etc.
+        // amount as USD, even if an old row escaped the startup repair.
+        group.billingCurrencyMismatch=true;
+        group.payoutCurrencyAnomaly=true;
+      } else {
+        group.netAmountUsd+=Number(row.netAmountUsd || 0);
+        group._hasNetAmountUsd=true;
+        group._netAmountUsdCount++;
+      }
     }
     if (row.netAmount !== null && row.netAmount !== undefined) {
       group._fallbackNetAmount += Number(row.netAmount || 0);
       group._hasFallbackNetAmount = true;
       group._netAmountCount++;
     }
-    if (row.netAmountUsd !== null && row.netAmountUsd !== undefined) group._netAmountUsdCount++;
     group.financeIsOfficial ||= Boolean(row.financeIsOfficial);
     const parsed = parseOrderBilling(row.billingData, Number(row.paidAmount || 0));
     if (parsed?.hasOfficialLedger) group._hasOfficialLedger = true;
@@ -2809,6 +2846,17 @@ async function aggregatePackedOrders(rows) {
     group.refundAmountUsd = group._hasRefundAmountUsd ? Number(group.refundAmountUsd.toFixed(2)) : null;
     group.payoutIsOfficial = group.netAmountUsd !== null;
     if (group.payoutIsOfficial) group.payoutSource = 'cached_official_order_payout';
+    if (!group.payoutIsOfficial) {
+      if (group.payoutCurrencyAnomaly) {
+        group.payoutPendingReason='官方应回款原币种异常，系统已阻止将本币直接当作 USD，并会重新换算';
+      } else if (group.billingCurrencyMismatch) {
+        group.payoutPendingReason='官方账单缺少可靠币种或汇率，暂不计算回款，服务器会继续补抓';
+      } else if (String(group.status || '').toLowerCase()==='cancelled') {
+        group.payoutPendingReason='官方取消冲销明细尚未返回；取得明细后将按费用与返还的实际净额自动更新';
+      } else {
+        group.payoutPendingReason='官方结算净额尚未返回，服务器会继续自动补抓';
+      }
+    }
     group.dimensionsChanged = dimensionSnapshotsDiffer(group.dimensionsOriginal,group.dimensionsLatest);
     delete group._fallbackNetAmount; delete group._hasFallbackNetAmount; delete group._hasGrossAmountUsd; delete group._hasNetAmountUsd; delete group._hasRefundAmountUsd; delete group._rowCount; delete group._netAmountCount; delete group._netAmountUsdCount; delete group._billingEntryIds; delete group._officialEntryCount; delete group._officialLedgerDelta; delete group._hasOfficialLedger; delete group._shippingBuyerPaid; delete group._shippingSellerCharge; delete group._shippingAdjustmentEvidence; delete group._officialFees; delete group._officialSignedFees;
   }
@@ -2887,7 +2935,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.36',
+    version: '2026-07-26.37',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2905,6 +2953,9 @@ app.get('/api/health/order-management', (req, res) => {
     officialPayoutOnly: true,
     receiverShippingCreditIncluded: true,
     receiverShippingLocalCurrencyConversion: true,
+    cancelledOrderOfficialReversalPayout: true,
+    explicitOfficialNetCurrencyNormalization: true,
+    impossibleCachedPayoutSuppression: true,
     shippingLedgerExplanation: true,
     combinedSalesCommission: true,
     orderDimensionSnapshots: true,
@@ -5372,9 +5423,8 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
                 paymentOfficialNet: null
               });
               const netAmount = payoutResolution.amount;
-              if (netAmount === null) continue;
-              const usdRate = await getBillingFxRate(String(order.currency || '').toUpperCase(),'USD');
-              const netAmountUsd = usdRate === null ? null : Number((netAmount * usdRate).toFixed(2));
+              const usdRate = netAmount === null ? null : await getBillingFxRate(String(order.currency || '').toUpperCase(),'USD');
+              const netAmountUsd = netAmount === null || usdRate === null ? null : Number((netAmount * usdRate).toFixed(2));
               await pool.query(`UPDATE ml_orders SET sale_fee=$1,shipping_fee=$2,other_fee=$3,net_amount=$4,
                 net_amount_usd=$5,billing_data=$6::jsonb,finance_is_official=TRUE,
                 finance_synced_at=NOW(),updated_at=NOW() WHERE owner_username=$7 AND ml_order_id=$8`,

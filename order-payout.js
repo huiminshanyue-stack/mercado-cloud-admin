@@ -46,15 +46,16 @@ function resolveOfficialOrderPayout({
   const gross = finiteNumber(grossAmount) ?? 0;
   const refunded = finiteNumber(refundAmount) ?? 0;
   const cancelled = String(orderStatus || '').trim().toLowerCase() === 'cancelled';
-  const dispatched = isDispatchedShipment(shipmentStatus);
   const fullyRefunded = gross > 0 && refunded >= gross - 0.01;
 
-  // An order cancelled before dispatch has no sale principal to settle. Its payout
-  // is only the official fee/credit ledger balance (normally 0 after reversal).
-  if (cancelled && !dispatched) {
+  // A cancelled order has no remaining sale principal. Its payout is the balance
+  // of Mercado Libre's official fee/credit reversal ledger. This also applies
+  // after dispatch: a retained shipping charge remains negative, while a complete
+  // official reversal resolves to zero instead of being stuck at “pending”.
+  if (cancelled) {
     if (hasOfficialLedger) {
       const delta = finiteNumber(officialLedgerDelta) ?? 0;
-      return { amount: Number(delta.toFixed(2)), source: 'cancelled_before_dispatch_ledger' };
+      return { amount: Number(delta.toFixed(2)), source: 'cancelled_official_ledger' };
     }
     return { amount: null, source: 'awaiting_cancelled_order_settlement' };
   }
@@ -67,9 +68,9 @@ function resolveOfficialOrderPayout({
     return { amount: null, source: 'awaiting_full_refund_settlement' };
   }
 
-  // For dispatched cancellations and partial refunds, wait for Mercado Libre's
-  // explicit settlement net. Deriving it from gross sales would fabricate payout.
-  if (cancelled || refunded > 0) {
+  // For partial refunds, wait for Mercado Libre's explicit settlement net.
+  // Deriving it from gross sales would fabricate payout.
+  if (refunded > 0) {
     return { amount: null, source: 'awaiting_official_reversal_settlement' };
   }
 
