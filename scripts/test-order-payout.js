@@ -6,7 +6,8 @@ const {
   assertLockedPayoutInvariant,
   resolveOfficialOrderPayout
 } = require('../order-payout');
-const { LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE,normalizeParsedOrderBilling } = require('../order-billing-normalization');
+const { LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE,normalizeOfficialMoneyAmount,
+  normalizeParsedOrderBilling } = require('../order-billing-normalization');
 
 const resolve = overrides => resolveOfficialOrderPayout({
   orderStatus: 'paid',
@@ -111,6 +112,12 @@ const unsafeUnknownNet=await normalizeParsedOrderBilling({
 },'USD',async(from,to)=>from===to ? 1 : null);
 assert.equal(unsafeUnknownNet.netAmount,null);
 assert.equal(unsafeUnknownNet.currencyMismatch,true);
+
+const paymentFallback=await normalizeOfficialMoneyAmount({
+  amount:-65004.64,sourceCurrency:'USD',currencyUnknown:false,targetCurrency:'USD',receiverCurrency:'COP',
+  localToUsdRate:0.00025,grossAmount:25.12,getFxRate:async(from,to)=>from===to ? 1 : null
+});
+assert.deepEqual(paymentFallback,{ amount:-16.25116,currencyMismatch:false,currencyInferred:true });
 
 console.log('order payout regression tests passed');
 })().catch(error=>{ console.error(error);process.exitCode=1; });

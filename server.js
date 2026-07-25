@@ -5,7 +5,7 @@ const axios = require('axios');
 const path = require('path');
 const { Pool } = require('pg');
 const { resolveOfficialOrderPayout } = require('./order-payout');
-const { normalizeParsedOrderBilling } = require('./order-billing-normalization');
+const { normalizeOfficialMoneyAmount,normalizeParsedOrderBilling } = require('./order-billing-normalization');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
@@ -447,12 +447,12 @@ async function initOrderManagementTables() {
   // must carry its source currency before it reaches payout. Rebuild all cached
   // official billing rows with the shared currency boundary. Unknown-currency
   // outliers are cleared to pending instead of being mislabeled as USD.
-  const mixedCurrencyRepairVersion='2026-07-26-all-official-money-currency-v2';
+  const mixedCurrencyRepairVersion='2026-07-26-all-official-money-currency-v3';
   const mixedCurrencyRepairSetting=await pool.query("SELECT value FROM settings WHERE key='order_mixed_currency_repair_version'");
   if (mixedCurrencyRepairSetting.rows[0]?.value!==mixedCurrencyRepairVersion) {
     const { rows:mixedCurrencyRows }=await pool.query(`SELECT ml_order_id,status,shipment_status,paid_amount,
-        refund_amount,currency,billing_data,gross_amount_usd,net_amount_usd
-      FROM ml_orders WHERE finance_is_official=TRUE AND billing_data<>'{}'::jsonb`);
+        refund_amount,currency,billing_data,gross_amount_usd,net_amount_usd,raw_data,site_id
+      FROM ml_orders WHERE finance_is_official=TRUE`);
     for (const row of mixedCurrencyRows) {
       const normalized=await normalizeParsedOrderBilling(
         parseOrderBilling(row.billing_data,Number(row.paid_amount || 0)),row.currency,getBillingFxRate
@@ -460,19 +460,40 @@ async function initOrderManagementTables() {
       if (!normalized || normalized.currencyMismatch) {
         const cached=Math.abs(Number(row.net_amount_usd || 0));
         const gross=Math.abs(Number(row.gross_amount_usd ?? row.paid_amount ?? 0));
-        if (cached>Math.max(1000,gross*20)) await pool.query(`UPDATE ml_orders SET net_amount=NULL,
-          net_amount_usd=NULL,updated_at=NOW() WHERE ml_order_id=$1`,[String(row.ml_order_id)]);
+        const paymentNet=await normalizeOfficialPaymentNet(row.raw_data?.payments,row.currency,row.site_id,
+          Number(row.paid_amount || 0),normalized);
+        const paymentResolution=resolveOfficialOrderPayout({ orderStatus:row.status,shipmentStatus:row.shipment_status,
+          grossAmount:row.paid_amount,refundAmount:row.refund_amount,explicitOfficialNet:null,
+          hasOfficialLedger:false,officialLedgerDelta:null,paymentOfficialNet:paymentNet });
+        if (paymentResolution.amount!==null) {
+          const usdRate=await getBillingFxRate(row.currency,'USD');
+          const repairedUsd=usdRate===null ? null : Number((paymentResolution.amount*usdRate).toFixed(2));
+          await pool.query(`UPDATE ml_orders SET net_amount=$1,net_amount_usd=$2,updated_at=NOW()
+            WHERE ml_order_id=$3`,[paymentResolution.amount,repairedUsd,String(row.ml_order_id)]);
+        } else if (cached>Math.max(1000,gross*20)) {
+          await pool.query(`UPDATE ml_orders SET net_amount=NULL,net_amount_usd=NULL,updated_at=NOW()
+            WHERE ml_order_id=$1`,[String(row.ml_order_id)]);
+        }
         continue;
       }
+      const normalizedPaymentNet=await normalizeOfficialPaymentNet(row.raw_data?.payments,row.currency,row.site_id,
+        Number(row.paid_amount || 0),normalized);
       const resolved=resolveOfficialOrderPayout({
         orderStatus:row.status,shipmentStatus:row.shipment_status,grossAmount:row.paid_amount,
         refundAmount:row.refund_amount,explicitOfficialNet:normalized.netAmount,
-        hasOfficialLedger:normalized.hasOfficialLedger,officialLedgerDelta:normalized.ledgerDelta,paymentOfficialNet:null
+        hasOfficialLedger:normalized.hasOfficialLedger,officialLedgerDelta:normalized.ledgerDelta,
+        paymentOfficialNet:normalizedPaymentNet
       });
       const usdRate=resolved.amount===null ? null : await getBillingFxRate(row.currency,'USD');
       const netAmountUsd=resolved.amount===null || usdRate===null ? null : Number((resolved.amount*usdRate).toFixed(2));
       if (resolved.amount===null && !['cancelled','refunded'].includes(String(row.status || '').toLowerCase()) &&
-          Number(row.refund_amount || 0)<=0) continue;
+          Number(row.refund_amount || 0)<=0) {
+        const cached=Math.abs(Number(row.net_amount_usd || 0));
+        const gross=Math.abs(Number(row.gross_amount_usd ?? row.paid_amount ?? 0));
+        if (cached>Math.max(1000,gross*20)) await pool.query(`UPDATE ml_orders SET net_amount=NULL,
+          net_amount_usd=NULL,updated_at=NOW() WHERE ml_order_id=$1`,[String(row.ml_order_id)]);
+        continue;
+      }
       await pool.query(`UPDATE ml_orders SET sale_fee=$1,shipping_fee=$2,other_fee=$3,
         net_amount=$4,net_amount_usd=$5,updated_at=NOW() WHERE ml_order_id=$6`,[
         normalized.saleFee,normalized.shippingFee,normalized.otherFee,resolved.amount,netAmountUsd,String(row.ml_order_id)
@@ -2697,6 +2718,26 @@ async function getBillingFxRate(fromCurrency, toCurrency) {
   return null;
 }
 
+async function normalizeOfficialPaymentNet(payments,targetCurrency,siteId,grossAmount,officialFinance=null) {
+  const target=String(targetCurrency || '').toUpperCase();
+  const localCurrencyBySite={ MLB:'BRL',MLM:'MXN',MLC:'CLP',MCO:'COP',MLA:'ARS' };
+  const receiverCurrency=String(officialFinance?.receiverCurrency || localCurrencyBySite[String(siteId || '').toUpperCase()] || '').toUpperCase();
+  let found=false,total=0;
+  for (const payment of Array.isArray(payments) ? payments : []) {
+    const amount=payment?.transaction_details?.net_received_amount;
+    if (amount===undefined || amount===null || !Number.isFinite(Number(amount))) continue;
+    found=true;
+    const sourceCurrency=String(payment?.transaction_details?.net_received_currency_id ||
+      payment?.transaction_details?.currency_id || payment?.currency_id || payment?.currency || target).toUpperCase();
+    const result=await normalizeOfficialMoneyAmount({ amount:Number(amount),sourceCurrency,currencyUnknown:!sourceCurrency,
+      targetCurrency:target,receiverCurrency,localToUsdRate:officialFinance?.localToUsdRate,
+      grossAmount,getFxRate:getBillingFxRate });
+    if (result.currencyMismatch || result.amount===null) return null;
+    total+=result.amount;
+  }
+  return found ? Number(total.toFixed(2)) : null;
+}
+
 function translateBillingDescription(value, category, subType) {
   const text = String(value || '').trim();
   const key = text.toLowerCase();
@@ -2935,7 +2976,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.37',
+    version: '2026-07-26.38',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2955,6 +2996,7 @@ app.get('/api/health/order-management', (req, res) => {
     receiverShippingLocalCurrencyConversion: true,
     cancelledOrderOfficialReversalPayout: true,
     explicitOfficialNetCurrencyNormalization: true,
+    officialPaymentNetCurrencyNormalization: true,
     impossibleCachedPayoutSuppression: true,
     shippingLedgerExplanation: true,
     combinedSalesCommission: true,
@@ -3462,7 +3504,9 @@ async function syncOrdersForUser(authUser, body = {}) {
       const finalShippingFee = officialFinance ? officialFinance.shippingFee : shippingFee;
       const otherFee = officialFinance ? officialFinance.otherFee : null;
       // 应回款优先采用官方明确净额；取消未发货和全额退款为 0，其他冲销场景不按销售额猜测。
-      const paymentOfficialNet = netParts.length ? netParts.reduce((sum, value) => sum + Number(value || 0), 0) : null;
+      const paymentOfficialNet = await normalizeOfficialPaymentNet(
+        payments,orderCurrency,order.site_id,grossAmount,officialFinance
+      );
       const payoutResolution = resolveOfficialOrderPayout({
         orderStatus: order.status,
         shipmentStatus: shipment.status,
@@ -3471,7 +3515,7 @@ async function syncOrdersForUser(authUser, body = {}) {
         explicitOfficialNet: officialFinance?.netAmount,
         hasOfficialLedger: officialFinance?.hasOfficialLedger,
         officialLedgerDelta: officialFinance?.ledgerDelta,
-        paymentOfficialNet: officialFinance?.currencyMismatch ? null : paymentOfficialNet
+        paymentOfficialNet
       });
       const finalNetAmount = payoutResolution.amount;
       const usdRate = await getBillingFxRate(orderCurrency, 'USD');
@@ -5412,6 +5456,8 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
                 parseOrderBilling(detail,grossAmount),String(order.currency || '').toUpperCase(),getBillingFxRate
               );
               if (!officialFinance) continue;
+              const paymentOfficialNet=await normalizeOfficialPaymentNet(order.raw_data?.payments,
+                String(order.currency || '').toUpperCase(),order.raw_data?.site_id,grossAmount,officialFinance);
               const payoutResolution = resolveOfficialOrderPayout({
                 orderStatus: order.status,
                 shipmentStatus: order.shipment_status,
@@ -5420,7 +5466,7 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
                 explicitOfficialNet: officialFinance.netAmount,
                 hasOfficialLedger: officialFinance.hasOfficialLedger,
                 officialLedgerDelta: officialFinance.ledgerDelta,
-                paymentOfficialNet: null
+                paymentOfficialNet
               });
               const netAmount = payoutResolution.amount;
               const usdRate = netAmount === null ? null : await getBillingFxRate(String(order.currency || '').toUpperCase(),'USD');

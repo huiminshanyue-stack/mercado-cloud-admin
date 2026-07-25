@@ -45,6 +45,42 @@ async function normalizeEntryAmount(entry,targetCurrency,getFxRate) {
   return rate === null || rawAmount === null ? null : Math.abs(rawAmount)*rate;
 }
 
+async function normalizeOfficialMoneyAmount({
+  amount,sourceCurrency,currencyUnknown,targetCurrency,receiverCurrency,
+  localToUsdRate,grossAmount,getFxRate
+}) {
+  const rawAmount=finiteNumber(amount);
+  const target=String(targetCurrency || '').toUpperCase();
+  const source=String(sourceCurrency || '').toUpperCase();
+  const receiver=String(receiverCurrency || '').toUpperCase();
+  const officialRate=finiteNumber(localToUsdRate);
+  if (rawAmount===null || !target) return { amount:null,currencyMismatch:true,currencyInferred:false };
+  const plausibleLimit=Math.max(1000,Math.abs(finiteNumber(grossAmount) || 0)*20);
+  let normalized=null,currencyMismatch=false,currencyInferred=false;
+  if (!currencyUnknown) {
+    const rate=!source || source===target ? 1 : await getFxRate(source,target);
+    if (rate===null) currencyMismatch=true;
+    else normalized=rawAmount*rate;
+  } else {
+    currencyMismatch=true;
+  }
+  if ((currencyUnknown || (normalized!==null && Math.abs(normalized)>plausibleLimit)) &&
+      receiver && receiver!==target && Math.abs(rawAmount)>plausibleLimit) {
+    const rate=target==='USD' && officialRate!==null ? officialRate : await getFxRate(receiver,target);
+    const inferred=rate===null ? null : rawAmount*rate;
+    if (inferred!==null && Math.abs(inferred)<=plausibleLimit) {
+      normalized=inferred;
+      currencyMismatch=false;
+      currencyInferred=true;
+    }
+  }
+  if (normalized!==null && Math.abs(normalized)>plausibleLimit) {
+    normalized=null;
+    currencyMismatch=true;
+  }
+  return { amount:normalized,currencyMismatch,currencyInferred };
+}
+
 /**
  * LOCKED CURRENCY BOUNDARY — all official billing entries must be converted to
  * the order currency before they can affect fees or payout. In particular,
@@ -57,55 +93,19 @@ async function normalizeParsedOrderBilling(parsed,targetCurrency,getFxRate) {
   if (!target) return { ...parsed,hasOfficialLedger:false,currencyMismatch:true,ledgerCurrencyNormalized:false };
   const entries=Array.isArray(parsed.entries) ? parsed.entries : [];
   let normalizedNetAmount=parsed.netAmount;
-  let explicitNetCurrencyMismatch=false;
-  let explicitNetCurrencyInferred=false;
+  let explicitNetCurrencyMismatch=false,explicitNetCurrencyInferred=false;
   const netCurrency=String(parsed.netAmountCurrency || '').toUpperCase();
   const rawNetAmount=finiteNumber(parsed.netAmount);
   const receiverCurrency=String(parsed.receiverCurrency || '').toUpperCase();
   const officialLocalToUsd=finiteNumber(parsed.localToUsdRate);
   const grossAmount=Math.abs(finiteNumber(parsed.grossAmount) || 0);
-  const plausibleNetLimit=Math.max(1000,grossAmount*20);
-  const receiverToTargetRate=async()=>target==='USD' && officialLocalToUsd!==null
-    ? officialLocalToUsd
-    : await getFxRate(receiverCurrency,target);
-  if (rawNetAmount!==null && parsed.netAmountCurrencyUnknown) {
-    // Some cross-border billing responses omit the currency on an amount that is
-    // clearly in the buyer site's local currency (for example COP 65,004 for a
-    // USD 25 order). Infer only when the raw value is impossible as order
-    // currency and the official/local conversion yields a plausible settlement.
-    const inferredRate=receiverCurrency && receiverCurrency!==target && Math.abs(rawNetAmount)>plausibleNetLimit
-      ? await receiverToTargetRate()
-      : null;
-    const inferredAmount=inferredRate===null ? null : rawNetAmount*inferredRate;
-    if (inferredAmount!==null && Math.abs(inferredAmount)<=plausibleNetLimit) {
-      normalizedNetAmount=inferredAmount;
-      explicitNetCurrencyInferred=true;
-    } else {
-      normalizedNetAmount=null;
-      explicitNetCurrencyMismatch=true;
-    }
-  } else if (rawNetAmount!==null && netCurrency && netCurrency!==target) {
-    const rate=target==='USD' && netCurrency===receiverCurrency && officialLocalToUsd!==null
-      ? officialLocalToUsd
-      : await getFxRate(netCurrency,target);
-    if (rate===null) { normalizedNetAmount=null;explicitNetCurrencyMismatch=true; }
-    else normalizedNetAmount=rawNetAmount*rate;
-  }
-  // A few responses incorrectly inherit the order currency onto a local-currency
-  // net field. A value thousands of times larger than the order can never be a
-  // USD settlement. Use the response's own local/USD ratio when it proves the
-  // converted amount is plausible; otherwise suppress the field to pending.
-  if (rawNetAmount!==null && normalizedNetAmount!==null && Math.abs(normalizedNetAmount)>plausibleNetLimit) {
-    const inferredRate=receiverCurrency && receiverCurrency!==target ? await receiverToTargetRate() : null;
-    const inferredAmount=inferredRate===null ? null : rawNetAmount*inferredRate;
-    if (inferredAmount!==null && Math.abs(inferredAmount)<=plausibleNetLimit) {
-      normalizedNetAmount=inferredAmount;
-      explicitNetCurrencyInferred=true;
-      explicitNetCurrencyMismatch=false;
-    } else {
-      normalizedNetAmount=null;
-      explicitNetCurrencyMismatch=true;
-    }
+  if (rawNetAmount!==null) {
+    const result=await normalizeOfficialMoneyAmount({ amount:rawNetAmount,sourceCurrency:netCurrency,
+      currencyUnknown:parsed.netAmountCurrencyUnknown,targetCurrency:target,receiverCurrency,
+      localToUsdRate:officialLocalToUsd,grossAmount,getFxRate });
+    normalizedNetAmount=result.amount;
+    explicitNetCurrencyMismatch=result.currencyMismatch;
+    explicitNetCurrencyInferred=result.currencyInferred;
   }
   if (!entries.length) {
     const ledgerCurrency=String(parsed.ledgerCurrency || target).toUpperCase();
@@ -146,4 +146,4 @@ async function normalizeParsedOrderBilling(parsed,targetCurrency,getFxRate) {
 }
 
 module.exports={ LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE,finiteNumber,billingEntryDirection,billingEntryBucket,
-  normalizeEntryAmount,normalizeParsedOrderBilling };
+  normalizeEntryAmount,normalizeOfficialMoneyAmount,normalizeParsedOrderBilling };
