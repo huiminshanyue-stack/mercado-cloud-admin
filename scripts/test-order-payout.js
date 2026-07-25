@@ -1,7 +1,11 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { resolveOfficialOrderPayout } = require('../order-payout');
+const {
+  LOCKED_PAYOUT_EXAMPLE,
+  assertLockedPayoutInvariant,
+  resolveOfficialOrderPayout
+} = require('../order-payout');
 
 const resolve = overrides => resolveOfficialOrderPayout({
   orderStatus: 'paid',
@@ -32,5 +36,12 @@ assert.equal(resolve({ refundAmount: 40.86, officialLedgerDelta: -1.25 }).amount
 assert.equal(resolve({ refundAmount: 10 }).amount, null);
 assert.equal(resolve({ officialLedgerDelta: -7.53 }).amount, 33.33);
 assert.equal(resolve({ hasOfficialLedger: false, paymentOfficialNet: 35.7 }).amount, 35.7);
+assert.equal(assertLockedPayoutInvariant(), true);
+assert.deepEqual(LOCKED_PAYOUT_EXAMPLE, {
+  grossAmount: 21.52,
+  combinedSalesCommission: 2.69,
+  sellerShippingCharge: 11,
+  expectedPayout: 7.83
+});
 
 console.log('order payout regression tests passed');

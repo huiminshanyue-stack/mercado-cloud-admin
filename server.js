@@ -2647,6 +2647,8 @@ function classifyBillingEntry(entry) {
 }
 
 async function aggregatePackedOrders(rows) {
+  // LOCKED: aggregate cached per-order payout only. Never recalculate payout from
+  // gross amount here; doing so previously changed the approved USD 7.83 result.
   const groups = new Map();
   for (const row of rows) {
     const groupId = String(row.packId || row.orderId);
@@ -2822,7 +2824,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.24',
+    version: '2026-07-25.25',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2867,6 +2869,7 @@ app.get('/api/health/order-management', (req, res) => {
     reversalSafeOfficialPayout: true,
     cachedPayoutAggregationOnly: true,
     cancelledBeforeDispatchPayoutRepair: true,
+    lockedOfficialPayoutInvariant: '21.52-2.69-11.00=7.83',
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''

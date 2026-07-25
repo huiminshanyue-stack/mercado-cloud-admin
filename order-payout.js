@@ -10,6 +10,17 @@ function isDispatchedShipment(status) {
   return ['shipped', 'delivered'].includes(String(status || '').trim().toLowerCase());
 }
 
+// LOCKED BUSINESS INVARIANT — 2026-07-25, confirmed by the product owner.
+// Do not change these numbers or the payout rule without the owner's explicit
+// approval. This exact official-billing example must always resolve to USD 7.83:
+// gross USD 21.52 - combined commission USD 2.69 - seller shipping USD 11.00.
+const LOCKED_PAYOUT_EXAMPLE = Object.freeze({
+  grossAmount: 21.52,
+  combinedSalesCommission: 2.69,
+  sellerShippingCharge: 11.00,
+  expectedPayout: 7.83
+});
+
 /**
  * Resolve an order payout without inventing settlement data.
  *
@@ -75,7 +86,30 @@ function resolveOfficialOrderPayout({
   return { amount: null, source: 'awaiting_official_settlement' };
 }
 
+function assertLockedPayoutInvariant() {
+  const example = LOCKED_PAYOUT_EXAMPLE;
+  const result = resolveOfficialOrderPayout({
+    orderStatus: 'paid',
+    shipmentStatus: 'shipped',
+    grossAmount: example.grossAmount,
+    refundAmount: 0,
+    explicitOfficialNet: null,
+    hasOfficialLedger: true,
+    officialLedgerDelta: -(example.combinedSalesCommission + example.sellerShippingCharge),
+    paymentOfficialNet: null
+  });
+  if (result.amount !== example.expectedPayout) {
+    throw new Error(`Locked payout invariant failed: expected ${example.expectedPayout}, received ${result.amount}`);
+  }
+  return true;
+}
+
+// Fail fast during server startup if a future change breaks the approved rule.
+assertLockedPayoutInvariant();
+
 module.exports = {
+  LOCKED_PAYOUT_EXAMPLE,
+  assertLockedPayoutInvariant,
   isDispatchedShipment,
   resolveOfficialOrderPayout
 };
