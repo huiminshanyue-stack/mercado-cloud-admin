@@ -1,0 +1,18 @@
+{
+  "pages": [
+    "pages/login/index",
+    "pages/bind/index",
+    "pages/orders/index",
+    "pages/order-detail/index"
+  ],
+  "window": {
+    "navigationBarBackgroundColor": "#1677ff",
+    "navigationBarTextStyle": "white",
+    "navigationBarTitleText": "山月助手",
+    "backgroundColor": "#f3f6fa",
+    "backgroundTextStyle": "dark"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json",
+  "lazyCodeLoading": "requiredComponents"
+}

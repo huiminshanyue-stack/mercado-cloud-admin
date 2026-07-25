@@ -1,0 +1,21 @@
+<view class="page login-page">
+  <view class="brand">
+    <view class="brand-mark">山</view>
+    <view class="brand-title">山月助手</view>
+    <view class="brand-subtitle">跨境电商订单管理</view>
+  </view>
+
+  <view class="card login-card">
+    <view class="section-title">{{wechatEnabled ? '微信安全登录' : 'ERP 内测登录'}}</view>
+    <view wx:if="{{wechatEnabled}}" class="hint">使用微信身份登录，首次使用需要绑定现有山月ERP账号。</view>
+    <button wx:if="{{wechatEnabled}}" class="primary-button action" loading="{{loading}}" bindtap="loginWithWechat">微信登录</button>
+
+    <block wx:else>
+      <view class="hint">公众号认证期间可使用管理员或 CNTORO 账号连接现有测试服务器。</view>
+      <input class="field" placeholder="ERP账号" value="{{username}}" bindinput="onUsername" />
+      <input class="field" password placeholder="ERP密码" value="{{password}}" bindinput="onPassword" />
+      <button class="primary-button action" loading="{{loading}}" bindtap="loginWithErp">进入订单内测</button>
+    </block>
+  </view>
+  <view class="security">账号密码通过 HTTPS 发送，仅用于本次身份验证，不保存在小程序。</view>
+</view>

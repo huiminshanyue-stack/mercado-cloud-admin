@@ -1,0 +1,45 @@
+<view class="page orders-page">
+  <view class="header">
+    <view><view class="title">订单工作台</view><view class="subtitle">{{userName}} · 只读内测</view></view>
+    <button class="logout" size="mini" bindtap="logout">退出</button>
+  </view>
+
+  <view class="card filters">
+    <input class="search" placeholder="输入订单号" confirm-type="search" value="{{orderId}}" bindinput="onOrderId" bindconfirm="applyFilters" />
+    <view class="filter-row">
+      <picker class="picker" mode="selector" range="{{storeNames}}" value="{{storeIndex}}" bindchange="onStoreChange">
+        <view>{{storeNames[storeIndex] || '全部店铺'}}⌄</view>
+      </picker>
+      <picker class="picker" mode="selector" range="{{statusNames}}" value="{{statusIndex}}" bindchange="onStatusChange">
+        <view>{{statusNames[statusIndex]}}⌄</view>
+      </picker>
+    </view>
+  </view>
+
+  <view class="summary">共 {{total}} 单 · 下拉刷新最新状态</view>
+  <view wx:if="{{loading && !orders.length}}" class="empty">正在读取订单…</view>
+  <view wx:elif="{{!loading && !orders.length}}" class="empty">当前筛选条件下暂无订单</view>
+
+  <view wx:for="{{orders}}" wx:key="displayOrderId" class="card order-card" data-id="{{item.displayOrderId}}" bindtap="openOrder">
+    <view class="order-head">
+      <view class="state state-{{item.stateKey}}">{{item.stateText}}</view>
+      <view class="country">{{item.countryFlag}} {{item.countryName}}</view>
+      <view class="order-no">{{item.displayOrderId}}</view>
+    </view>
+    <view class="store">{{item.storeName}}</view>
+    <view class="product">
+      <image class="image" mode="aspectFill" src="{{item.productImage}}" />
+      <view class="product-main">
+        <view class="product-title">{{item.productTitle}}</view>
+        <view class="meta">数量 ×{{item.quantity}}　SKU：{{item.sku}}</view>
+        <view class="meta">下单：{{item.dateText}}</view>
+      </view>
+    </view>
+    <view class="money-row">
+      <view><text class="label">商品金额</text><text class="amount">{{item.grossText}}</text></view>
+      <view><text class="label">应回款</text><text class="amount payout">{{item.payoutText}}</text></view>
+    </view>
+  </view>
+  <view wx:if="{{loading && orders.length}}" class="loading-more">加载中…</view>
+  <view wx:if="{{!hasMore && orders.length}}" class="loading-more">已显示全部订单</view>
+</view>

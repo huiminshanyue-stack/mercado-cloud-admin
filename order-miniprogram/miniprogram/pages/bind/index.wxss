@@ -1,0 +1,5 @@
+.bind-card { margin-top:80rpx; padding:42rpx 36rpx; }
+.title { font-size:38rpx; font-weight:700; }
+.desc { margin:20rpx 0 34rpx; color:#6d7b8a; font-size:26rpx; line-height:1.7; }
+.field { height:92rpx; box-sizing:border-box; margin-top:22rpx; padding:0 26rpx; background:#f6f8fb; border:1rpx solid #e4eaf1; border-radius:14rpx; }
+.button { margin-top:34rpx; }

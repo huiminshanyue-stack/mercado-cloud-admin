@@ -1,0 +1,12 @@
+{
+  "name": "shanyue-order-miniprogram",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "miniprogram-api-typings": "^4.0.1",
+    "typescript": "^5.5.4"
+  }
+}

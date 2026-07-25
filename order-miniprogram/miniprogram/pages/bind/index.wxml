@@ -1,0 +1,9 @@
+<view class="page">
+  <view class="card bind-card">
+    <view class="title">绑定山月ERP账号</view>
+    <view class="desc">绑定后只显示该ERP账号已授权店铺的订单，其他用户数据始终不可见。</view>
+    <input class="field" placeholder="ERP账号" value="{{username}}" bindinput="onUsername" />
+    <input class="field" password placeholder="ERP密码" value="{{password}}" bindinput="onPassword" />
+    <button class="primary-button button" loading="{{loading}}" bindtap="bindAccount">确认绑定</button>
+  </view>
+</view>

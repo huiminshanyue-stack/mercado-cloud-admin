@@ -7,6 +7,7 @@ const { Pool } = require('pg');
 const { resolveOfficialOrderPayout } = require('./order-payout');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
+const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -2850,7 +2851,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-25.28',
+    version: '2026-07-25.29',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -2904,6 +2905,9 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentAlertWindow: 'order-created-through-handling-deadline-plus-24h',
     historicalCancellationAlertSuppression: true,
     officialAlertEventTime: true,
+    wechatMiniProgramApiV1: true,
+    wechatErpTestLogin: true,
+    miniProgramReadOnlyOrders: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
@@ -3494,7 +3498,8 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
   }
 });
 
-app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
+async function getOrderListData(authUser,query = {}) {
+  const req = { authUser,query };
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
   const params = [req.authUser.username], where = ['o.owner_username=$1','o.hidden_at IS NULL'];
   if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
@@ -3533,7 +3538,12 @@ app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
     delete row.rawData;
   }
   const packedRows = await aggregatePackedOrders(rows.rows);
-  res.json({ code: 0, data: { items: packedRows, total: count.rows[0].total, page, size } });
+  return { items: packedRows, total: count.rows[0].total, page, size };
+}
+
+app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
+  try { res.json({ code: 0, data: await getOrderListData(req.authUser,req.query || {}) }); }
+  catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单失败' }); }
 });
 
 app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, async (req, res) => {
@@ -3593,16 +3603,21 @@ app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, as
   }
 });
 
-app.get('/api/admin/order-stores', requireOrderAccess, async (req, res) => {
-  await listOrderStoreAuthorizations(req.authUser);
+async function getOrderStoresData(authUser) {
+  await listOrderStoreAuthorizations(authUser);
   const { rows } = await pool.query(`SELECT a.ml_user_id AS id,COALESCE(NULLIF(s.nickname,''),a.nickname) AS nickname,s.remark,
     COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),NULLIF(a.nickname,''),a.ml_user_id) AS "displayName",
     COALESCE(NULLIF(s.site_id,''),a.site_id) AS "siteId",COUNT(o.id)::int AS "orderCount"
     FROM ml_store_authorizations a LEFT JOIN ml_stores s ON s.ml_user_id=a.ml_user_id
     LEFT JOIN ml_orders o ON o.store_user_id=a.ml_user_id AND o.owner_username=a.owner_username
     WHERE a.owner_username=$1 AND a.enabled=TRUE
-    GROUP BY a.ml_user_id,a.nickname,a.site_id,s.nickname,s.remark,s.site_id ORDER BY "displayName"`, [req.authUser.username]);
-  res.json({ code: 0, data: rows });
+    GROUP BY a.ml_user_id,a.nickname,a.site_id,s.nickname,s.remark,s.site_id ORDER BY "displayName"`, [authUser.username]);
+  return rows;
+}
+
+app.get('/api/admin/order-stores', requireOrderAccess, async (req, res) => {
+  try { res.json({ code: 0, data: await getOrderStoresData(req.authUser) }); }
+  catch (error) { res.status(500).json({ code: 500, message: error.message || '读取授权店铺失败' }); }
 });
 
 async function ensureLegacyStoreAuthorization(authUser) {
@@ -5816,6 +5831,8 @@ async function start() {
   await seedDashboardStats();
   await initInternationalProductTable();
   await initOrderManagementTables();
+  await initMiniProgramTables(pool);
+  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');

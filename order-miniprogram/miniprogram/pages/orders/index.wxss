@@ -1,0 +1,24 @@
+.orders-page { padding-bottom:50rpx; }
+.header { display:flex; justify-content:space-between; align-items:center; margin:4rpx 0 28rpx; }
+.title { font-size:42rpx; font-weight:750; }
+.subtitle { margin-top:8rpx; color:#8492a1; font-size:24rpx; }
+.logout { margin:0; color:#647386; background:#fff; border-radius:12rpx; }
+.filters { padding:22rpx; }
+.search { height:80rpx; padding:0 24rpx; background:#f5f7fa; border-radius:13rpx; font-size:28rpx; }
+.filter-row { display:flex; gap:18rpx; margin-top:18rpx; }
+.picker { flex:1; padding:20rpx 22rpx; color:#526170; background:#f5f7fa; border-radius:13rpx; font-size:26rpx; }
+.summary { padding:24rpx 8rpx 16rpx; color:#7f8c9b; font-size:24rpx; }
+.order-card { margin-bottom:22rpx; padding:24rpx; overflow:hidden; }
+.order-head { display:flex; align-items:center; gap:14rpx; }
+.state { padding:7rpx 14rpx; border-radius:9rpx; font-size:22rpx; background:#eef4ff; color:#1677ff; }
+.state-pending { background:#fff5e8; color:#e68a00; }.state-done { background:#eaf8f1; color:#16a66a; }.state-closed { background:#fff0f0; color:#ef5350; }
+.country { font-size:26rpx; font-weight:650; }.order-no { flex:1; overflow:hidden; color:#4c5c6c; font-size:25rpx; text-align:right; text-overflow:ellipsis; white-space:nowrap; }
+.store { margin:16rpx 0; color:#1677ff; font-size:24rpx; }
+.product { display:flex; gap:20rpx; padding:18rpx 0; border-top:1rpx solid #eef1f5; border-bottom:1rpx solid #eef1f5; }
+.image { width:132rpx; height:132rpx; flex:none; background:#f1f3f6; border-radius:14rpx; }
+.product-main { min-width:0; flex:1; }.product-title { display:-webkit-box; overflow:hidden; font-size:28rpx; font-weight:650; line-height:1.45; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+.meta { margin-top:10rpx; overflow:hidden; color:#83909f; font-size:23rpx; text-overflow:ellipsis; white-space:nowrap; }
+.money-row { display:flex; justify-content:space-between; padding-top:20rpx; }
+.money-row view { display:flex; flex-direction:column; }.money-row view:last-child { text-align:right; }
+.label { color:#8b97a4; font-size:22rpx; }.amount { margin-top:5rpx; font-size:29rpx; font-weight:700; }.payout { color:#16a66a; }
+.empty,.loading-more { padding:90rpx 0; color:#94a0ad; text-align:center; font-size:26rpx; }.loading-more { padding:28rpx 0; }
