@@ -1,5 +1,7 @@
 'use strict';
 
+const zlib=require('node:zlib');
+
 function normalizeOfficialTrackingNumber(value) {
   return String(value ?? '')
     .normalize('NFKC')
@@ -15,6 +17,65 @@ function trackingLookupProvider(method) {
   return '';
 }
 
+function collectTrackingNumberCandidates(value,result=[],seen=new Set()) {
+  if (!value || typeof value!=='object' || seen.has(value)) return result;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) collectTrackingNumberCandidates(item,result,seen);
+    return result;
+  }
+  for (const [key,child] of Object.entries(value)) {
+    if (/^(tracking_number|trackingnumber|mail_no|mailno|waybill_number|waybillnumber)$/i.test(key)) {
+      const normalized=normalizeOfficialTrackingNumber(child);
+      if (normalized) result.push(normalized);
+    }
+    if (child && typeof child==='object') collectTrackingNumberCandidates(child,result,seen);
+  }
+  return result;
+}
+
+function isMelDistribution(method) {
+  return String(method || '').toLowerCase().replace(/[^a-z0-9]/g,'').includes('meldistribution');
+}
+
+function isMelPublicTrackingNumber(value) {
+  return /^\d{8,20}$/.test(normalizeOfficialTrackingNumber(value));
+}
+
+function chooseOfficialTrackingNumber(method,candidates) {
+  const normalized=[...new Set((candidates || []).map(normalizeOfficialTrackingNumber).filter(Boolean))];
+  if (!normalized.length) return '';
+  if (isMelDistribution(method)) return normalized.find(isMelPublicTrackingNumber) || normalized[0];
+  return normalized[0];
+}
+
+function extractMelTrackingNumberFromPdf(pdf,excludedValues=[]) {
+  const source=Buffer.isBuffer(pdf) ? pdf : Buffer.from(pdf || []);
+  if (!source.length) return '';
+  const buffers=[source];
+  const binary=source.toString('latin1');
+  for (const match of binary.matchAll(/stream\r?\n([\s\S]*?)\r?\nendstream/g)) {
+    try { buffers.push(zlib.inflateSync(Buffer.from(match[1],'latin1'))); } catch (_) { /* non-Flate stream */ }
+  }
+  const numbers=[];
+  for (const buffer of buffers) {
+    const text=buffer.toString('latin1');
+    numbers.push(...(text.match(/(?<!\d)\d{8,20}(?!\d)/g) || []));
+    for (const hex of text.matchAll(/<([0-9a-f]{16,120})>/gi)) {
+      const decoded=Buffer.from(hex[1],'hex').toString('latin1').replace(/\0/g,'');
+      numbers.push(...(decoded.match(/(?<!\d)\d{8,20}(?!\d)/g) || []));
+    }
+  }
+  const excluded=new Set(excludedValues.map(value=>normalizeOfficialTrackingNumber(value)).filter(Boolean));
+  const candidates=[...new Set(numbers.map(normalizeOfficialTrackingNumber))].filter(value=>!excluded.has(value));
+  candidates.sort((left,right)=>{
+    const score=value=>(value.length===12 ? 100 : 0)+(value.startsWith('3') ? 30 : 0)-
+      (value.length>=15 ? 20 : 0);
+    return score(right)-score(left);
+  });
+  return candidates.find(isMelPublicTrackingNumber) || '';
+}
+
 function buildExternalTrackingUrl(method,trackingNumber) {
   const number=normalizeOfficialTrackingNumber(trackingNumber);
   if (!number) return '';
@@ -24,4 +85,6 @@ function buildExternalTrackingUrl(method,trackingNumber) {
   return '';
 }
 
-module.exports={ normalizeOfficialTrackingNumber,trackingLookupProvider,buildExternalTrackingUrl };
+module.exports={ normalizeOfficialTrackingNumber,trackingLookupProvider,buildExternalTrackingUrl,
+  collectTrackingNumberCandidates,isMelDistribution,isMelPublicTrackingNumber,
+  chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf };
