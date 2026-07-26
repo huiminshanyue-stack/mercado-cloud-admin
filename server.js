@@ -3018,7 +3018,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.42',
+    version: '2026-07-26.43',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3045,7 +3045,9 @@ app.get('/api/health/order-management', (req, res) => {
     orderDimensionSnapshots: true,
     dimensionDeclaredVsCurrent: true,
     dimensionDeclaredVsVerifiedPackage: true,
-    dimensionSourceLabels: ['seller_order_snapshot','mercado_verified_package','current_listing_reference','billable_weight_reference'],
+    dimensionSourceLabels: ['mercado_shipment_package','current_item_official_record','item_shipping_option_billable_weight'],
+    dimensionWeightComparisonUsesOrderQuantity: true,
+    listingDimensionsAreCurrentOfficialRecord: true,
     dimensionMissingValueLabels: true,
     compactDimensionCard: true,
     statisticsIndependentFilters: true,
@@ -3777,11 +3779,9 @@ app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, as
       dimensionsLatest: snapshot,
       dimensionsUpdatedAt: snapshot.fetchedAt,
       dimensionsChanged: changed,
-      note: changed
-        ? '美客多返回的该订单包裹核验值与卖家下单时申报快照不同。商品当前刊登值与计费重量已单独标明；是否产生额外运费，以官方账单实际收费项目为准。'
-        : (snapshot.verifiedPackage
-          ? '美客多返回的该订单包裹核验值与卖家下单时申报快照一致。'
-          : '已更新商品当前刊登值，但美客多暂未返回该订单包裹核验值，系统不会把刊登值冒充核验值。'),
+      note: snapshot.verifiedPackage
+        ? '已获取美客多订单包裹核验值、商品当前官方记录值和计费重量；页面将按订单商品数量进行重量对比，最终运费以官方账单为准。'
+        : '已更新商品当前官方记录值，但美客多暂未返回该订单包裹核验值，系统不会把商品记录值冒充包裹核验值。',
       failures
     } });
   } catch (error) {
