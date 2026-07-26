@@ -29,10 +29,18 @@ function shouldCreateCancellationAlert({ existed, previousStatus, orderStatus, s
   return isWithinOrderAlertWindow({ dateCreated, handlingDeadline, now });
 }
 
+function shouldCreateShippedAlert({ existed, previousShipmentStatus, orderStatus, shipmentStatus }) {
+  if (!existed) return false;
+  if (['cancelled','refunded'].includes(String(orderStatus || '').toLowerCase())) return false;
+  if (String(shipmentStatus || '').toLowerCase() !== 'shipped') return false;
+  return !['shipped','delivered'].includes(String(previousShipmentStatus || '').toLowerCase());
+}
+
 module.exports = {
   ONLINE_GRACE_PERIOD_MS,
   isFulfillmentFinished,
   isWithinOrderAlertWindow,
   shouldCreateNewOrderAlert,
-  shouldCreateCancellationAlert
+  shouldCreateCancellationAlert,
+  shouldCreateShippedAlert
 };

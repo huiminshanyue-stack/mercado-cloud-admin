@@ -57,7 +57,8 @@ function registerMiniProgramRoutes(app, dependencies) {
     getOrderRealtimeStateData,
     getOfficialNotificationPreferences,
     updateOfficialNotificationPreferences,
-    getOfficialAccountBindingStatus
+    getOfficialAccountBindingStatus,
+    enqueueOfficialNotification
   } = dependencies;
   const appId = process.env.WECHAT_MINIPROGRAM_APPID || DEFAULT_APP_ID;
   const appSecret = process.env.WECHAT_MINIPROGRAM_SECRET || '';
@@ -190,6 +191,15 @@ function registerMiniProgramRoutes(app, dependencies) {
       WHERE id=$2 RETURNING union_id`,[user.username,req.miniAuth.identityId]);
     if (identity.rows[0]?.union_id) await pool.query(`UPDATE wechat_official_followers SET erp_username=$1,updated_at=NOW()
       WHERE union_id=$2 AND subscribed=TRUE`,[user.username,identity.rows[0].union_id]);
+    if (typeof enqueueOfficialNotification==='function') {
+      try {
+        await enqueueOfficialNotification({
+          ownerUsername:user.username,eventType:'binding_success',eventKey:`binding:${req.miniAuth.identityId}:${user.username}`,
+          payload:{ title:'ERP账号绑定成功',username:user.nickname || user.username,bindingAccount:user.username,
+            productName:'山月ERP',remark:'微信身份已成功绑定山月ERP账号' }
+        });
+      } catch (error) { console.error('[MiniProgram] binding notification queue failed:',error.message); }
+    }
     res.json({ code: 0, data: { bound: true,user: { username:user.username,nickname:user.nickname,role:user.role,validUntil:user.validuntil || null } } });
   });
 

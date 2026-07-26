@@ -5,7 +5,8 @@ const {
   isFulfillmentFinished,
   isWithinOrderAlertWindow,
   shouldCreateNewOrderAlert,
-  shouldCreateCancellationAlert
+  shouldCreateCancellationAlert,
+  shouldCreateShippedAlert
 } = require('../order-alert-policy');
 
 const now = Date.parse('2026-07-25T10:00:00Z');
@@ -76,5 +77,18 @@ assert.equal(shouldCreateCancellationAlert({
   handlingDeadline: '2026-07-25T09:55:00Z',
   now
 }), true);
+
+assert.equal(shouldCreateShippedAlert({
+  existed:true,previousShipmentStatus:'ready_to_ship',orderStatus:'paid',shipmentStatus:'shipped'
+}),true);
+assert.equal(shouldCreateShippedAlert({
+  existed:true,previousShipmentStatus:'shipped',orderStatus:'paid',shipmentStatus:'shipped'
+}),false);
+assert.equal(shouldCreateShippedAlert({
+  existed:false,previousShipmentStatus:'',orderStatus:'paid',shipmentStatus:'shipped'
+}),false);
+assert.equal(shouldCreateShippedAlert({
+  existed:true,previousShipmentStatus:'ready_to_ship',orderStatus:'cancelled',shipmentStatus:'shipped'
+}),false);
 
 console.log('order alert policy regression tests passed');

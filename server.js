@@ -10,7 +10,8 @@ const { normalizeOfficialTrackingNumber,buildExternalTrackingUrl,collectTracking
   isMelDistribution,chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf,
   publicOfficialTrackingNumber } = require('./order-logistics');
 const { dimensionSnapshotsDiffer } = require('./order-dimensions');
-const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert } = require('./order-alert-policy');
+const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert,
+  shouldCreateShippedAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
@@ -3018,7 +3019,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.43',
+    version: '2026-07-26.44',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3100,7 +3101,7 @@ app.get('/api/health/order-management', (req, res) => {
     mercadoLibreWebhookTopics: ['orders_v2','shipments','messages','claims'],
     persistentWebhookQueue: true,
     realtimeOrderStatePolling: true,
-    wechatOfficialAccountNotifications: ['new_order','cancelled','deadline','refund','buyer_inquiry','after_sales'],
+    wechatOfficialAccountNotifications: ['new_order','cancelled','deadline','refund','shipped','buyer_inquiry','after_sales','binding_success'],
     wechatOfficialAccountUnionIdBinding: true,
     wechatOfficialAccountPersistentOutbox: true,
     multiStoreSync: true,
@@ -3646,6 +3647,15 @@ async function syncOrdersForUser(authUser, body = {}) {
         dateCreated: order.date_created,
         handlingDeadline
       })) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'cancelled','订单已取消',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${country || '未知站点'}订单已被取消`, `cancelled:${order.id}`]);
+      if (shouldCreateShippedAlert({
+        existed: Boolean(old),
+        previousShipmentStatus: old?.shipment_status,
+        orderStatus: order.status,
+        shipmentStatus: shipment.status
+      })) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
+        VALUES($1,$2,'shipped','订单已发货',$3,$4) ON CONFLICT(event_key) DO NOTHING`,[
+        req.authUser.username,String(order.id),`${country || '未知站点'}订单已进入运输中`,`shipped:${order.id}`
+      ]);
       if (old && Number(refundAmount || 0)>Number(old.refund_amount || 0)+0.000001) {
         await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
           VALUES($1,$2,'refund','订单发生退款',$3,$4) ON CONFLICT(event_key) DO NOTHING`,[
@@ -6356,7 +6366,8 @@ async function start() {
     getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,getOrderRealtimeStateData,
     getOfficialNotificationPreferences:officialAccountService.getPreferences,
     updateOfficialNotificationPreferences:officialAccountService.updatePreferences,
-    getOfficialAccountBindingStatus:officialAccountService.getBindingStatus });
+    getOfficialAccountBindingStatus:officialAccountService.getBindingStatus,
+    enqueueOfficialNotification:officialAccountService.enqueueNotification });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');

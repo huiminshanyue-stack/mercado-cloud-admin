@@ -3,16 +3,21 @@
 const assert=require('node:assert/strict');
 const crypto=require('crypto');
 const {
-  DEFAULT_OFFICIAL_APP_ID,EVENT_TYPES,sha1Signature,parseWeChatXml,decryptWeChatMessage,
+  DEFAULT_OFFICIAL_APP_ID,EVENT_TYPES,OFFICIAL_TEMPLATE_PRESETS,sha1Signature,parseWeChatXml,decryptWeChatMessage,
   preferenceColumn,retryDelaySeconds,renderTemplateData
 }=require('../wechat-official-account');
 
 assert.equal(DEFAULT_OFFICIAL_APP_ID,'wx1758849125581a06');
-assert.deepEqual(EVENT_TYPES,['new_order','cancelled','deadline','refund','buyer_inquiry','after_sales']);
+assert.deepEqual(EVENT_TYPES,['new_order','cancelled','deadline','refund','shipped','buyer_inquiry','after_sales','binding_success']);
 assert.equal(sha1Signature(['token','123','nonce']),sha1Signature(['nonce','token','123']));
 assert.equal(preferenceColumn('buyer_inquiry'),'buyer_inquiry_enabled');
+assert.equal(preferenceColumn('shipped'),'shipped_enabled');
+assert.equal(preferenceColumn('binding_success'),'binding_success_enabled');
 assert.equal(retryDelaySeconds(1),15);
 assert.equal(retryDelaySeconds(8),14400);
+assert.equal(OFFICIAL_TEMPLATE_PRESETS.deadline.title,'订单物流异常通知');
+assert.equal(OFFICIAL_TEMPLATE_PRESETS.buyer_inquiry.dataMapping.phrase5.source,'notificationStatus');
+assert.equal(OFFICIAL_TEMPLATE_PRESETS.binding_success.pagePath,'pages/home/index');
 
 const xml=`<xml><ToUserName><![CDATA[gh_test]]></ToUserName><FromUserName><![CDATA[o_user]]></FromUserName>
   <CreateTime>1720000000</CreateTime><MsgType><![CDATA[event]]></MsgType><Event><![CDATA[subscribe]]></Event>

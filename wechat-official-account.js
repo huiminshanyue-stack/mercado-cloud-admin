@@ -5,8 +5,40 @@ const axios=require('axios');
 
 const DEFAULT_OFFICIAL_APP_ID='wx1758849125581a06';
 const DEFAULT_MINIPROGRAM_APP_ID='wx0f97428df87ee76e';
-const EVENT_TYPES=['new_order','cancelled','deadline','refund','buyer_inquiry','after_sales'];
+const EVENT_TYPES=['new_order','cancelled','deadline','refund','shipped','buyer_inquiry','after_sales','binding_success'];
 const RETRY_DELAYS_SECONDS=[15,60,300,900,1800,3600,7200,14400];
+const OFFICIAL_TEMPLATE_PRESETS={
+  new_order:{ title:'客户新订单处理通知',pagePath:'pages/order-detail/index?id={{orderId}}',dataMapping:{
+    character_string5:{ source:'orderNumber',maxLength:32 },amount7:{ source:'amount',maxLength:16 },
+    character_string15:{ source:'quantity',maxLength:12 },time4:{ source:'eventTime',maxLength:20 }
+  } },
+  cancelled:{ title:'订单取消成功通知',pagePath:'pages/order-detail/index?id={{orderId}}',dataMapping:{
+    character_string8:{ source:'orderNumber',maxLength:32 },amount4:{ source:'amount',maxLength:16 },
+    time6:{ source:'eventTime',maxLength:20 }
+  } },
+  deadline:{ title:'订单物流异常通知',pagePath:'pages/order-detail/index?id={{orderId}}',dataMapping:{
+    character_string4:{ source:'orderNumber',maxLength:32 },const1:{ source:'title',maxLength:20 }
+  } },
+  refund:{ title:'订单退款成功通知',pagePath:'pages/order-detail/index?id={{orderId}}',dataMapping:{
+    character_string1:{ source:'orderNumber',maxLength:32 },time2:{ source:'eventTime',maxLength:20 },
+    thing3:{ source:'productName',maxLength:20 },thing4:{ source:'quantity',maxLength:20 },amount5:{ source:'amount',maxLength:16 }
+  } },
+  shipped:{ title:'订单发货通知',pagePath:'pages/order-detail/index?id={{orderId}}',dataMapping:{
+    character_string1:{ source:'orderNumber',maxLength:32 },time3:{ source:'eventTime',maxLength:20 }
+  } },
+  buyer_inquiry:{ title:'服务工单已推送提醒',pagePath:'pages/inquiries/index',dataMapping:{
+    time12:{ source:'eventTime',maxLength:20 },phrase5:{ source:'notificationStatus',maxLength:5 },
+    character_string2:{ source:'orderNumber',maxLength:32 }
+  } },
+  after_sales:{ title:'收到客户投诉提醒',pagePath:'pages/after-sales/index',dataMapping:{
+    character_string8:{ source:'orderNumber',maxLength:32 },time2:{ source:'eventTime',maxLength:20 },
+    const5:{ source:'title',maxLength:20 }
+  } },
+  binding_success:{ title:'账号绑定成功提醒',pagePath:'pages/home/index',dataMapping:{
+    thing1:{ source:'username',maxLength:20 },time3:{ source:'eventTime',maxLength:20 },
+    character_string4:{ source:'bindingAccount',maxLength:32 },thing6:{ source:'productName',maxLength:20 }
+  } }
+};
 
 function sha1Signature(parts) {
   return crypto.createHash('sha1').update(parts.map(value=>String(value || '')).sort().join('')).digest('hex');
@@ -52,7 +84,8 @@ function decryptWeChatMessage(encrypted,encodingAesKey,expectedAppId) {
 function preferenceColumn(eventType) {
   return {
     new_order:'new_order_enabled',cancelled:'cancelled_enabled',deadline:'deadline_enabled',refund:'refund_enabled',
-    buyer_inquiry:'buyer_inquiry_enabled',after_sales:'after_sales_enabled'
+    shipped:'shipped_enabled',buyer_inquiry:'buyer_inquiry_enabled',after_sales:'after_sales_enabled',
+    binding_success:'binding_success_enabled'
   }[eventType] || '';
 }
 
@@ -87,6 +120,7 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
   const callbackPath='/api/wechat/official-account/events';
   let accessTokenCache={ token:'',expiresAt:0 },accessTokenPromise=null;
   let scanTimer=null,workerTimer=null,followerSyncTimer=null,scanning=false,working=false,syncingFollowers=false,stopped=false;
+  let templateSyncStatus={ synced:false,configured:0,missing:EVENT_TYPES.length,lastAt:null,error:'' };
 
   async function init() {
     await pool.query(`CREATE TABLE IF NOT EXISTS wechat_official_followers (
@@ -99,9 +133,12 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     await pool.query(`CREATE TABLE IF NOT EXISTS wechat_official_notification_preferences (
       owner_username VARCHAR(120) PRIMARY KEY,enabled BOOLEAN NOT NULL DEFAULT TRUE,new_order_enabled BOOLEAN NOT NULL DEFAULT TRUE,
       cancelled_enabled BOOLEAN NOT NULL DEFAULT TRUE,deadline_enabled BOOLEAN NOT NULL DEFAULT TRUE,refund_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      buyer_inquiry_enabled BOOLEAN NOT NULL DEFAULT TRUE,after_sales_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      shipped_enabled BOOLEAN NOT NULL DEFAULT TRUE,buyer_inquiry_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      after_sales_enabled BOOLEAN NOT NULL DEFAULT TRUE,binding_success_enabled BOOLEAN NOT NULL DEFAULT TRUE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+    await pool.query('ALTER TABLE wechat_official_notification_preferences ADD COLUMN IF NOT EXISTS shipped_enabled BOOLEAN NOT NULL DEFAULT TRUE');
+    await pool.query('ALTER TABLE wechat_official_notification_preferences ADD COLUMN IF NOT EXISTS binding_success_enabled BOOLEAN NOT NULL DEFAULT TRUE');
     await pool.query(`CREATE TABLE IF NOT EXISTS wechat_official_template_configs (
       event_type VARCHAR(40) PRIMARY KEY,template_id VARCHAR(160) NOT NULL DEFAULT '',data_mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
       page_path VARCHAR(500) NOT NULL DEFAULT '',enabled BOOLEAN NOT NULL DEFAULT TRUE,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -120,10 +157,11 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     for (const eventType of EVENT_TYPES) {
       const envKey=`WECHAT_OFFICIAL_TEMPLATE_${eventType.toUpperCase()}_ID`;
       const fieldsKey=`WECHAT_OFFICIAL_TEMPLATE_${eventType.toUpperCase()}_FIELDS_JSON`;
-      let mapping={};
+      const preset=OFFICIAL_TEMPLATE_PRESETS[eventType] || {};
+      let mapping=preset.dataMapping || {};
       try { mapping=JSON.parse(process.env[fieldsKey] || '{}'); } catch (_) { mapping={}; }
-      const pagePath=['buyer_inquiry'].includes(eventType) ? 'pages/inquiries/index'
-        : eventType==='after_sales' ? 'pages/after-sales/index' : 'pages/order-detail/index?id={{orderId}}';
+      if (!Object.keys(mapping).length) mapping=preset.dataMapping || {};
+      const pagePath=preset.pagePath || 'pages/order-detail/index?id={{orderId}}';
       await pool.query(`INSERT INTO wechat_official_template_configs(event_type,template_id,data_mapping,page_path)
         VALUES($1,$2,$3::jsonb,$4) ON CONFLICT(event_type) DO UPDATE SET
         template_id=CASE WHEN wechat_official_template_configs.template_id='' AND EXCLUDED.template_id<>'' THEN EXCLUDED.template_id ELSE wechat_official_template_configs.template_id END,
@@ -284,14 +322,36 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
       ON CONFLICT(event_key) DO NOTHING`);
   }
 
+  function formatBeijingTime(value) {
+    const date=new Date(value || Date.now());
+    if (Number.isNaN(date.getTime())) return '';
+    const parts=new Intl.DateTimeFormat('zh-CN',{ timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',
+      hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false }).formatToParts(date);
+    const read=type=>parts.find(part=>part.type===type)?.value || '';
+    return `${read('year')}-${read('month')}-${read('day')} ${read('hour')}:${read('minute')}:${read('second')}`;
+  }
+
+  function summarizeItems(items) {
+    const list=Array.isArray(items) ? items : [];
+    const first=list[0] || {},item=first.item || first;
+    const title=String(item.title || first.title || '订单商品').trim();
+    const quantity=list.reduce((sum,entry)=>sum+Math.max(0,Number(entry.quantity || entry.item?.quantity || 0)),0);
+    return { productName:title || '订单商品',quantity:String(quantity || 1) };
+  }
+
   function alertPayload(row) {
-    const eventTime=new Date(row.created_at || Date.now()).toLocaleString('zh-CN',{ timeZone:'Asia/Shanghai',hour12:false });
+    const itemSummary=summarizeItems(row.items);
+    const eventSource=['new_order','cancelled'].includes(row.alert_type) ? row.date_created : row.created_at;
+    const eventTime=formatBeijingTime(eventSource);
+    const currency=String(row.currency || '');
+    const money=Number(row.alert_type==='refund' ? row.refund_amount || 0 : row.paid_amount || 0);
     return {
       title:String(row.title || ''),content:String(row.content || ''),eventType:String(row.alert_type || ''),
       orderId:String(row.order_id || ''),orderNumber:String(row.display_order_id || row.order_id || ''),
-      storeName:String(row.store_name || '授权店铺'),country:String(row.country || ''),currency:String(row.currency || ''),
-      amount:String(row.alert_type==='refund' ? row.refund_amount || 0 : row.paid_amount || 0),
+      storeName:String(row.store_name || '授权店铺'),country:String(row.country || ''),currency,
+      amount:`${currency} ${money.toFixed(2)}`.trim(),productName:itemSummary.productName,quantity:itemSummary.quantity,
       status:String(row.status || row.shipment_status || ''),deadline:String(row.handling_deadline || ''),eventTime,
+      notificationStatus:row.alert_type==='buyer_inquiry' ? '待回复' : String(row.status || row.shipment_status || ''),
       remark:'请进入山月助手小程序查看详情'
     };
   }
@@ -305,6 +365,7 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
       const cursor=Number(cursorResult.rows[0]?.value || 0);
       const { rows }=await pool.query(`SELECT a.*,COALESCE(NULLIF(o.pack_id,''),o.ml_order_id,a.order_id) AS display_order_id,
         o.country,o.currency,o.paid_amount,o.refund_amount,o.status,o.shipment_status,o.handling_deadline,
+        o.date_created,o.date_closed,o.items,
         COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'授权店铺') AS store_name
         FROM order_alerts a LEFT JOIN ml_orders o ON o.owner_username=a.owner_username AND o.ml_order_id=a.order_id
         LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id
@@ -328,6 +389,31 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
       if (nextCursor>cursor) await pool.query(`UPDATE settings SET value=$1,updated_at=NOW() WHERE key='wechat_official_alert_cursor'`,[String(nextCursor)]);
       triggerWorker();
     } finally { scanning=false; }
+  }
+
+  async function enqueueNotification(input={}) {
+    const eventType=String(input.eventType || '');
+    const ownerUsername=String(input.ownerUsername || '').trim();
+    if (!EVENT_TYPES.includes(eventType)) throw new Error('Unsupported notification event type');
+    if (!ownerUsername) throw new Error('ownerUsername is required');
+    const column=preferenceColumn(eventType);
+    const followers=await pool.query(`SELECT f.open_id FROM wechat_official_followers f
+      LEFT JOIN wechat_official_notification_preferences p ON LOWER(p.owner_username)=LOWER(f.erp_username)
+      WHERE f.subscribed=TRUE AND LOWER(f.erp_username)=LOWER($1)
+        AND COALESCE(p.enabled,TRUE)=TRUE AND COALESCE(p.${column},TRUE)=TRUE`,[ownerUsername]);
+    const payload={ eventTime:formatBeijingTime(Date.now()),...(input.payload || {}) };
+    let queued=0;
+    for (const follower of followers.rows) {
+      const eventKey=`direct:${String(input.eventKey || `${eventType}:${Date.now()}`).slice(0,140)}:${follower.open_id}`;
+      const result=await pool.query(`INSERT INTO wechat_official_notification_outbox
+        (event_key,owner_username,open_id,event_type,order_id,payload) VALUES($1,$2,$3,$4,$5,$6::jsonb)
+        ON CONFLICT(event_key) DO NOTHING RETURNING id`,[
+        eventKey,ownerUsername,follower.open_id,eventType,input.orderId ? String(input.orderId) : null,JSON.stringify(payload)
+      ]);
+      queued+=result.rows.length;
+    }
+    triggerWorker();
+    return { queued,followers:followers.rows.length };
   }
 
   async function claimNext() {
@@ -392,8 +478,9 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     const row=rows[0] || {};
     return {
       enabled:row.enabled ?? true,newOrder:row.new_order_enabled ?? true,cancelled:row.cancelled_enabled ?? true,
-      deadline:row.deadline_enabled ?? true,refund:row.refund_enabled ?? true,buyerInquiry:row.buyer_inquiry_enabled ?? true,
-      afterSales:row.after_sales_enabled ?? true
+      deadline:row.deadline_enabled ?? true,refund:row.refund_enabled ?? true,shipped:row.shipped_enabled ?? true,
+      buyerInquiry:row.buyer_inquiry_enabled ?? true,afterSales:row.after_sales_enabled ?? true,
+      bindingSuccess:row.binding_success_enabled ?? true
     };
   }
 
@@ -401,12 +488,14 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     const current=await getPreferences(ownerUsername);
     const next={ ...current,...Object.fromEntries(Object.entries(input).filter(([key,value])=>Object.hasOwn(current,key) && typeof value==='boolean')) };
     await pool.query(`INSERT INTO wechat_official_notification_preferences
-      (owner_username,enabled,new_order_enabled,cancelled_enabled,deadline_enabled,refund_enabled,buyer_inquiry_enabled,after_sales_enabled,updated_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT(owner_username) DO UPDATE SET
+      (owner_username,enabled,new_order_enabled,cancelled_enabled,deadline_enabled,refund_enabled,shipped_enabled,
+       buyer_inquiry_enabled,after_sales_enabled,binding_success_enabled,updated_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW()) ON CONFLICT(owner_username) DO UPDATE SET
       enabled=EXCLUDED.enabled,new_order_enabled=EXCLUDED.new_order_enabled,cancelled_enabled=EXCLUDED.cancelled_enabled,
-      deadline_enabled=EXCLUDED.deadline_enabled,refund_enabled=EXCLUDED.refund_enabled,
-      buyer_inquiry_enabled=EXCLUDED.buyer_inquiry_enabled,after_sales_enabled=EXCLUDED.after_sales_enabled,updated_at=NOW()`,
-    [ownerUsername,next.enabled,next.newOrder,next.cancelled,next.deadline,next.refund,next.buyerInquiry,next.afterSales]);
+      deadline_enabled=EXCLUDED.deadline_enabled,refund_enabled=EXCLUDED.refund_enabled,shipped_enabled=EXCLUDED.shipped_enabled,
+      buyer_inquiry_enabled=EXCLUDED.buyer_inquiry_enabled,after_sales_enabled=EXCLUDED.after_sales_enabled,
+      binding_success_enabled=EXCLUDED.binding_success_enabled,updated_at=NOW()`,
+    [ownerUsername,next.enabled,next.newOrder,next.cancelled,next.deadline,next.refund,next.shipped,next.buyerInquiry,next.afterSales,next.bindingSuccess]);
     return next;
   }
 
@@ -439,6 +528,34 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     return weChatApi('GET','https://api.weixin.qq.com/cgi-bin/template/get_all_private_template',undefined,true);
   }
 
+  async function syncTemplateConfigsFromOfficial() {
+    if (!appSecret) return { skipped:true,reason:'app_secret_not_configured',configured:0,missing:EVENT_TYPES };
+    try {
+      const remote=await listAvailableTemplates();
+      const templates=Array.isArray(remote?.template_list) ? remote.template_list : [];
+      const configured=[],missing=[];
+      for (const eventType of EVENT_TYPES) {
+        const preset=OFFICIAL_TEMPLATE_PRESETS[eventType];
+        const template=templates.find(item=>String(item.title || '').trim()===preset.title);
+        if (!template?.template_id) { missing.push(eventType); continue; }
+        await pool.query(`UPDATE wechat_official_template_configs SET template_id=$2,data_mapping=$3::jsonb,
+          page_path=$4,enabled=TRUE,updated_at=NOW() WHERE event_type=$1`,[
+          eventType,String(template.template_id),JSON.stringify(preset.dataMapping),preset.pagePath
+        ]);
+        configured.push(eventType);
+      }
+      await pool.query(`UPDATE wechat_official_notification_outbox SET status='skipped',
+        last_error='template_activated_after_event',updated_at=NOW()
+        WHERE status='waiting_config' AND created_at<NOW()-INTERVAL '10 minutes'`);
+      templateSyncStatus={ synced:true,configured:configured.length,missing:missing.length,lastAt:new Date().toISOString(),error:'' };
+      triggerWorker();
+      return { skipped:false,configured,missing };
+    } catch (error) {
+      templateSyncStatus={ ...templateSyncStatus,synced:false,lastAt:new Date().toISOString(),error:String(error.message || error).slice(0,300) };
+      throw error;
+    }
+  }
+
   async function getStatus() {
     const [followers,outbox,templates]=await Promise.all([
       pool.query(`SELECT COUNT(*)::int AS total,COUNT(*) FILTER(WHERE subscribed=TRUE)::int AS subscribed,
@@ -447,7 +564,8 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
       listTemplateConfigs()
     ]);
     return { appId,miniProgramAppId,callbackPath,configured:{ secret:Boolean(appSecret),token:Boolean(callbackToken),aesKey:Boolean(encodingAesKey) },
-      workerRunning:Boolean(workerTimer)&&!stopped,processing:working,syncingFollowers,followers:followers.rows[0],outbox:Object.fromEntries(outbox.rows.map(row=>[row.status,row.count])),templates };
+      workerRunning:Boolean(workerTimer)&&!stopped,processing:working,syncingFollowers,templateSync:templateSyncStatus,
+      followers:followers.rows[0],outbox:Object.fromEntries(outbox.rows.map(row=>[row.status,row.count])),templates };
   }
 
   function registerRoutes(app) {
@@ -459,7 +577,7 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     app.get('/api/health/wechat-official-account',(req,res)=>{
       res.json({ code:0,data:{ appId,callbackPath,eventTypes:EVENT_TYPES,
         configured:{ secret:Boolean(appSecret),token:Boolean(callbackToken),aesKey:Boolean(encodingAesKey) },
-        workerRunning:Boolean(workerTimer)&&!stopped,processing:working } });
+        workerRunning:Boolean(workerTimer)&&!stopped,processing:working,templateSync:templateSyncStatus } });
     });
     app.get('/api/admin/wechat-official/status',requireAdmin,async (req,res)=>{
       try { res.json({ code:0,data:await getStatus() }); } catch (error) { res.status(500).json({ code:500,message:error.message }); }
@@ -469,6 +587,10 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     });
     app.get('/api/admin/wechat-official/available-templates',requireAdmin,async (req,res)=>{
       try { res.json({ code:0,data:await listAvailableTemplates() }); }
+      catch (error) { res.status(502).json({ code:502,message:error.message }); }
+    });
+    app.post('/api/admin/wechat-official/templates/sync',requireAdmin,async (req,res)=>{
+      try { res.json({ code:0,data:await syncTemplateConfigsFromOfficial() }); }
       catch (error) { res.status(502).json({ code:502,message:error.message }); }
     });
     app.post('/api/admin/wechat-official/sync-followers',requireAdmin,async (req,res)=>{
@@ -488,6 +610,7 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     if (!followerSyncTimer) { followerSyncTimer=setInterval(()=>syncFollowers().catch(error=>logger.error('[WeChatOfficial] follower sync failed:',error.message)),6*60*60*1000); followerSyncTimer.unref?.(); }
     enqueueNewAlerts().catch(error=>logger.error('[WeChatOfficial] initial scan failed:',error.message));
     syncFollowers().catch(error=>logger.error('[WeChatOfficial] initial follower sync failed:',error.message));
+    syncTemplateConfigsFromOfficial().catch(error=>logger.error('[WeChatOfficial] template sync failed:',error.message));
     triggerWorker();
   }
 
@@ -499,8 +622,9 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     scanTimer=null;workerTimer=null;followerSyncTimer=null;
   }
 
-  return { init,registerRoutes,start,stop,getPreferences,updatePreferences,getBindingStatus,getStatus,listTemplateConfigs,saveTemplateConfig,syncFollowers };
+  return { init,registerRoutes,start,stop,getPreferences,updatePreferences,getBindingStatus,getStatus,listTemplateConfigs,
+    saveTemplateConfig,syncFollowers,syncTemplateConfigsFromOfficial,enqueueNotification };
 }
 
-module.exports={ DEFAULT_OFFICIAL_APP_ID,EVENT_TYPES,sha1Signature,parseWeChatXml,decryptWeChatMessage,
+module.exports={ DEFAULT_OFFICIAL_APP_ID,EVENT_TYPES,OFFICIAL_TEMPLATE_PRESETS,sha1Signature,parseWeChatXml,decryptWeChatMessage,
   preferenceColumn,retryDelaySeconds,renderTemplateData,createOfficialAccountService };
