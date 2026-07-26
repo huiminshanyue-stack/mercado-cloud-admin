@@ -41,7 +41,7 @@
     </view>
   </view>
 
-  <view class="summary">共 {{total}} 单 · 下拉刷新最新状态</view>
+  <view id="orders-list-start" class="summary">共 {{total}} 单 · 第 {{page}} / {{pageCount}} 页 · 下拉刷新最新状态</view>
   <view wx:if="{{loading && !orders.length}}" class="empty">正在读取订单…</view>
   <view wx:elif="{{!loading && !orders.length}}" class="empty">当前筛选条件下暂无订单</view>
 
@@ -70,6 +70,10 @@
       <view class="cost-column"><text class="label">成本 CNY {{item.costText}}</text><button class="cost-action" size="mini" data-id="{{item.displayOrderId}}" catchtap="openCost">填写成本</button></view>
     </view>
   </view>
-  <view wx:if="{{loading && orders.length}}" class="loading-more">加载中…</view>
-  <view wx:if="{{!hasMore && orders.length}}" class="loading-more">已显示全部订单</view>
+  <view wx:if="{{orders.length}}" class="pagination">
+    <button class="page-button" disabled="{{loading || page <= 1}}" bindtap="previousPage">上一页</button>
+    <view class="page-status"><text>第 {{page}} 页</text><text class="page-total">共 {{pageCount}} 页</text></view>
+    <button class="page-button page-button-next" disabled="{{loading || page >= pageCount}}" bindtap="nextPage">下一页</button>
+  </view>
+  <view wx:if="{{loading && orders.length}}" class="loading-more">正在更新本页…</view>
 </view>

@@ -55,7 +55,7 @@ function normalize(order:any) {
 
 Page({
   data:{
-    loading:false,page:1,size:20,total:0,hasMore:true,orders:[] as any[],stores:[] as any[],
+    loading:false,page:1,size:20,total:0,pageCount:1,hasMore:false,orders:[] as any[],stores:[] as any[],
     storeNames:['全部店铺'],storeIndex:0,statusNames:statusOptions.map(i=>i.name),statusIndex:0,
     orderId:'',userName:'内测账号',loadedOnce:false,
     periodTabs,summaryPeriod:'today',summaryLoading:false,allSummaryLoading:false,
@@ -70,23 +70,29 @@ Page({
     }
     this.setData({ userName:app.globalData.user?.nickname || app.globalData.user?.username || '内测账号' });
     await this.loadStores();
-    await Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]);
+    await Promise.all([this.loadOrders(1),this.loadSummary(),this.loadAllTimeSummary()]);
     this.setData({ loadedOnce:true });
   },
   onShow() {
-    if (this.data.loadedOnce) Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]);
+    if ((this as any)._returningFromChild) {
+      (this as any)._returningFromChild=false;
+      const scrollTop=Number((this as any)._savedScrollTop || 0);
+      setTimeout(()=>wx.pageScrollTo({ scrollTop,duration:0 }),0);
+    } else if (this.data.loadedOnce) {
+      Promise.all([this.loadOrders(this.data.page),this.loadSummary(),this.loadAllTimeSummary()]);
+    }
     realtimeWatcher.start(state=>{
-      if (state.lastTopic === 'orders_v2' || state.lastTopic === 'shipments') Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]);
+      if (state.lastTopic === 'orders_v2' || state.lastTopic === 'shipments') Promise.all([this.loadOrders(this.data.page),this.loadSummary(),this.loadAllTimeSummary()]);
     });
   },
   onHide() { realtimeWatcher.stop(); },
   onUnload() { realtimeWatcher.stop(); },
-  async onPullDownRefresh() { await Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]); wx.stopPullDownRefresh(); },
-  async onReachBottom() { if (this.data.hasMore && !this.data.loading) await this.loadOrders(false); },
+  async onPullDownRefresh() { await Promise.all([this.loadOrders(this.data.page),this.loadSummary(),this.loadAllTimeSummary()]); wx.stopPullDownRefresh(); },
+  onPageScroll(event:{scrollTop:number}) { (this as any)._savedScrollTop=Number(event.scrollTop || 0); },
   onOrderId(event:WechatMiniprogram.Input) { this.setData({ orderId:event.detail.value.trim() }); },
-  async onStoreChange(event:WechatMiniprogram.PickerChange) { this.setData({ storeIndex:Number(event.detail.value) }); await Promise.all([this.loadOrders(true),this.loadSummary()]); },
-  async onStatusChange(event:WechatMiniprogram.PickerChange) { this.setData({ statusIndex:Number(event.detail.value) }); await this.loadOrders(true); },
-  async applyFilters() { await this.loadOrders(true); },
+  async onStoreChange(event:WechatMiniprogram.PickerChange) { this.setData({ storeIndex:Number(event.detail.value) }); await Promise.all([this.loadOrders(1),this.loadSummary()]); },
+  async onStatusChange(event:WechatMiniprogram.PickerChange) { this.setData({ statusIndex:Number(event.detail.value) }); await this.loadOrders(1); },
+  async applyFilters() { await this.loadOrders(1); },
   async onPeriodChange(event:WechatMiniprogram.TouchEvent) {
     const period=String(event.currentTarget.dataset.period || 'today');
     if (period===this.data.summaryPeriod) return;
@@ -99,9 +105,9 @@ Page({
       this.setData({ stores,storeNames:['全部店铺',...stores.map(store=>store.displayName || store.nickname || store.id)] });
     } catch (error) { showError(error); }
   },
-  async loadOrders(reset:boolean) {
+  async loadOrders(targetPage:number) {
     if (this.data.loading) return;
-    const page = reset ? 1 : this.data.page;
+    const page=Math.max(1,Number(targetPage || 1));
     this.setData({ loading:true });
     try {
       const store = this.data.storeIndex > 0 ? this.data.stores[this.data.storeIndex-1] : null;
@@ -114,12 +120,23 @@ Page({
       ].filter(Boolean).join('&');
       const result = await request<any>({ path:`/api/miniprogram/v1/orders?${query}` });
       const incoming = (result.items || []).map(normalize);
-      const orders = reset ? incoming : [...this.data.orders,...incoming];
-      this.setData({ orders,total:Number(result.total || 0),page:page+1,hasMore:orders.length<Number(result.total || 0) });
+      const total=Number(result.total || 0);
+      const pageCount=Math.max(1,Math.ceil(total/this.data.size));
+      this.setData({ orders:incoming,total,page,pageCount,hasMore:page<pageCount });
     } catch (error:any) {
       if (/登录/.test(error?.message || '')) wx.reLaunch({ url:'/pages/login/index' });
       showError(error);
     } finally { this.setData({ loading:false }); }
+  },
+  async previousPage() {
+    if (this.data.loading || this.data.page<=1) return;
+    await this.loadOrders(this.data.page-1);
+    wx.pageScrollTo({ selector:'#orders-list-start',duration:0 });
+  },
+  async nextPage() {
+    if (this.data.loading || this.data.page>=this.data.pageCount) return;
+    await this.loadOrders(this.data.page+1);
+    wx.pageScrollTo({ selector:'#orders-list-start',duration:0 });
   },
   async loadSummary() {
     const requestId=Number((this as any)._summaryRequestId || 0)+1;
@@ -147,9 +164,11 @@ Page({
     finally { if ((this as any)._allSummaryRequestId===requestId) this.setData({ allSummaryLoading:false }); }
   },
   openOrder(event:WechatMiniprogram.TouchEvent) {
+    (this as any)._returningFromChild=true;
     wx.navigateTo({ url:`/pages/order-detail/index?id=${encodeURIComponent(event.currentTarget.dataset.id)}` });
   },
   openCost(event:WechatMiniprogram.TouchEvent) {
+    (this as any)._returningFromChild=true;
     wx.navigateTo({ url:`/pages/cost/index?id=${encodeURIComponent(event.currentTarget.dataset.id)}` });
   },
   logout() {

@@ -61,3 +61,10 @@
 .label { color:#8b97a4; font-size:22rpx; }.amount { margin-top:5rpx; font-size:29rpx; font-weight:700; }.payout { color:#16a66a; }
 .cost-column { align-items:flex-end; }.cost-action { margin:7rpx 0 0; padding:0 14rpx; color:#1677ff; background:#edf5ff; font-size:21rpx; line-height:46rpx; }
 .empty,.loading-more { padding:90rpx 0; color:#94a0ad; text-align:center; font-size:26rpx; }.loading-more { padding:28rpx 0; }
+.pagination { display:flex; align-items:center; justify-content:space-between; gap:20rpx; padding:12rpx 0 34rpx; }
+.page-button { width:190rpx; margin:0; color:#526170; background:#fff; border:1rpx solid #dfe5eb; border-radius:12rpx; font-size:25rpx; line-height:72rpx; }
+.page-button::after { border:0; }
+.page-button-next { color:#fff; background:#1677ff; border-color:#1677ff; }
+.page-button[disabled] { color:#aeb7c0; background:#f2f4f6; border-color:#e7eaee; }
+.page-status { display:flex; flex-direction:column; align-items:center; color:#344454; font-size:25rpx; font-weight:650; }
+.page-total { margin-top:4rpx; color:#909ba6; font-size:20rpx; font-weight:400; }
