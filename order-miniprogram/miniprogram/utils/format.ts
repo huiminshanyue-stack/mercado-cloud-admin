@@ -34,7 +34,9 @@ export function formatDate(value?: string | null): string {
 export function money(value: unknown,currency = 'USD'): string {
   if (value === null || value === undefined || value === '') return '待获取';
   const amount = Number(value);
-  return Number.isFinite(amount) ? `${currency} ${amount.toFixed(2)}` : '待获取';
+  if (!Number.isFinite(amount)) return '待获取';
+  const symbol=currency === 'USD' ? '$' : currency === 'CNY' ? '￥' : `${currency} `;
+  return `${symbol}${amount.toFixed(2)}`;
 }
 
 export function countryInfo(code?: string): { name:string;flag:string } {

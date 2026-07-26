@@ -35,7 +35,8 @@
       <view class="row"><text>退款金额</text><text>{{order.refundText}}</text></view>
       <view class="row strong"><text>应回款</text><text class="success">{{order.payoutText}}</text></view>
       <view class="finance-hint">{{order.payoutHint}}，不使用销售额估算。</view>
-      <view class="row"><text>商品成本</text><text>CNY {{order.costText}}</text></view>
+      <view class="row"><text>整单商品成本</text><text>{{order.costText}}</text></view>
+      <view class="row strong"><text>人民币利润</text><text class="{{order.profitClass}}">{{order.profitText}}</text></view>
       <button class="cost-button" bindtap="openCost">查看或修改订单成本</button>
     </view>
 

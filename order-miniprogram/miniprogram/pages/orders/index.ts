@@ -49,7 +49,13 @@ function normalize(order:any) {
       : '',
     products,productCount:products.reduce((total:number,product:any)=>total+product.quantity,0),
     grossText:money(order.grossAmountUsd ?? order.paidAmount,'USD'),
-    payoutText:money(order.netAmountUsd,'USD'),costText:Number(order.productCost || 0).toFixed(2)
+    payoutText:money(order.netAmountUsd,'USD'),
+    costText:money(order.productCost || 0,'CNY'),
+    costActionText:Number(order.productCost || 0) === 0 ? '填写成本' : '修改成本',
+    profitText:money(order.profitCny,'CNY'),
+    profitClass:order.profitCny === null || order.profitCny === undefined
+      ? 'profit-pending'
+      : Number(order.profitCny) < 0 ? 'profit-negative' : 'profit-positive'
   };
 }
 
@@ -73,10 +79,15 @@ Page({
     await Promise.all([this.loadOrders(1),this.loadSummary(),this.loadAllTimeSummary()]);
     this.setData({ loadedOnce:true });
   },
-  onShow() {
+  async onShow() {
     if ((this as any)._returningFromChild) {
       (this as any)._returningFromChild=false;
+      const refreshAfterReturn=Boolean((this as any)._refreshAfterChildReturn);
+      (this as any)._refreshAfterChildReturn=false;
       const scrollTop=Number((this as any)._savedScrollTop || 0);
+      if (refreshAfterReturn) {
+        await Promise.all([this.loadOrders(this.data.page),this.loadSummary(),this.loadAllTimeSummary()]);
+      }
       setTimeout(()=>wx.pageScrollTo({ scrollTop,duration:0 }),0);
     } else if (this.data.loadedOnce) {
       Promise.all([this.loadOrders(this.data.page),this.loadSummary(),this.loadAllTimeSummary()]);
@@ -165,10 +176,12 @@ Page({
   },
   openOrder(event:WechatMiniprogram.TouchEvent) {
     (this as any)._returningFromChild=true;
+    (this as any)._refreshAfterChildReturn=false;
     wx.navigateTo({ url:`/pages/order-detail/index?id=${encodeURIComponent(event.currentTarget.dataset.id)}` });
   },
   openCost(event:WechatMiniprogram.TouchEvent) {
     (this as any)._returningFromChild=true;
+    (this as any)._refreshAfterChildReturn=true;
     wx.navigateTo({ url:`/pages/cost/index?id=${encodeURIComponent(event.currentTarget.dataset.id)}` });
   },
   logout() {

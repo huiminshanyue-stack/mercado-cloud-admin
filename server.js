@@ -3773,7 +3773,14 @@ async function getOrderListData(authUser,query = {}) {
     delete row.rawData;
   }
   const packedRows = await aggregatePackedOrders(rows.rows);
-  return { items: packedRows, total: count.rows[0].total, page, size };
+  const exchangeRate = await getUsdCnyRate(req.authUser.username);
+  for (const order of packedRows) {
+    order.exchangeRate = Number(exchangeRate);
+    order.profitCny = order.netAmountUsd === null || order.netAmountUsd === undefined
+      ? null
+      : Number((Number(order.netAmountUsd) * Number(exchangeRate) - Number(order.productCost || 0)).toFixed(2));
+  }
+  return { items: packedRows, total: count.rows[0].total, page, size, exchangeRate:Number(exchangeRate) };
 }
 
 async function getMiniOrderWorkbenchSummaryData(authUser,query = {}) {

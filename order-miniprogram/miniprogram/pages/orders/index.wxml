@@ -7,7 +7,7 @@
   <view class="card account-total-card">
     <view class="account-total-head"><view><text class="account-total-title">全部店铺总览</text><text class="account-total-subtitle">全部历史订单</text></view><text wx:if="{{allSummaryLoading}}" class="summary-loading">更新中</text></view>
     <view class="total-profit-label">总利润</view>
-    <view class="total-profit-value"><text class="currency-symbol">¥</text>{{allTimeSummary.profitText}}</view>
+    <view class="total-profit-value"><text class="currency-symbol">￥</text>{{allTimeSummary.profitText}}</view>
     <view class="account-total-divider"></view>
     <view class="account-total-metrics">
       <view><text class="account-metric-label">销售额</text><text class="account-metric-value">{{allTimeSummary.salesText}}</text></view>
@@ -65,10 +65,12 @@
     <view class="order-date">下单：{{item.dateText}}</view>
     <view wx:if="{{item.stateKey === 'pending'}}" class="dispatch-deadline">{{item.dispatchDeadlineText}}</view>
     <view class="money-row">
-      <view><text class="label">商品金额</text><text class="amount">{{item.grossText}}</text></view>
-      <view><text class="label">应回款</text><text class="amount payout">{{item.payoutText}}</text></view>
-      <view class="cost-column"><text class="label">成本 CNY {{item.costText}}</text><button class="cost-action" size="mini" data-id="{{item.displayOrderId}}" catchtap="openCost">填写成本</button></view>
+      <view class="money-cell"><text class="label">商品金额</text><text class="amount">{{item.grossText}}</text></view>
+      <view class="money-cell"><text class="label">应回款</text><text class="amount payout">{{item.payoutText}}</text></view>
+      <view class="money-cell"><text class="label">整单成本</text><text class="amount cost-amount">{{item.costText}}</text></view>
+      <view class="money-cell profit-column"><text class="label">人民币利润</text><text class="amount {{item.profitClass}}">{{item.profitText}}</text></view>
     </view>
+    <button class="cost-action" size="mini" data-id="{{item.displayOrderId}}" catchtap="openCost">{{item.costActionText}}</button>
   </view>
   <view wx:if="{{orders.length}}" class="pagination">
     <button class="page-button" disabled="{{loading || page <= 1}}" bindtap="previousPage">上一页</button>

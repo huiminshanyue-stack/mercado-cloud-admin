@@ -34,7 +34,11 @@ Page({
         dateText:formatDate(raw.dateCreated),products,
         grossText:money(raw.grossAmountUsd ?? raw.paidAmount,'USD'),saleFeeText:money(raw.salesCommissionTotalSigned ?? raw.saleFee,'USD'),
         shippingFeeText:money(raw.shippingFeeSigned ?? raw.shippingFee,'USD'),refundText:money(raw.refundAmountUsd ?? raw.refundAmount,'USD'),
-        payoutText:money(raw.netAmountUsd,'USD'),costText:Number(raw.productCost || 0).toFixed(2),
+        payoutText:money(raw.netAmountUsd,'USD'),costText:money(raw.productCost || 0,'CNY'),
+        profitText:money(raw.profitCny,'CNY'),
+        profitClass:raw.profitCny === null || raw.profitCny === undefined
+          ? 'muted'
+          : Number(raw.profitCny) < 0 ? 'danger' : 'success',
         payoutHint:raw.payoutIsOfficial ? '官方实际净回款' : '官方净回款待获取',
         deadlineText:deadlineText(raw),onlineText:onlineDeadlineText(raw),
         cancellationText:cancellationText(raw.cancellationReason),
