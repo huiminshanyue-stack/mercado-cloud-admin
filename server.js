@@ -3035,7 +3035,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.46',
+    version: '2026-07-26.47',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3065,6 +3065,9 @@ app.get('/api/health/order-management', (req, res) => {
     dimensionSourceLabels: ['mercado_shipment_package','current_item_official_record','item_shipping_option_billable_weight'],
     dimensionWeightComparisonUsesOrderQuantity: true,
     listingDimensionsAreCurrentOfficialRecord: true,
+    dimensionUiSemanticsV2: true,
+    platformWeightAnomalyWarning: true,
+    miniProgramDimensionRefresh: true,
     dimensionMissingValueLabels: true,
     compactDimensionCard: true,
     statisticsIndependentFilters: true,
@@ -3764,16 +3767,23 @@ app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
   catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单失败' }); }
 });
 
-app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || '').trim();
+async function refreshOrderDimensionsData(authUser, requestedOrderId) {
+    const orderId = String(requestedOrderId || '').trim();
     const { rows } = await pool.query(`SELECT ml_order_id,pack_id,shipping_id,store_user_id,site_id,items,
       shipping_dimensions_original AS "dimensionsOriginal"
       FROM ml_orders WHERE owner_username=$1 AND (ml_order_id=$2 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$2)
-      ORDER BY date_created`, [req.authUser.username,orderId]);
-    if (!rows.length) return res.status(404).json({ code: 404, message: '订单不存在或无权访问' });
-    const context = await getOrderStoreContext(req.authUser,rows[0].store_user_id);
-    if (!context) return res.status(401).json({ code: 401, message: '店铺授权已失效，请重新授权后获取尺寸' });
+      ORDER BY date_created`, [authUser.username,orderId]);
+    if (!rows.length) {
+      const error = new Error('订单不存在或无权访问');
+      error.status = 404;
+      throw error;
+    }
+    const context = await getOrderStoreContext(authUser,rows[0].store_user_id);
+    if (!context) {
+      const error = new Error('店铺授权已失效，请重新授权后获取尺寸重量');
+      error.status = 401;
+      throw error;
+    }
     const shipmentIds = [...new Set(rows.map(row => String(row.shipping_id || '')).filter(Boolean))];
     const itemIds = [...new Set(rows.flatMap(row => (Array.isArray(row.items) ? row.items : []).map(entry => String(entry?.item?.id || '')).filter(Boolean)))];
     const shipments = [], items = [], failures = [];
@@ -3792,10 +3802,12 @@ app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, as
       catch (error) { failures.push({ type: 'item', id: itemId, status: error.response?.status || 0, message: error.response?.data?.message || error.message }); }
     }
     const snapshot = buildOrderDimensionSnapshot(shipments,items);
-    await saveOrderApiAudit(req.authUser.username,context.sellerId,String(rows[0].ml_order_id),'dimensions',`dimensions:${orderId}`,{ shipments,items,failures,snapshot });
+    await saveOrderApiAudit(authUser.username,context.sellerId,String(rows[0].ml_order_id),'dimensions',`dimensions:${orderId}`,{ shipments,items,failures,snapshot });
     if (!snapshot.available) {
       const officialReason = failures.map(item => `${item.type} ${item.id}：${item.message}`).join('；');
-      return res.status(422).json({ code: 422, message: officialReason || '美客多官方接口当前未返回该订单的长宽高和重量' });
+      const error = new Error(officialReason || '美客多官方接口当前未返回该订单的长宽高和重量');
+      error.status = 422;
+      throw error;
     }
     const existingOriginal = rows.find(row => row.dimensionsOriginal?.available)?.dimensionsOriginal || null;
     const original = existingOriginal || snapshot;
@@ -3804,20 +3816,26 @@ app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, as
       shipping_dimensions_original=CASE WHEN COALESCE(shipping_dimensions_original,'{}'::jsonb)='{}'::jsonb THEN $1::jsonb ELSE shipping_dimensions_original END,
       shipping_dimensions_latest=$2::jsonb,shipping_dimensions_updated_at=NOW(),updated_at=NOW()
       WHERE owner_username=$3 AND (ml_order_id=$4 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$4)`,
-      [JSON.stringify(original),JSON.stringify(snapshot),req.authUser.username,orderId]);
-    res.json({ code: 0, data: {
+      [JSON.stringify(original),JSON.stringify(snapshot),authUser.username,orderId]);
+    return {
       dimensionsOriginal: original,
       dimensionsLatest: snapshot,
       dimensionsUpdatedAt: snapshot.fetchedAt,
       dimensionsChanged: changed,
       note: snapshot.verifiedPackage
-        ? '已获取美客多订单包裹核验值、商品当前官方记录值和计费重量；页面将按订单商品数量进行重量对比，最终运费以官方账单为准。'
-        : '已更新商品当前官方记录值，但美客多暂未返回该订单包裹核验值，系统不会把商品记录值冒充包裹核验值。',
+        ? '已获取卖家自主填写的尺寸重量、美客多平台称重返回值和当前计费重量；系统已按订单商品数量比较，最终运费以官方账单为准。'
+        : '已更新美客多平台当前返回的尺寸重量，但卖家自主填写的尺寸重量暂未由官方接口返回；系统不会用另一组数据冒充。',
       failures
-    } });
+    };
+}
+
+app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, async (req, res) => {
+  try {
+    res.json({ code: 0, data: await refreshOrderDimensionsData(req.authUser,req.params.orderId) });
   } catch (error) {
     console.error('[Orders] 获取官方尺寸重量失败:', error.response?.data || error.message);
-    res.status(error.response?.status || 500).json({ code: error.response?.status || 500, message: error.response?.data?.message || error.message || '获取尺寸重量失败' });
+    const status = error.status || error.response?.status || 500;
+    res.status(status).json({ code: status, message: error.response?.data?.message || error.message || '获取尺寸重量失败' });
   }
 });
 
@@ -6445,7 +6463,7 @@ async function start() {
   });
   await mercadoLibreWebhookService.init();
   mercadoLibreWebhookService.registerRoutes(app);
-  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData,
+  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData,refreshOrderDimensionsData,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
     getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,translateOrderMessageData,getOrderRealtimeStateData,
     getOfficialNotificationPreferences:officialAccountService.getPreferences,

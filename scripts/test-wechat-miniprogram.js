@@ -39,7 +39,7 @@ async function runHandlers(handlers,req,res) {
 
 async function testRoutes() {
   process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
-  const routes=new Map(),listCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
+  const routes=new Map(),listCalls=[],dimensionCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -82,6 +82,10 @@ async function testRoutes() {
       listCalls.push({ user,query });
       return { items:[{ orderId:'order-1' }],total:1,page:1,size:20 };
     },
+    refreshOrderDimensionsData:async (user,orderId) => {
+      dimensionCalls.push({ user,orderId });
+      return { dimensionsLatest:{ available:true },dimensionsChanged:true };
+    },
     updateOrderCostData:async (user,orderId,body) => {
       costCalls.push({ user,orderId,body });
       return { orderId,cost:body.cost,note:body.note || '' };
@@ -117,7 +121,7 @@ async function testRoutes() {
   assert.equal(configRes.statusCode,200);
   assert.equal(configRes.body.data.appId,DEFAULT_APP_ID);
   assert.equal(configRes.body.data.writeOperationsEnabled,true);
-  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply']);
+  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply','dimension_refresh']);
 
   const anonymousRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/orders'),{ headers:{},query:{} },anonymousRes);
@@ -138,6 +142,16 @@ async function testRoutes() {
   assert.equal(listCalls.length,1);
   assert.equal(listCalls[0].user.username,'CNTORO');
   assert.deepEqual(listCalls[0].query,{ page:'2',storeId:'store-1' });
+
+  const dimensionsRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/orders/:orderId/dimensions/refresh'),{
+    headers:{ authorization:'Bearer cntoro-token' },params:{ orderId:'order-1' },body:{}
+  },dimensionsRes);
+  assert.equal(dimensionsRes.statusCode,200);
+  assert.equal(dimensionsRes.body.data.dimensionsLatest.available,true);
+  assert.equal(dimensionCalls.length,1);
+  assert.equal(dimensionCalls[0].user.username,'CNTORO');
+  assert.equal(dimensionCalls[0].orderId,'order-1');
 
   const costRes=responseRecorder();
   await runHandlers(routes.get('PATCH /api/miniprogram/v1/orders/:orderId/cost'),{

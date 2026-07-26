@@ -107,14 +107,65 @@ function compact(value:unknown): string {
   return Number.isFinite(parsed) ? String(Number(parsed.toFixed(2))) : String(value);
 }
 
-export function dimensionSummary(snapshot:any,mode:'original'|'latest'): string {
-  const value=mode==='original'
-    ? snapshot?.orderRecorded || snapshot?.items?.[0]?.orderDimensions || snapshot?.items?.[0]?.dimensions || snapshot?.package?.dimensions
-    : snapshot?.items?.[0]?.listingDimensions || snapshot?.items?.[0]?.dimensions || snapshot?.package?.dimensions;
-  if (!value) return '官方暂未返回';
+function dimensionValue(snapshot:any,mode:'seller'|'platform'): any {
+  if (mode==='seller') {
+    return snapshot?.verifiedPackage || snapshot?.package?.dimensions || snapshot?.declaredAtOrder || snapshot?.orderRecorded || snapshot?.items?.[0]?.orderDimensions || null;
+  }
+  return snapshot?.currentListing || snapshot?.items?.find((item:any)=>item?.listingDimensions)?.listingDimensions || null;
+}
+
+export function dimensionSummary(snapshot:any,mode:'seller'|'platform'): string {
+  const value=dimensionValue(snapshot,mode);
+  if (!value) return '暂未获取';
   const length=compact(value.length),width=compact(value.width),height=compact(value.height),weight=compact(value.weight);
   const size=length && width && height ? `${length}×${width}×${height} ${value.dimensionUnit || 'cm'}` : '长宽高未完整返回';
   return `${size} / ${weight ? `重量 ${weight} ${value.weightUnit || 'g'}` : '重量未返回'}`;
+}
+
+function weightInGrams(value:any): number|null {
+  const parsed=Number(value?.weight);
+  if (!Number.isFinite(parsed)) return null;
+  const unit=String(value?.weightUnit || 'g').trim().toLowerCase();
+  if (['kg','kgs','kilogram','kilograms','公斤','千克'].includes(unit)) return parsed*1000;
+  if (['mg','milligram','milligrams','毫克'].includes(unit)) return parsed/1000;
+  if (['lb','lbs','磅'].includes(unit)) return parsed*453.59237;
+  if (['oz','盎司'].includes(unit)) return parsed*28.349523125;
+  return parsed;
+}
+
+function quantityForItem(orderItems:any[],itemId:string,singleFallback:boolean): number {
+  const matched=itemId
+    ? orderItems.filter(entry=>String(entry?.item?.id || entry?.item_id || '')===itemId)
+    : (singleFallback && orderItems.length===1 ? orderItems : []);
+  const quantity=matched.reduce((total,entry)=>total+Math.max(0,Number(entry?.quantity) || 0),0);
+  return Math.max(1,quantity || 1);
+}
+
+function platformTotalWeight(orderItems:any[],snapshot:any): number|null {
+  const records=(snapshot?.items || []).filter((item:any)=>item?.listingDimensions);
+  if (!records.length) {
+    const single=weightInGrams(dimensionValue(snapshot,'platform'));
+    const quantity=orderItems.reduce((total,entry)=>total+Math.max(0,Number(entry?.quantity) || 0),0);
+    return single===null ? null : single*Math.max(1,quantity || 1);
+  }
+  let total=0,found=false;
+  records.forEach((record:any)=>{
+    const single=weightInGrams(record.listingDimensions);
+    if (single===null) return;
+    total+=single*quantityForItem(orderItems,String(record.itemId || ''),records.length===1);
+    found=true;
+  });
+  return found ? total : null;
+}
+
+export function dimensionWeightState(orderItems:any[],snapshot:any): { sellerHint:string,sellerHintClass:string,weightAnomaly:boolean } {
+  const seller=weightInGrams(dimensionValue(snapshot,'seller'));
+  const platform=platformTotalWeight(Array.isArray(orderItems) ? orderItems : [],snapshot);
+  if (seller===null || platform===null) return { sellerHint:'',sellerHintClass:'',weightAnomaly:false };
+  const tolerance=Math.max(0.01,Math.max(Math.abs(seller),Math.abs(platform))*0.0001);
+  if (Math.abs(seller-platform)<=tolerance) return { sellerHint:'与当前记录重量一致',sellerHintClass:'is-equal',weightAnomaly:false };
+  if (seller<platform) return { sellerHint:'低于当前记录重量',sellerHintClass:'is-lower',weightAnomaly:true };
+  return { sellerHint:'高于当前记录重量',sellerHintClass:'is-higher',weightAnomaly:false };
 }
 
 export function reputationReasonText(value:unknown): string {

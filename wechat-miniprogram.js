@@ -57,6 +57,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     loginRateLimit,
     getOrderListData,
     getOrderStoresData,
+    refreshOrderDimensionsData,
     updateOrderCostData,
     getOrderInquiriesData,
     getOrderAfterSalesData,
@@ -153,7 +154,7 @@ function registerMiniProgramRoutes(app, dependencies) {
       wechatLoginEnabled: Boolean(appSecret),
       erpTestLoginEnabled: true,
       writeOperationsEnabled: true,
-      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply'],
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh'],
       environment: process.env.NODE_ENV || 'production'
     } });
   });
@@ -228,7 +229,7 @@ function registerMiniProgramRoutes(app, dependencies) {
       authSource: req.miniAuth.source,
       user: req.authUser || null,
       writeOperationsEnabled: true,
-      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply']
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh']
     } });
   });
 
@@ -340,6 +341,14 @@ function registerMiniProgramRoutes(app, dependencies) {
       if (!data.items.length) return res.status(404).json({ code: 404, message: '订单不存在或无权查看' });
       res.json({ code: 0, data: data.items[0] });
     } catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单详情失败' }); }
+  });
+
+  app.post('/api/miniprogram/v1/orders/:orderId/dimensions/refresh',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await refreshOrderDimensionsData(req.authUser,req.params.orderId) }); }
+    catch (error) {
+      const status=error.status || error.response?.status || 500;
+      res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '获取尺寸重量失败' });
+    }
   });
 
   app.get('/api/miniprogram/v1/home-summary',requireBoundOrderUser,async (req,res) => {

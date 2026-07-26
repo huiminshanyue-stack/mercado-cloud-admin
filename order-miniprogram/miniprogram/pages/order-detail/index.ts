@@ -1,8 +1,8 @@
 import { request,showError } from '../../utils/request';
-import { cancellationText,countryInfo,deadlineText,dimensionSummary,formatDate,money,onlineDeadlineText,orderState,reputationReasonText } from '../../utils/format';
+import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWeightState,formatDate,money,onlineDeadlineText,orderState,reputationReasonText } from '../../utils/format';
 
 Page({
-  data:{ loading:true,order:null as any,displayOrderId:'',loadedOnce:false },
+  data:{ loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false },
   async onLoad(options:Record<string,string>) {
     if (!options.id) {
       wx.navigateBack();
@@ -27,6 +27,8 @@ Page({
           productKey:`${item.id || 'item'}:${item.variation_id || item.seller_sku || item.seller_custom_field || 'variation'}:${index}`
         };
       });
+      const dimensionSnapshot=raw.dimensionsLatest?.available ? raw.dimensionsLatest : raw.dimensionsOriginal;
+      const dimensionState=dimensionWeightState(raw.items || [],dimensionSnapshot);
       this.setData({ order:{
         ...raw,displayOrderId:raw.displayOrderId || raw.orderId,stateText:orderState(raw),countryName:country.name,countryFlag:country.flag,
         dateText:formatDate(raw.dateCreated),products,
@@ -36,8 +38,11 @@ Page({
         payoutHint:raw.payoutIsOfficial ? '官方实际净回款' : '官方净回款待获取',
         deadlineText:deadlineText(raw),onlineText:onlineDeadlineText(raw),
         cancellationText:cancellationText(raw.cancellationReason),
-        originalDimensionText:dimensionSummary(raw.dimensionsOriginal,'original'),
-        latestDimensionText:dimensionSummary(raw.dimensionsLatest,'latest'),
+        sellerDimensionText:dimensionSummary(dimensionSnapshot,'seller'),
+        platformDimensionText:dimensionSummary(dimensionSnapshot,'platform'),
+        sellerWeightHint:dimensionState.sellerHint,
+        sellerWeightHintClass:dimensionState.sellerHintClass,
+        weightAnomaly:dimensionState.weightAnomaly,
         dimensionsAvailable:Boolean(raw.dimensionsOriginal?.available || raw.dimensionsLatest?.available),
         reputationReasonText:reputationReasonText(raw.reputationReason)
       } });
@@ -51,5 +56,27 @@ Page({
   },
   openCost() {
     wx.navigateTo({ url:`/pages/cost/index?id=${encodeURIComponent(this.data.order.displayOrderId)}` });
+  },
+  async refreshDimensions() {
+    if (this.data.dimensionRefreshing || !this.data.displayOrderId) return;
+    this.setData({ dimensionRefreshing:true });
+    wx.showLoading({ title:'正在获取',mask:true });
+    let updated=false;
+    let failure:unknown=null;
+    try {
+      await request<any>({
+        path:`/api/miniprogram/v1/orders/${encodeURIComponent(this.data.displayOrderId)}/dimensions/refresh`,
+        method:'POST',
+        timeout:60000
+      });
+      await this.loadOrder();
+      updated=true;
+    } catch (error) { failure=error; }
+    finally {
+      wx.hideLoading();
+      this.setData({ dimensionRefreshing:false });
+    }
+    if (failure) showError(failure);
+    else if (updated) wx.showToast({ title:'尺寸重量已更新',icon:'success' });
   }
 });

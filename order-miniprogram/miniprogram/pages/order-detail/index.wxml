@@ -39,11 +39,21 @@
       <button class="cost-button" bindtap="openCost">查看或修改订单成本</button>
     </view>
 
-    <view wx:if="{{order.dimensionsAvailable}}" class="card section">
-      <view class="section-title">长宽高与重量</view>
-      <view class="dimension-label">旧值（下单时申报）</view><view class="dimension-value">{{order.originalDimensionText}}</view>
-      <view class="dimension-label">新值（美客多当前计费值）</view><view class="dimension-value">{{order.latestDimensionText}}</view>
-      <view wx:if="{{order.dimensionsChanged}}" class="dimension-changed">美客多官方值已变化，是否产生额外运费以官方账单为准。</view>
+    <view class="card section">
+      <view class="dimension-heading">
+        <view class="section-title dimension-title">长宽高与重量</view>
+        <button class="dimension-refresh" size="mini" loading="{{dimensionRefreshing}}" disabled="{{dimensionRefreshing}}" bindtap="refreshDimensions">获取最新尺寸重量</button>
+      </view>
+      <block wx:if="{{order.dimensionsAvailable}}">
+        <view class="dimension-label">卖家自主填写的数值</view>
+        <view class="dimension-note">卖家在店铺后台自行填写并随订单上报</view>
+        <view class="dimension-value">{{order.sellerDimensionText}}<text wx:if="{{order.sellerWeightHint}}" class="weight-hint {{order.sellerWeightHintClass}}">{{order.sellerWeightHint}}</text></view>
+        <view class="dimension-label">美客多平台返回的值</view>
+        <view class="dimension-note">美客多完成称重、核验后反馈的单件尺寸重量</view>
+        <view class="dimension-value">{{order.platformDimensionText}}<text wx:if="{{order.weightAnomaly}}" class="weight-anomaly">重量异常</text></view>
+        <view class="dimension-rule">系统比较两组数据，并以数值较高的一组作为运费计费依据；最终费用以美客多官方账单为准。</view>
+      </block>
+      <view wx:else class="dimension-empty">尚未获取尺寸重量，点击右上角按钮查询美客多最新数据。</view>
     </view>
 
     <view class="card section">
