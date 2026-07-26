@@ -119,7 +119,8 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
   const miniProgramAppId=process.env.WECHAT_MINIPROGRAM_APPID || DEFAULT_MINIPROGRAM_APP_ID;
   const callbackPath='/api/wechat/official-account/events';
   let accessTokenCache={ token:'',expiresAt:0 },accessTokenPromise=null;
-  let scanTimer=null,workerTimer=null,followerSyncTimer=null,scanning=false,working=false,syncingFollowers=false,stopped=false;
+  let scanTimer=null,workerTimer=null,followerSyncTimer=null,templateSyncTimer=null;
+  let scanning=false,working=false,syncingFollowers=false,stopped=false;
   let templateSyncStatus={ synced:false,configured:0,missing:EVENT_TYPES.length,lastAt:null,error:'' };
 
   async function init() {
@@ -608,6 +609,7 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     if (!scanTimer) { scanTimer=setInterval(()=>enqueueNewAlerts().catch(error=>logger.error('[WeChatOfficial] alert scan failed:',error.message)),5000); scanTimer.unref?.(); }
     if (!workerTimer) { workerTimer=setInterval(triggerWorker,5000); workerTimer.unref?.(); }
     if (!followerSyncTimer) { followerSyncTimer=setInterval(()=>syncFollowers().catch(error=>logger.error('[WeChatOfficial] follower sync failed:',error.message)),6*60*60*1000); followerSyncTimer.unref?.(); }
+    if (!templateSyncTimer) { templateSyncTimer=setInterval(()=>syncTemplateConfigsFromOfficial().catch(error=>logger.error('[WeChatOfficial] template sync retry failed:',error.message)),5*60*1000); templateSyncTimer.unref?.(); }
     enqueueNewAlerts().catch(error=>logger.error('[WeChatOfficial] initial scan failed:',error.message));
     syncFollowers().catch(error=>logger.error('[WeChatOfficial] initial follower sync failed:',error.message));
     syncTemplateConfigsFromOfficial().catch(error=>logger.error('[WeChatOfficial] template sync failed:',error.message));
@@ -619,7 +621,8 @@ function createOfficialAccountService({ pool,requireAdmin,logger=console }) {
     if (scanTimer) clearInterval(scanTimer);
     if (workerTimer) clearInterval(workerTimer);
     if (followerSyncTimer) clearInterval(followerSyncTimer);
-    scanTimer=null;workerTimer=null;followerSyncTimer=null;
+    if (templateSyncTimer) clearInterval(templateSyncTimer);
+    scanTimer=null;workerTimer=null;followerSyncTimer=null;templateSyncTimer=null;
   }
 
   return { init,registerRoutes,start,stop,getPreferences,updatePreferences,getBindingStatus,getStatus,listTemplateConfigs,
