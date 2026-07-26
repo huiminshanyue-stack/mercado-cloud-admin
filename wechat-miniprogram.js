@@ -54,6 +54,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     getOrderClaimMessagesData,
     sendOrderClaimMessageData,
     translateOrderTextData,
+    translateOrderMessageData,
     getOrderRealtimeStateData,
     getOfficialNotificationPreferences,
     updateOfficialNotificationPreferences,
@@ -379,6 +380,11 @@ function registerMiniProgramRoutes(app, dependencies) {
   app.post('/api/miniprogram/v1/translate',requireBoundOrderUser,async (req,res) => {
     try { res.json({ code:0,data:await translateOrderTextData(req.body || {}) }); }
     catch (error) { const status=error.status || 502; res.status(status).json({ code:status,message:error.message || '翻译服务暂不可用' }); }
+  });
+
+  app.post('/api/miniprogram/v1/message-translations',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await translateOrderMessageData(req.authUser,req.body || {}) }); }
+    catch (error) { const status=error.status || 502; res.status(status).json({ code:status,message:error.message || '消息翻译服务暂不可用' }); }
   });
 }
 

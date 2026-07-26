@@ -378,6 +378,21 @@ async function initOrderManagementTables() {
     thread_id VARCHAR(120) NOT NULL, last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY(owner_username,thread_type,thread_id)
   )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS order_message_translations (
+    owner_username VARCHAR(120) NOT NULL,
+    thread_type VARCHAR(30) NOT NULL,
+    thread_id VARCHAR(160) NOT NULL,
+    message_key VARCHAR(240) NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,
+    source_language VARCHAR(20) NOT NULL,
+    target_language VARCHAR(20) NOT NULL,
+    source_text TEXT NOT NULL,
+    translated_text TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(owner_username,thread_type,thread_id,message_key,target_language)
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_order_message_translations_owner_updated ON order_message_translations(owner_username,updated_at DESC)');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_api_audits (
     id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120) NOT NULL,
     store_user_id VARCHAR(80), order_id VARCHAR(80), api_type VARCHAR(50) NOT NULL,
@@ -5334,9 +5349,72 @@ async function translateOrderTextData(body = {}) {
     return { text:translated,source,target };
 }
 
+const messageTranslationInflight = new Map();
+const messageTranslationWindows = new Map();
+
+function consumeMessageTranslationQuota(username) {
+  const now=Date.now(),windowMs=60000,limit=60;
+  const recent=(messageTranslationWindows.get(username) || []).filter(timestamp=>now-timestamp<windowMs);
+  if (recent.length>=limit) {
+    const error=new Error('单条消息翻译操作过于频繁，请稍后再试');
+    error.status=429;
+    throw error;
+  }
+  recent.push(now);
+  messageTranslationWindows.set(username,recent);
+}
+
+async function translateOrderMessageData(authUser,body = {}) {
+  const username=String(authUser?.username || '').trim();
+  const threadType=String(body?.threadType || '').trim().toLowerCase();
+  const threadId=String(body?.threadId || '').trim();
+  const messageKey=String(body?.messageKey || '').trim();
+  const sourceText=String(body?.text || '').trim();
+  const source=String(body?.source || 'auto').trim() || 'auto';
+  const target=String(body?.target || 'zh-CN').trim() || 'zh-CN';
+  if (!username) { const error=new Error('当前登录身份无效'); error.status=401; throw error; }
+  if (!['inquiry','claim'].includes(threadType)) { const error=new Error('消息线程类型无效'); error.status=400; throw error; }
+  if (!threadId || threadId.length>160) { const error=new Error('消息线程编号无效'); error.status=400; throw error; }
+  if (!messageKey || messageKey.length>240) { const error=new Error('消息编号无效'); error.status=400; throw error; }
+  if (!sourceText) { const error=new Error('该消息没有可翻译的文字内容'); error.status=400; throw error; }
+  if (sourceText.length>5000) { const error=new Error('单条消息翻译内容不能超过5000字'); error.status=400; throw error; }
+  if (source.length>20 || target.length>20) { const error=new Error('翻译语言参数无效'); error.status=400; throw error; }
+
+  const contentHash=crypto.createHash('sha256').update(sourceText,'utf8').digest('hex');
+  const cached=await pool.query(`SELECT translated_text AS text,source_language AS source,target_language AS target
+    FROM order_message_translations
+    WHERE owner_username=$1 AND thread_type=$2 AND thread_id=$3 AND message_key=$4
+      AND target_language=$5 AND content_hash=$6`,
+    [username,threadType,threadId,messageKey,target,contentHash]);
+  if (cached.rows[0]) return { ...cached.rows[0],cached:true };
+
+  const inflightKey=[username,threadType,threadId,messageKey,target,contentHash].join('\u0000');
+  if (messageTranslationInflight.has(inflightKey)) return messageTranslationInflight.get(inflightKey);
+  consumeMessageTranslationQuota(username);
+  const task=(async()=>{
+    const translated=await translateOrderTextData({ text:sourceText,source,target });
+    await pool.query(`INSERT INTO order_message_translations(
+        owner_username,thread_type,thread_id,message_key,content_hash,source_language,target_language,source_text,translated_text,updated_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+      ON CONFLICT(owner_username,thread_type,thread_id,message_key,target_language)
+      DO UPDATE SET content_hash=EXCLUDED.content_hash,source_language=EXCLUDED.source_language,
+        source_text=EXCLUDED.source_text,translated_text=EXCLUDED.translated_text,updated_at=NOW()`,
+      [username,threadType,threadId,messageKey,contentHash,source,target,sourceText,translated.text]);
+    return { ...translated,cached:false };
+  })();
+  messageTranslationInflight.set(inflightKey,task);
+  try { return await task; }
+  finally { messageTranslationInflight.delete(inflightKey); }
+}
+
 app.post('/api/admin/translate', requireOrderAccess, async (req, res) => {
   try { res.json({ code:0,data:await translateOrderTextData(req.body || {}) }); }
   catch (e) { const status=e.status || 502; res.status(status).json({ code:status,message:status===502 ? `翻译失败：${e.response?.data?.message || e.message}` : e.message }); }
+});
+
+app.post('/api/admin/message-translations', requireOrderAccess, async (req, res) => {
+  try { res.json({ code:0,data:await translateOrderMessageData(req.authUser,req.body || {}) }); }
+  catch (e) { const status=e.status || 502; res.status(status).json({ code:status,message:status===502 ? `消息翻译失败：${e.response?.data?.message || e.message}` : e.message }); }
 });
 
 app.get('/api/admin/order-alerts', requireOrderAccess, async (req, res) => {
@@ -6363,7 +6441,7 @@ async function start() {
   mercadoLibreWebhookService.registerRoutes(app);
   registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
-    getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,getOrderRealtimeStateData,
+    getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,translateOrderMessageData,getOrderRealtimeStateData,
     getOfficialNotificationPreferences:officialAccountService.getPreferences,
     updateOfficialNotificationPreferences:officialAccountService.updatePreferences,
     getOfficialAccountBindingStatus:officialAccountService.getBindingStatus,

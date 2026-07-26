@@ -37,7 +37,7 @@ async function runHandlers(handlers,req,res) {
 
 async function testRoutes() {
   process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
-  const routes=new Map(),listCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],followerSyncCalls=[],bindingNotifications=[];
+  const routes=new Map(),listCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -97,6 +97,10 @@ async function testRoutes() {
       return { id:'claim-message-1' };
     },
     translateOrderTextData:async body=>({ text:body.text }),
+    translateOrderMessageData:async (user,body)=>{
+      messageTranslationCalls.push({ user,body });
+      return { text:'中文译文',source:'auto',target:'zh-CN',cached:false };
+    },
     getOrderRealtimeStateData:async user=>({ version:3,lastTopic:'orders_v2',lastOrderId:'order-1',owner:user.username }),
     getOfficialNotificationPreferences:async()=>({ enabled:true,newOrder:true,cancelled:true,deadline:true,refund:true,buyerInquiry:true,afterSales:true }),
     updateOfficialNotificationPreferences:async (user,body)=>({ owner:user, ...body }),
@@ -188,6 +192,18 @@ async function testRoutes() {
   assert.equal(claimSendCalls[0].user.username,'CNTORO');
   assert.equal(claimSendCalls[0].claimId,'claim-1');
   assert.deepEqual(claimSendCalls[0].body,{ text:'Resolved',storeId:'store-1' });
+
+  const messageTranslationRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/message-translations'),{
+    headers:{ authorization:'Bearer cntoro-token' },body:{
+      threadType:'claim',threadId:'claim-1',messageKey:'message-9',text:'Hola',source:'auto',target:'zh-CN'
+    }
+  },messageTranslationRes);
+  assert.equal(messageTranslationRes.statusCode,200);
+  assert.equal(messageTranslationRes.body.data.text,'中文译文');
+  assert.equal(messageTranslationCalls.length,1);
+  assert.equal(messageTranslationCalls[0].user.username,'CNTORO');
+  assert.equal(messageTranslationCalls[0].body.messageKey,'message-9');
 }
 
 testRoutes().then(() => console.log('wechat miniprogram security and route tests passed'));

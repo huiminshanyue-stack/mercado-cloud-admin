@@ -3,7 +3,21 @@
   <scroll-view class="messages" scroll-y enhanced>
     <view wx:if="{{loading}}" class="empty">正在读取售后聊天…</view>
     <view wx:elif="{{!messages.length}}" class="empty">当前售后线程暂无可显示的文字消息</view>
-    <view wx:for="{{messages}}" wx:key="key" class="message-row {{item.side}}"><view class="bubble"><view class="content">{{item.content || '（非文字消息）'}}</view><view class="meta">{{item.roleText}} · {{item.timeText}}</view></view></view>
+    <view wx:for="{{messages}}" wx:key="key" class="message-row {{item.side}}">
+      <view class="bubble">
+        <view class="content">{{item.content || '（非文字消息）'}}</view>
+        <view class="meta">{{item.roleText}} · {{item.timeText}}</view>
+        <view wx:if="{{item.content}}" class="message-tools">
+          <view class="message-translate-button" data-index="{{index}}" bindtap="translateMessage">
+            {{item.translationLoading ? '翻译中…' : (item.translationText ? (item.translationVisible ? '收起翻译' : '查看翻译') : '翻译成中文')}}
+          </view>
+        </view>
+        <view wx:if="{{item.translationVisible && item.translationText}}" class="message-translation">
+          <view class="translation-label">中文翻译</view>
+          <view>{{item.translationText}}</view>
+        </view>
+      </view>
+    </view>
   </scroll-view>
   <view class="composer">
     <textarea class="textarea" maxlength="2000" value="{{chineseText}}" placeholder="第一步：输入中文售后回复" bindinput="onChinese" />

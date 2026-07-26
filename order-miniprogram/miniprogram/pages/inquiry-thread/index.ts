@@ -11,9 +11,31 @@ Page({
     this.setData({ loading:true });
     try {
       const raw=await request<any>({ path:`/api/miniprogram/v1/inquiries/${encodeURIComponent(this.data.orderId)}/messages`,timeout:60000 });
-      this.setData({ messages:messageList(raw).map(message=>({ ...message,side:isSellerMessage(message,this.data.storeId) ? 'seller' : 'buyer' })) });
+      const previous=new Map(this.data.messages.map((message:any)=>[String(message.key),message]));
+      this.setData({ messages:messageList(raw).map(message=>{
+        const saved:any=previous.get(String(message.key));
+        return { ...message,side:isSellerMessage(message,this.data.storeId) ? 'seller' : 'buyer',
+          translationText:saved?.translationText || '',translationVisible:Boolean(saved?.translationVisible),translationLoading:false };
+      }) });
     } catch (error) { showError(error); }
     finally { this.setData({ loading:false }); }
+  },
+  async translateMessage(event:WechatMiniprogram.TouchEvent) {
+    const index=Number(event.currentTarget.dataset.index);
+    const message=this.data.messages[index];
+    if (!message || !String(message.content || '').trim()) { wx.showToast({ title:'该消息没有可翻译的文字',icon:'none' }); return; }
+    if (message.translationText) {
+      this.setData({ [`messages[${index}].translationVisible`]:!message.translationVisible });
+      return;
+    }
+    this.setData({ [`messages[${index}].translationLoading`]:true });
+    try {
+      const data=await request<any>({ path:'/api/miniprogram/v1/message-translations',method:'POST',data:{
+        threadType:'inquiry',threadId:this.data.orderId,messageKey:String(message.key),text:message.content,source:'auto',target:'zh-CN'
+      },timeout:30000 });
+      this.setData({ [`messages[${index}].translationText`]:data.text || '',[`messages[${index}].translationVisible`]:true });
+    } catch (error) { showError(error); }
+    finally { this.setData({ [`messages[${index}].translationLoading`]:false }); }
   },
   onChinese(event:WechatMiniprogram.TextareaInput) { this.setData({ chineseText:event.detail.value }); },
   onEnglish(event:WechatMiniprogram.TextareaInput) { this.setData({ englishText:event.detail.value }); },
