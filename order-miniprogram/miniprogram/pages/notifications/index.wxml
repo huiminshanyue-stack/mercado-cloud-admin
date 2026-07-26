@@ -8,8 +8,11 @@
       <view class="binding-state">{{binding.bound > 0 ? '已绑定' : '待绑定'}}</view>
     </view>
     <view wx:if="{{binding.bound > 0}}" class="binding-message">当前微信已与 ERP 账号匹配，公众号可按下方设置接收提醒。</view>
-    <view wx:else class="binding-message">请先关注公众号“山月跨境”，再重新进入小程序。公众号和小程序需绑定在同一微信开放平台后，系统会通过 UnionID 自动匹配，不需要填写订单账号。</view>
-    <button class="refresh-button" size="mini" loading="{{loading}}" bindtap="loadSettings">刷新绑定状态</button>
+    <view wx:else class="binding-message">点击下方按钮可直接打开“山月跨境”。关注后返回本页，系统会识别当前微信，并只绑定到当前登录的 ERP 账号。</view>
+    <view class="binding-actions">
+      <button wx:if="{{binding.bound === 0}}" class="official-button" size="mini" bindtap="openOfficialAccount">打开山月跨境公众号</button>
+      <button class="refresh-button" size="mini" loading="{{detecting}}" disabled="{{detecting}}" bindtap="detectAndBind">{{binding.bound > 0 ? '重新检测绑定' : '我已关注，检测并绑定'}}</button>
+    </view>
   </view>
 
   <view class="section-title">提醒设置</view>

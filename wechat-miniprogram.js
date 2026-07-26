@@ -58,10 +58,21 @@ function registerMiniProgramRoutes(app, dependencies) {
     getOfficialNotificationPreferences,
     updateOfficialNotificationPreferences,
     getOfficialAccountBindingStatus,
-    enqueueOfficialNotification
+    enqueueOfficialNotification,
+    syncOfficialFollowers,
+    exchangeMiniProgramCode
   } = dependencies;
   const appId = process.env.WECHAT_MINIPROGRAM_APPID || DEFAULT_APP_ID;
   const appSecret = process.env.WECHAT_MINIPROGRAM_SECRET || '';
+
+  async function exchangeCode(code) {
+    if (typeof exchangeMiniProgramCode === 'function') return exchangeMiniProgramCode({ appId,appSecret,code });
+    const response = await axios.get('https://api.weixin.qq.com/sns/jscode2session', {
+      params: { appid: appId,secret: appSecret,js_code: code,grant_type: 'authorization_code' },
+      timeout: 15000
+    });
+    return response.data || {};
+  }
 
   async function loadMiniAuth(req) {
     const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
@@ -140,11 +151,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     if (!code || code.length > 200) return res.status(400).json({ code: 400, message: '微信登录凭证无效' });
     if (!appSecret) return res.status(503).json({ code: 503, message: '微信登录等待认证完成，请暂时使用ERP内测登录' });
     try {
-      const response = await axios.get('https://api.weixin.qq.com/sns/jscode2session', {
-        params: { appid: appId, secret: appSecret, js_code: code, grant_type: 'authorization_code' },
-        timeout: 15000
-      });
-      const data = response.data || {};
+      const data = await exchangeCode(code);
       if (data.errcode || !data.openid) {
         return res.status(401).json({ code: 401, message: data.errmsg || '微信身份验证失败' });
       }
@@ -221,6 +228,71 @@ function registerMiniProgramRoutes(app, dependencies) {
       ]);
       res.json({ code:0,data:{ preferences,binding } });
     } catch (error) { res.status(500).json({ code:500,message:error.message || '读取公众号提醒设置失败' }); }
+  });
+
+  // Bind the currently signed-in ERP test account to the real WeChat identity.
+  // This is deliberately separate from the order data path: it never changes
+  // order, billing or store ownership data.
+  app.post('/api/miniprogram/v1/official-account-binding/refresh',loginRateLimit,requireBoundOrderUser,async (req,res) => {
+    const code=String(req.body?.code || '').trim();
+    if (!code || code.length>200) return res.status(400).json({ code:400,message:'微信登录凭证无效，请重新检测' });
+    if (!appSecret) return res.status(503).json({ code:503,message:'服务器尚未配置小程序 AppSecret，暂时无法识别当前微信。请在 Railway 添加 WECHAT_MINIPROGRAM_SECRET 后重新部署。' });
+    try {
+      const data=await exchangeCode(code);
+      if (data.errcode || !data.openid) return res.status(401).json({ code:401,message:data.errmsg || '微信身份验证失败' });
+      const unionId=data.unionid ? String(data.unionid) : null;
+      const currentUsername=String(req.authUser.username);
+      const identity=await pool.query(`INSERT INTO wechat_miniprogram_identities(app_id,open_id,union_id,erp_username,updated_at)
+        VALUES($1,$2,$3,$4,NOW()) ON CONFLICT(app_id,open_id) DO UPDATE SET
+        union_id=COALESCE(EXCLUDED.union_id,wechat_miniprogram_identities.union_id),updated_at=NOW()
+        RETURNING id,union_id,erp_username`,[appId,String(data.openid),unionId,currentUsername]);
+      const identityRow=identity.rows[0];
+      if (identityRow?.erp_username && String(identityRow.erp_username).toLowerCase()!==currentUsername.toLowerCase()) {
+        return res.status(409).json({ code:409,message:`当前微信已绑定其他 ERP 账号（${identityRow.erp_username}），请先解除原绑定后再操作。` });
+      }
+      await pool.query(`UPDATE wechat_miniprogram_identities SET erp_username=$1,updated_at=NOW() WHERE id=$2`,
+        [currentUsername,identityRow.id]);
+
+      const resolvedUnionId=String(identityRow.union_id || unionId || '');
+      if (!resolvedUnionId) {
+        const binding=await getOfficialAccountBindingStatus(currentUsername);
+        return res.json({ code:0,data:{ status:'unionid_unavailable',binding,
+          message:'微信暂未返回 UnionID。请确认“山月助手”小程序与“山月跨境”服务号已绑定到同一微信开放平台账号，然后重新检测。' } });
+      }
+
+      let syncWarning='';
+      let matched=await pool.query(`UPDATE wechat_official_followers SET erp_username=$1,updated_at=NOW()
+        WHERE union_id=$2 AND subscribed=TRUE RETURNING open_id`,[currentUsername,resolvedUnionId]);
+      if (!matched.rows.length && typeof syncOfficialFollowers==='function') {
+        try { await syncOfficialFollowers(); }
+        catch (error) {
+          syncWarning='公众号关注名单同步暂时失败，请稍后重试';
+          console.error('[MiniProgram] official follower sync failed:',error.response?.data || error.message);
+        }
+        matched=await pool.query(`UPDATE wechat_official_followers SET erp_username=$1,updated_at=NOW()
+          WHERE union_id=$2 AND subscribed=TRUE RETURNING open_id`,[currentUsername,resolvedUnionId]);
+      }
+      const binding=await getOfficialAccountBindingStatus(currentUsername);
+      if (matched.rows.length>0 || Number(binding?.bound || 0)>0) {
+        if (typeof enqueueOfficialNotification==='function') {
+          try {
+            await enqueueOfficialNotification({ ownerUsername:currentUsername,eventType:'binding_success',
+              eventKey:`official-binding:${identityRow.id}:${currentUsername}`,
+              payload:{ title:'公众号绑定成功',username:req.authUser.nickname || currentUsername,
+                bindingAccount:currentUsername,productName:'山月ERP',remark:'公众号已与山月ERP账号匹配' } });
+          } catch (error) { console.error('[MiniProgram] official binding notification queue failed:',error.message); }
+        }
+        return res.json({ code:0,data:{ status:'bound',binding,message:'绑定成功，山月跨境公众号已与当前 ERP 账号匹配。' } });
+      }
+      const follower=await pool.query(`SELECT subscribed FROM wechat_official_followers WHERE union_id=$1 ORDER BY updated_at DESC LIMIT 1`,[resolvedUnionId]);
+      const message=follower.rows[0]?.subscribed===false
+        ? '已识别当前微信，但公众号关注状态为未关注。请重新关注“山月跨境”后再检测。'
+        : `${syncWarning ? `${syncWarning}；` : ''}尚未查询到当前微信对“山月跨境”的关注记录。请打开公众号主页确认已关注，再返回小程序检测。`;
+      res.json({ code:0,data:{ status:'not_following',binding,message } });
+    } catch (error) {
+      console.error('[MiniProgram] official binding refresh failed:',error.response?.data || error.message);
+      res.status(502).json({ code:502,message:'连接微信身份服务失败，请稍后重新检测' });
+    }
   });
 
   app.put('/api/miniprogram/v1/notification-preferences',requireBoundOrderUser,async (req,res) => {

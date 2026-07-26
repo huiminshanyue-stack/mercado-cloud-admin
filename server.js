@@ -6367,7 +6367,8 @@ async function start() {
     getOfficialNotificationPreferences:officialAccountService.getPreferences,
     updateOfficialNotificationPreferences:officialAccountService.updatePreferences,
     getOfficialAccountBindingStatus:officialAccountService.getBindingStatus,
-    enqueueOfficialNotification:officialAccountService.enqueueNotification });
+    enqueueOfficialNotification:officialAccountService.enqueueNotification,
+    syncOfficialFollowers:officialAccountService.syncFollowers });
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('============================================');

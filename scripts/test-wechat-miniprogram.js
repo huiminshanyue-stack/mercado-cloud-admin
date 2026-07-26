@@ -36,7 +36,8 @@ async function runHandlers(handlers,req,res) {
 }
 
 async function testRoutes() {
-  const routes=new Map(),listCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[];
+  process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
+  const routes=new Map(),listCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -50,6 +51,14 @@ async function testRoutes() {
         if (params[0]==='cntoro-token') return { rows:[{ username:'CNTORO',role:'user',validuntil:null }] };
         if (params[0]==='other-token') return { rows:[{ username:'OTHER',role:'user',validuntil:null }] };
         return { rows:[] };
+      }
+      if (sql.includes('INSERT INTO wechat_miniprogram_identities')) {
+        assert.equal(params[3],'CNTORO');
+        return { rows:[{ id:9,union_id:'union-cntoro',erp_username:'CNTORO' }] };
+      }
+      if (sql.includes('UPDATE wechat_official_followers') && sql.includes('RETURNING open_id')) {
+        assert.deepEqual(params,['CNTORO','union-cntoro']);
+        return { rows:[{ open_id:'official-open-id' }] };
       }
       if (sql.includes('COUNT(DISTINCT') && sql.includes('FROM ml_orders')) {
         assert.equal(params[0],'CNTORO');
@@ -91,7 +100,10 @@ async function testRoutes() {
     getOrderRealtimeStateData:async user=>({ version:3,lastTopic:'orders_v2',lastOrderId:'order-1',owner:user.username }),
     getOfficialNotificationPreferences:async()=>({ enabled:true,newOrder:true,cancelled:true,deadline:true,refund:true,buyerInquiry:true,afterSales:true }),
     updateOfficialNotificationPreferences:async (user,body)=>({ owner:user, ...body }),
-    getOfficialAccountBindingStatus:async()=>({ followers:1,subscribed:1,bound:1 })
+    getOfficialAccountBindingStatus:async()=>({ followers:1,subscribed:1,bound:1 }),
+    exchangeMiniProgramCode:async()=>({ openid:'mini-open-id',unionid:'union-cntoro' }),
+    syncOfficialFollowers:async()=>{ followerSyncCalls.push(true); return { skipped:false,followers:1,imported:1 }; },
+    enqueueOfficialNotification:async input=>{ bindingNotifications.push(input); return { queued:1 }; }
   });
 
   const configRes=responseRecorder();
@@ -149,6 +161,16 @@ async function testRoutes() {
   },preferenceRes);
   assert.equal(preferenceRes.body.data.preferences.newOrder,true);
   assert.equal(preferenceRes.body.data.binding.bound,1);
+
+  const bindingRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/official-account-binding/refresh'),{
+    headers:{ authorization:'Bearer cntoro-token' },body:{ code:'wx-login-code' }
+  },bindingRes);
+  assert.equal(bindingRes.statusCode,200);
+  assert.equal(bindingRes.body.data.status,'bound');
+  assert.equal(bindingRes.body.data.binding.bound,1);
+  assert.equal(followerSyncCalls.length,0);
+  assert.equal(bindingNotifications[0].eventType,'binding_success');
 
   const inquirySendRes=responseRecorder();
   await runHandlers(routes.get('POST /api/miniprogram/v1/inquiries/:orderId/messages'),{

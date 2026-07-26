@@ -7,7 +7,10 @@
 .binding-state { padding:9rpx 18rpx; color:#b56b00; background:#fff3dc; border-radius:24rpx; font-size:23rpx; }
 .bound .binding-state { color:#07834d; background:#dcf8eb; }
 .binding-message { margin-top:25rpx; color:#5f6d7b; font-size:25rpx; line-height:1.7; }
-.refresh-button { margin:24rpx 0 0; color:#1677ff; background:#eef5ff; }
+.binding-actions { display:flex; flex-wrap:wrap; gap:16rpx; margin-top:24rpx; }
+.binding-actions button { margin:0; }
+.official-button { color:#fff; background:#16a66a; }
+.refresh-button { color:#1677ff; background:#eef5ff; }
 .section-title { margin:35rpx 4rpx 18rpx; font-size:31rpx; font-weight:700; }
 .settings { overflow:hidden; padding:0 30rpx; }
 .setting-row { display:flex; min-height:116rpx; align-items:center; justify-content:space-between; gap:24rpx; border-bottom:1rpx solid #edf0f4; }
