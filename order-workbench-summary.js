@@ -1,6 +1,6 @@
 'use strict';
 
-const PERIODS = new Set(['today','week','month']);
+const PERIODS = new Set(['today','week','month','all']);
 
 function normalizeSummaryPeriod(value) {
   const period=String(value || '').trim().toLowerCase();

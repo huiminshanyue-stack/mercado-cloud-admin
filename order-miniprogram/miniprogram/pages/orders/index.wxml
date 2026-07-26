@@ -4,6 +4,20 @@
     <button class="logout" size="mini" bindtap="logout">退出</button>
   </view>
 
+  <view class="card account-total-card">
+    <view class="account-total-head"><view><text class="account-total-title">全部店铺总览</text><text class="account-total-subtitle">全部历史订单</text></view><text wx:if="{{allSummaryLoading}}" class="summary-loading">更新中</text></view>
+    <view class="total-profit-label">总利润</view>
+    <view class="total-profit-value"><text class="currency-symbol">¥</text>{{allTimeSummary.profitText}}</view>
+    <view class="account-total-divider"></view>
+    <view class="account-total-metrics">
+      <view><text class="account-metric-label">销售额</text><text class="account-metric-value">{{allTimeSummary.salesText}}</text></view>
+      <view><text class="account-metric-label">订单量</text><text class="account-metric-value">{{allTimeSummary.orderCount}}</text></view>
+      <view><text class="account-metric-label">利润率</text><text class="account-metric-value rate-value">{{allTimeSummary.profitRateText}}</text></view>
+    </view>
+    <view class="account-total-basis">人民币口径：官方应回款 USD × 汇率 {{allTimeSummary.exchangeRateText}}</view>
+    <view wx:if="{{allTimeSummary.pendingPayoutCount > 0}}" class="summary-pending">{{allTimeSummary.pendingPayoutCount}} 单官方回款待获取，暂未计入销售额、利润和利润率</view>
+  </view>
+
   <view class="recent-section">
     <view class="recent-title-row"><text class="recent-title">最近订单</text><text wx:if="{{summaryLoading}}" class="summary-loading">更新中</text></view>
     <view class="period-tabs">

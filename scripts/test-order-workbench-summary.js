@@ -4,6 +4,7 @@ const assert=require('node:assert/strict');
 const { normalizeSummaryPeriod,buildOrderWorkbenchSummary }=require('../order-workbench-summary');
 
 assert.equal(normalizeSummaryPeriod('week'),'week');
+assert.equal(normalizeSummaryPeriod('all'),'all');
 assert.equal(normalizeSummaryPeriod('invalid'),'today');
 
 const summary=buildOrderWorkbenchSummary([

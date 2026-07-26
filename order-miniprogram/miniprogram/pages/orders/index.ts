@@ -13,6 +13,17 @@ const periodTabs = [
   { name:'今日订单',value:'today' },{ name:'本周订单',value:'week' },{ name:'本月订单',value:'month' }
 ];
 
+function formatWorkbenchSummary(result:any) {
+  return {
+    orderCount:Number(result.orderCount || 0),
+    salesText:Number(result.salesCny || 0).toFixed(2),
+    profitText:Number(result.profitCny || 0).toFixed(2),
+    profitRateText:result.profitRate===null || result.profitRate===undefined ? '--' : `${Number(result.profitRate).toFixed(1)}%`,
+    pendingPayoutCount:Number(result.pendingPayoutCount || 0),
+    exchangeRateText:Number(result.exchangeRate || 0).toFixed(4)
+  };
+}
+
 function normalize(order:any) {
   const products = (Array.isArray(order.items) ? order.items : []).map((product:any,index:number) => {
     const item = product.item || {};
@@ -47,8 +58,9 @@ Page({
     loading:false,page:1,size:20,total:0,hasMore:true,orders:[] as any[],stores:[] as any[],
     storeNames:['全部店铺'],storeIndex:0,statusNames:statusOptions.map(i=>i.name),statusIndex:0,
     orderId:'',userName:'内测账号',loadedOnce:false,
-    periodTabs,summaryPeriod:'today',summaryLoading:false,
-    workbenchSummary:{ orderCount:0,salesText:'--',profitText:'--',profitRateText:'--',pendingPayoutCount:0,exchangeRateText:'--' }
+    periodTabs,summaryPeriod:'today',summaryLoading:false,allSummaryLoading:false,
+    workbenchSummary:{ orderCount:0,salesText:'--',profitText:'--',profitRateText:'--',pendingPayoutCount:0,exchangeRateText:'--' },
+    allTimeSummary:{ orderCount:0,salesText:'--',profitText:'--',profitRateText:'--',pendingPayoutCount:0,exchangeRateText:'--' }
   },
   async onLoad() {
     const app = getApp<IAppOption>();
@@ -58,18 +70,18 @@ Page({
     }
     this.setData({ userName:app.globalData.user?.nickname || app.globalData.user?.username || '内测账号' });
     await this.loadStores();
-    await Promise.all([this.loadOrders(true),this.loadSummary()]);
+    await Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]);
     this.setData({ loadedOnce:true });
   },
   onShow() {
-    if (this.data.loadedOnce) Promise.all([this.loadOrders(true),this.loadSummary()]);
+    if (this.data.loadedOnce) Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]);
     realtimeWatcher.start(state=>{
-      if (state.lastTopic === 'orders_v2' || state.lastTopic === 'shipments') Promise.all([this.loadOrders(true),this.loadSummary()]);
+      if (state.lastTopic === 'orders_v2' || state.lastTopic === 'shipments') Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]);
     });
   },
   onHide() { realtimeWatcher.stop(); },
   onUnload() { realtimeWatcher.stop(); },
-  async onPullDownRefresh() { await Promise.all([this.loadOrders(true),this.loadSummary()]); wx.stopPullDownRefresh(); },
+  async onPullDownRefresh() { await Promise.all([this.loadOrders(true),this.loadSummary(),this.loadAllTimeSummary()]); wx.stopPullDownRefresh(); },
   async onReachBottom() { if (this.data.hasMore && !this.data.loading) await this.loadOrders(false); },
   onOrderId(event:WechatMiniprogram.Input) { this.setData({ orderId:event.detail.value.trim() }); },
   async onStoreChange(event:WechatMiniprogram.PickerChange) { this.setData({ storeIndex:Number(event.detail.value) }); await Promise.all([this.loadOrders(true),this.loadSummary()]); },
@@ -117,18 +129,22 @@ Page({
       const store=this.data.storeIndex>0 ? this.data.stores[this.data.storeIndex-1] : null;
       const query=[`period=${encodeURIComponent(this.data.summaryPeriod)}`,store ? `storeId=${encodeURIComponent(store.id)}` : ''].filter(Boolean).join('&');
       const result=await request<any>({ path:`/api/miniprogram/v1/order-workbench-summary?${query}` });
-      const profitRate=result.profitRate===null || result.profitRate===undefined ? '--' : `${Number(result.profitRate).toFixed(1)}%`;
       if ((this as any)._summaryRequestId!==requestId) return;
-      this.setData({ workbenchSummary:{
-        orderCount:Number(result.orderCount || 0),
-        salesText:Number(result.salesCny || 0).toFixed(2),
-        profitText:Number(result.profitCny || 0).toFixed(2),
-        profitRateText:profitRate,
-        pendingPayoutCount:Number(result.pendingPayoutCount || 0),
-        exchangeRateText:Number(result.exchangeRate || 0).toFixed(4)
-      } });
+      this.setData({ workbenchSummary:formatWorkbenchSummary(result) });
     } catch (error) { if ((this as any)._summaryRequestId===requestId) showError(error); }
     finally { if ((this as any)._summaryRequestId===requestId) this.setData({ summaryLoading:false }); }
+  },
+  async loadAllTimeSummary() {
+    const requestId=Number((this as any)._allSummaryRequestId || 0)+1;
+    (this as any)._allSummaryRequestId=requestId;
+    this.setData({ allSummaryLoading:true });
+    try {
+      // Intentionally omit storeId: this card is the account-wide total for all authorized stores.
+      const result=await request<any>({ path:'/api/miniprogram/v1/order-workbench-summary?period=all' });
+      if ((this as any)._allSummaryRequestId!==requestId) return;
+      this.setData({ allTimeSummary:formatWorkbenchSummary(result) });
+    } catch (error) { if ((this as any)._allSummaryRequestId===requestId) showError(error); }
+    finally { if ((this as any)._allSummaryRequestId===requestId) this.setData({ allSummaryLoading:false }); }
   },
   openOrder(event:WechatMiniprogram.TouchEvent) {
     wx.navigateTo({ url:`/pages/order-detail/index?id=${encodeURIComponent(event.currentTarget.dataset.id)}` });

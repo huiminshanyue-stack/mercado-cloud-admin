@@ -3,6 +3,22 @@
 .title { font-size:42rpx; font-weight:750; }
 .subtitle { margin-top:8rpx; color:#8492a1; font-size:24rpx; }
 .logout { margin:0; color:#647386; background:#fff; border-radius:12rpx; }
+.account-total-card { box-sizing:border-box; margin-bottom:28rpx; padding:28rpx; }
+.account-total-head { display:flex; align-items:flex-start; justify-content:space-between; }
+.account-total-title,.account-total-subtitle { display:block; }
+.account-total-title { color:#1f2d3d; font-size:29rpx; font-weight:700; }
+.account-total-subtitle { margin-top:6rpx; color:#929eaa; font-size:20rpx; }
+.total-profit-label { margin-top:26rpx; color:#536170; font-size:23rpx; font-weight:600; }
+.total-profit-value { margin-top:5rpx; color:#08749d; font-size:52rpx; font-weight:760; letter-spacing:-1rpx; }
+.currency-symbol { margin-right:8rpx; font-size:28rpx; font-weight:650; }
+.account-total-divider { height:1rpx; margin:23rpx 0 20rpx; background:#edf0f3; }
+.account-total-metrics { display:flex; }
+.account-total-metrics > view { flex:1; }
+.account-metric-label,.account-metric-value { display:block; }
+.account-metric-label { color:#5d6975; font-size:22rpx; font-weight:600; }
+.account-metric-value { margin-top:8rpx; color:#1f2d3d; font-size:30rpx; font-weight:720; }
+.rate-value { color:#e7872b; }
+.account-total-basis { margin-top:20rpx; color:#8a96a2; font-size:20rpx; }
 .recent-section { margin-bottom:22rpx; }
 .recent-title-row { display:flex; align-items:center; justify-content:space-between; margin:0 4rpx 16rpx; }
 .recent-title { color:#1f2d3d; font-size:31rpx; font-weight:700; }

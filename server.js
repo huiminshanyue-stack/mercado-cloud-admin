@@ -3036,7 +3036,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-27.52',
+    version: '2026-07-27.53',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3118,6 +3118,7 @@ app.get('/api/health/order-management', (req, res) => {
     wechatErpTestLogin: true,
     miniProgramHomeDashboard: true,
     miniProgramOrderWorkbenchSummary: true,
+    miniProgramAllStoreLifetimeProfitSummary: true,
     miniProgramSalesUsesOfficialPayoutCny: true,
     miniProgramPendingDispatchDeadline: true,
     miniProgramOrderCostWrite: true,
@@ -3785,7 +3786,7 @@ async function getMiniOrderWorkbenchSummaryData(authUser,query = {}) {
   const shanghaiDate=`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date`;
   if (period==='today') where.push(`${shanghaiDate}=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date`);
   else if (period==='week') where.push(`${shanghaiDate}>=date_trunc('week',CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date`);
-  else where.push(`${shanghaiDate}>=date_trunc('month',CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date`);
+  else if (period==='month') where.push(`${shanghaiDate}>=date_trunc('month',CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date`);
 
   const { rows }=await pool.query(`SELECT o.ml_order_id AS "orderId",o.pack_id AS "packId",
     o.net_amount_usd AS "netAmountUsd",o.gross_amount_usd AS "grossAmountUsd",
