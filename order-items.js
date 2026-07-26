@@ -44,14 +44,34 @@ function isColorAttribute(attribute) {
   return COLOR_ATTRIBUTE_PATTERN.test(id) || /(^|\s)(color|colour|cor)(\s|$)|颜色/i.test(name);
 }
 
-function findVariation(detail, variationId) {
-  if (!detail || !variationId || !Array.isArray(detail.variations)) return null;
-  return detail.variations.find(variation => String(variation?.id || '') === String(variationId)) || null;
+function normalizedSku(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function variationSellerSku(variation) {
+  return variation?.seller_custom_field
+    || variation?.seller_sku
+    || variation?.sellerSku
+    || variation?.sku
+    || '';
+}
+
+function findVariation(detail, variationId, sellerSku) {
+  if (!detail || !Array.isArray(detail.variations)) return null;
+  if (variationId !== undefined && variationId !== null && String(variationId).trim()) {
+    const byId = detail.variations.find(variation => String(variation?.id || '') === String(variationId));
+    if (byId) return byId;
+  }
+  const wantedSku = normalizedSku(sellerSku);
+  if (!wantedSku) return null;
+  return detail.variations.find(variation => normalizedSku(variationSellerSku(variation)) === wantedSku) || null;
 }
 
 function colorAttributes(entry, detail) {
   const item = entry?.item || {};
-  const variation = findVariation(detail, item.variation_id ?? entry?.variation_id);
+  const sellerSku = item.seller_sku || item.sellerSku || item.seller_custom_field
+    || entry?.seller_sku || entry?.seller_custom_field || '';
+  const variation = findVariation(detail, item.variation_id ?? entry?.variation_id, sellerSku);
   return [
     item.variation_attributes,
     entry?.variation_attributes,

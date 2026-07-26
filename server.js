@@ -3035,7 +3035,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.49',
+    version: '2026-07-27.50',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3069,6 +3069,8 @@ app.get('/api/health/order-management', (req, res) => {
     platformWeightAnomalyWarning: true,
     miniProgramDimensionRefresh: true,
     dimensionMissingValueLabels: true,
+    dimensionRefreshImmediateFeedback: true,
+    dimensionRefreshUpdatesColors: true,
     compactDimensionCard: true,
     statisticsIndependentFilters: true,
     statisticsNaturalDateRange: true,
@@ -3807,23 +3809,34 @@ async function refreshOrderDimensionsData(authUser, requestedOrderId) {
       try { items.push(await fetchOfficialItemDetail(context.token,itemId,true)); }
       catch (error) { failures.push({ type: 'item', id: itemId, status: error.response?.status || 0, message: error.response?.data?.message || error.message }); }
     }
+    const detailsByItemId = new Map(items.map(item => [String(item?.id || ''),item]));
+    for (const row of rows) {
+      row.items = normalizeOrderItems(row.items,detailsByItemId);
+    }
     const snapshot = buildOrderDimensionSnapshot(shipments,items);
     await saveOrderApiAudit(authUser.username,context.sellerId,String(rows[0].ml_order_id),'dimensions',`dimensions:${orderId}`,{ shipments,items,failures,snapshot });
     if (!snapshot.available) {
+      await Promise.all(rows.map(row => pool.query(
+        `UPDATE ml_orders SET items=$1::jsonb,updated_at=NOW() WHERE owner_username=$2 AND ml_order_id=$3`,
+        [JSON.stringify(row.items),authUser.username,String(row.ml_order_id)]
+      )));
       const officialReason = failures.map(item => `${item.type} ${item.id}：${item.message}`).join('；');
       const error = new Error(officialReason || '美客多官方接口当前未返回该订单的长宽高和重量');
       error.status = 422;
+      error.orderData = { items: rows.flatMap(row => Array.isArray(row.items) ? row.items : []) };
       throw error;
     }
     const existingOriginal = rows.find(row => row.dimensionsOriginal?.available)?.dimensionsOriginal || null;
     const original = existingOriginal || snapshot;
     const changed = dimensionSnapshotsDiffer(original,snapshot);
-    await pool.query(`UPDATE ml_orders SET
-      shipping_dimensions_original=CASE WHEN COALESCE(shipping_dimensions_original,'{}'::jsonb)='{}'::jsonb THEN $1::jsonb ELSE shipping_dimensions_original END,
-      shipping_dimensions_latest=$2::jsonb,shipping_dimensions_updated_at=NOW(),updated_at=NOW()
-      WHERE owner_username=$3 AND (ml_order_id=$4 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$4)`,
-      [JSON.stringify(original),JSON.stringify(snapshot),authUser.username,orderId]);
+    await Promise.all(rows.map(row => pool.query(`UPDATE ml_orders SET
+      items=$1::jsonb,
+      shipping_dimensions_original=CASE WHEN COALESCE(shipping_dimensions_original,'{}'::jsonb)='{}'::jsonb THEN $2::jsonb ELSE shipping_dimensions_original END,
+      shipping_dimensions_latest=$3::jsonb,shipping_dimensions_updated_at=NOW(),updated_at=NOW()
+      WHERE owner_username=$4 AND ml_order_id=$5`,
+      [JSON.stringify(row.items),JSON.stringify(original),JSON.stringify(snapshot),authUser.username,String(row.ml_order_id)])));
     return {
+      items: rows.flatMap(row => Array.isArray(row.items) ? row.items : []),
       dimensionsOriginal: original,
       dimensionsLatest: snapshot,
       dimensionsUpdatedAt: snapshot.fetchedAt,
@@ -3841,7 +3854,7 @@ app.post('/api/admin/orders/:orderId/dimensions/refresh', requireOrderAccess, as
   } catch (error) {
     console.error('[Orders] 获取官方尺寸重量失败:', error.response?.data || error.message);
     const status = error.status || error.response?.status || 500;
-    res.status(status).json({ code: status, message: error.response?.data?.message || error.message || '获取尺寸重量失败' });
+    res.status(status).json({ code: status, message: error.response?.data?.message || error.message || '获取尺寸重量失败', data: error.orderData || undefined });
   }
 });
 

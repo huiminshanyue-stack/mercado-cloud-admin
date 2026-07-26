@@ -40,4 +40,16 @@ const historicalSkuFallback = normalizeOrderItems([
 assert.deepStrictEqual(historicalSkuFallback.map(item => item.item.colorNameZh), ['黑色','粉色','']);
 assert.strictEqual(fallback[0].quantity, 2);
 
+const variationMatchedBySku = normalizeOrderItems([
+  { quantity:1,item:{ id:'MLC2',seller_sku:'CBT-GOGGLES-GOLD' } }
+], new Map([['MLC2',{
+  variations:[{
+    id:991,
+    seller_custom_field:'CBT-GOGGLES-GOLD',
+    attribute_combinations:[{ id:'COLOR',value_name:'Dorado' }]
+  }]
+}]]));
+assert.strictEqual(variationMatchedBySku[0].item.colorOriginal, 'Dorado');
+assert.ok(variationMatchedBySku[0].item.colorNameZh, 'official variation color must be resolved by seller SKU');
+
 console.log('order item normalization tests passed');
