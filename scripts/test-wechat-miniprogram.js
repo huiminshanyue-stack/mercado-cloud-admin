@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { DEFAULT_APP_ID,tokenHash,canTestOrders,registerMiniProgramRoutes } = require('../wechat-miniprogram');
+const { DEFAULT_APP_ID,tokenHash,canTestOrders,describeWechatLoginError,registerMiniProgramRoutes } = require('../wechat-miniprogram');
 
 assert.equal(DEFAULT_APP_ID,'wx0f97428df87ee76e');
 assert.equal(tokenHash('山月助手').length,64);
@@ -10,6 +10,8 @@ assert.notEqual(tokenHash('token-a'),tokenHash('token-b'));
 assert.equal(canTestOrders({ role:'admin',username:'ADMIN' }),true);
 assert.equal(canTestOrders({ role:'user',username:'cntoro' }),true);
 assert.equal(canTestOrders({ role:'user',username:'other' }),false);
+assert.match(describeWechatLoginError({ errcode:40164,errmsg:'invalid ip 152.55.177.79' }),/API IP 白名单/);
+assert.equal(describeWechatLoginError({ errcode:40029,errmsg:'invalid code' }),'微信登录凭证已失效，请重新点击微信登录');
 
 function responseRecorder() {
   return {

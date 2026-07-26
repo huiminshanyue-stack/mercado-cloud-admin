@@ -7,7 +7,7 @@
 
   <view class="card login-card">
     <view class="section-title">{{wechatEnabled ? '微信安全登录' : 'ERP 内测登录'}}</view>
-    <view wx:if="{{wechatEnabled}}" class="hint">使用微信身份登录，首次使用需要绑定现有山月ERP账号。</view>
+    <view wx:if="{{wechatEnabled}}" class="hint">首次使用需用ERP账号密码完成一次绑定；以后会按当前微信身份安全恢复对应ERP账号，无需重复输入密码。</view>
     <button wx:if="{{wechatEnabled}}" class="primary-button action" loading="{{loading}}" bindtap="loginWithWechat">微信登录</button>
 
     <block wx:else>

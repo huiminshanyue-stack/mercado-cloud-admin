@@ -42,5 +42,9 @@ export function request<T>(options: RequestOptions): Promise<T> {
 
 export function showError(error: unknown): void {
   const message = error instanceof Error ? error.message : '操作失败，请稍后重试';
-  wx.showToast({ title: message.slice(0,20),icon:'none',duration:2800 });
+  if (message.length > 18) {
+    wx.showModal({ title:'操作未完成',content:message,showCancel:false,confirmText:'我知道了' });
+    return;
+  }
+  wx.showToast({ title:message,icon:'none',duration:2800 });
 }

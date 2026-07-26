@@ -12,6 +12,17 @@ function tokenHash(token) {
   return crypto.createHash('sha256').update(String(token || '')).digest('hex');
 }
 
+function describeWechatLoginError(data = {}) {
+  const errcode = Number(data.errcode || 0);
+  const errmsg = String(data.errmsg || '').trim();
+  if (errcode === 40164 || /invalid\s+ip/i.test(errmsg)) {
+    return '微信登录失败：Railway 当前出口 IP 不在小程序 API 白名单。测试环境请关闭小程序 AppSecret 下方的 API IP 白名单保护；正式环境请先配置固定出口 IP。';
+  }
+  if (errcode === 40029 || /invalid\s+code/i.test(errmsg)) return '微信登录凭证已失效，请重新点击微信登录';
+  if (errcode === 45011) return '微信登录请求过于频繁，请稍后再试';
+  return errmsg || '微信身份验证失败';
+}
+
 function canTestOrders(user) {
   return user?.role === 'admin' || ORDER_TEST_USERNAMES.has(String(user?.username || '').toUpperCase());
 }
@@ -154,7 +165,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     try {
       const data = await exchangeCode(code);
       if (data.errcode || !data.openid) {
-        return res.status(401).json({ code: 401, message: data.errmsg || '微信身份验证失败' });
+        return res.status(401).json({ code: 401, message: describeWechatLoginError(data) });
       }
       const identity = await pool.query(`INSERT INTO wechat_miniprogram_identities(app_id,open_id,union_id,updated_at)
         VALUES($1,$2,$3,NOW()) ON CONFLICT(app_id,open_id) DO UPDATE SET
@@ -240,7 +251,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     if (!appSecret) return res.status(503).json({ code:503,message:'服务器尚未配置小程序 AppSecret，暂时无法识别当前微信。请在 Railway 添加 WECHAT_MINIPROGRAM_SECRET 后重新部署。' });
     try {
       const data=await exchangeCode(code);
-      if (data.errcode || !data.openid) return res.status(401).json({ code:401,message:data.errmsg || '微信身份验证失败' });
+      if (data.errcode || !data.openid) return res.status(401).json({ code:401,message:describeWechatLoginError(data) });
       const unionId=data.unionid ? String(data.unionid) : null;
       const currentUsername=String(req.authUser.username);
       const identity=await pool.query(`INSERT INTO wechat_miniprogram_identities(app_id,open_id,union_id,erp_username,updated_at)
@@ -391,6 +402,7 @@ function registerMiniProgramRoutes(app, dependencies) {
 module.exports = {
   DEFAULT_APP_ID,
   tokenHash,
+  describeWechatLoginError,
   canTestOrders,
   initMiniProgramTables,
   registerMiniProgramRoutes
