@@ -14,8 +14,6 @@
       <view><text class="account-metric-label">订单量</text><text class="account-metric-value">{{allTimeSummary.orderCount}}</text></view>
       <view><text class="account-metric-label">利润率</text><text class="account-metric-value rate-value">{{allTimeSummary.profitRateText}}</text></view>
     </view>
-    <view class="account-total-basis">人民币口径：官方应回款 USD × 汇率 {{allTimeSummary.exchangeRateText}}</view>
-    <view wx:if="{{allTimeSummary.pendingPayoutCount > 0}}" class="summary-pending">{{allTimeSummary.pendingPayoutCount}} 单官方回款待获取，暂未计入销售额、利润和利润率</view>
   </view>
 
   <view class="recent-section">
@@ -24,13 +22,11 @@
       <view wx:for="{{periodTabs}}" wx:for-item="period" wx:key="value" class="period-tab {{summaryPeriod === period.value ? 'active' : ''}}" data-period="{{period.value}}" bindtap="onPeriodChange">{{period.name}}</view>
     </view>
     <view class="stats-card">
-      <view class="stat-item"><text class="stat-label">订单数</text><text class="stat-value">{{workbenchSummary.orderCount}}</text><text class="stat-unit">单</text></view>
-      <view class="stat-item"><text class="stat-label">利润</text><text class="stat-value profit-value">{{workbenchSummary.profitText}}</text><text class="stat-unit">CNY</text></view>
-      <view class="stat-item"><text class="stat-label">销售额</text><text class="stat-value sales-value">{{workbenchSummary.salesText}}</text><text class="stat-unit">CNY</text></view>
-      <view class="stat-item"><text class="stat-label">利润率</text><text class="stat-value">{{workbenchSummary.profitRateText}}</text><text class="stat-unit">回款口径</text></view>
+      <view class="stat-item"><text class="stat-label">订单数</text><text class="stat-value">{{workbenchSummary.orderCount}}</text></view>
+      <view class="stat-item"><text class="stat-label">利润</text><text class="stat-value profit-value">{{workbenchSummary.profitText}}</text></view>
+      <view class="stat-item"><text class="stat-label">销售额</text><text class="stat-value sales-value">{{workbenchSummary.salesText}}</text></view>
+      <view class="stat-item"><text class="stat-label">利润率</text><text class="stat-value">{{workbenchSummary.profitRateText}}</text></view>
     </view>
-    <view class="summary-basis">销售额 = 官方应回款 USD × 汇率 {{workbenchSummary.exchangeRateText}}</view>
-    <view wx:if="{{workbenchSummary.pendingPayoutCount > 0}}" class="summary-pending">{{workbenchSummary.pendingPayoutCount}} 单官方回款待获取，暂未计入金额与利润率</view>
   </view>
 
   <view class="card filters">

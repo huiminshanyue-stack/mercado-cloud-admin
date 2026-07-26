@@ -18,7 +18,6 @@
 .account-metric-label { color:#5d6975; font-size:22rpx; font-weight:600; }
 .account-metric-value { margin-top:8rpx; color:#1f2d3d; font-size:30rpx; font-weight:720; }
 .rate-value { color:#e7872b; }
-.account-total-basis { margin-top:20rpx; color:#8a96a2; font-size:20rpx; }
 .recent-section { margin-bottom:22rpx; }
 .recent-title-row { display:flex; align-items:center; justify-content:space-between; margin:0 4rpx 16rpx; }
 .recent-title { color:#1f2d3d; font-size:31rpx; font-weight:700; }
@@ -29,13 +28,10 @@
 .stats-card { display:flex; margin-top:16rpx; padding:22rpx 6rpx; background:#fff3f1; border:1rpx solid #ffe5e0; border-radius:18rpx; }
 .stat-item { position:relative; min-width:0; flex:1; text-align:center; }
 .stat-item + .stat-item::before { position:absolute; top:10rpx; bottom:10rpx; left:0; width:1rpx; background:#f0dcd8; content:''; }
-.stat-label,.stat-value,.stat-unit { display:block; }
+.stat-label,.stat-value { display:block; }
 .stat-label { color:#596674; font-size:22rpx; }
 .stat-value { margin-top:8rpx; overflow:hidden; color:#1f2d3d; font-size:29rpx; font-weight:750; text-overflow:ellipsis; white-space:nowrap; }
-.stat-unit { margin-top:3rpx; color:#9a7f7a; font-size:18rpx; }
 .profit-value { color:#159866; }.sales-value { color:#d66d49; }
-.summary-basis { margin:12rpx 6rpx 0; color:#7b8896; font-size:21rpx; }
-.summary-pending { margin:7rpx 6rpx 0; color:#dc7a22; font-size:21rpx; }
 .filters { padding:22rpx; }
 .search { height:80rpx; padding:0 24rpx; background:#f5f7fa; border-radius:13rpx; font-size:28rpx; }
 .filter-row { display:flex; gap:18rpx; margin-top:18rpx; }
