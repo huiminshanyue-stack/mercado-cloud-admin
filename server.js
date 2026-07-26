@@ -3035,7 +3035,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-27.50',
+    version: '2026-07-27.51',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3071,6 +3071,7 @@ app.get('/api/health/order-management', (req, res) => {
     dimensionMissingValueLabels: true,
     dimensionRefreshImmediateFeedback: true,
     dimensionRefreshUpdatesColors: true,
+    dimensionSnapshotScopeRegressionFixed: true,
     compactDimensionCard: true,
     statisticsIndependentFilters: true,
     statisticsNaturalDateRange: true,
@@ -3209,8 +3210,6 @@ function itemDimensions(item) {
   const height = attributeValue('PACKAGE_HEIGHT','HEIGHT');
   const weight = attributeValue('PACKAGE_WEIGHT','WEIGHT');
   if ([length,width,height,weight].every(entry => entry.value === null)) return null;
-  const currentListing = itemRecords.find(item => item.listingDimensions)?.listingDimensions || null;
-  const billableWeight = itemRecords.find(item => item.billableWeight)?.billableWeight || null;
   return {
     length: length.value,
     width: width.value,
@@ -3261,6 +3260,8 @@ function buildOrderDimensionSnapshot(shipments, items) {
       source: fromItem ? 'item.attributes' : 'shipment.shipping_items.dimensions'
     } : null;
   }).filter(Boolean);
+  const currentListing = itemRecords.find(item => item.listingDimensions)?.listingDimensions || null;
+  const billableWeight = itemRecords.find(item => item.billableWeight)?.billableWeight || null;
   return {
     source: 'mercado_libre_official',
     fetchedAt: new Date().toISOString(),

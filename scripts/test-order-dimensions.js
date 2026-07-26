@@ -1,6 +1,8 @@
 'use strict';
 
 const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const path=require('node:path');
 const { snapshotDeclaredValue,snapshotVerifiedValue,snapshotListingValue,
   snapshotBillableWeight,dimensionSnapshotsDiffer }=require('../order-dimensions');
 
@@ -21,5 +23,14 @@ assert.equal(dimensionSnapshotsDiffer(original,{ package:{ dimensions:{ ...decla
   '长宽高顺序变化但三边与重量相同，不应误判为平台修改');
 assert.equal(dimensionSnapshotsDiffer(original,{ items:[{ listingDimensions:listing }] }),false,
   '商品当前刊登值不能冒充订单包裹核验值');
+
+const serverSource=fs.readFileSync(path.join(__dirname,'..','server.js'),'utf8');
+const itemDimensionsSource=serverSource.match(/function itemDimensions\(item\) \{[\s\S]*?\n\}/)?.[0] || '';
+const snapshotSource=serverSource.match(/function buildOrderDimensionSnapshot\(shipments, items\) \{[\s\S]*?\n\}/)?.[0] || '';
+assert.ok(!itemDimensionsSource.includes('itemRecords'),
+  'itemDimensions must not access the order-level itemRecords collection');
+assert.ok(snapshotSource.includes('const currentListing = itemRecords.find') &&
+  snapshotSource.includes('const billableWeight = itemRecords.find'),
+  'order dimension snapshot must derive current listing and billable weight after itemRecords is built');
 
 console.log('order dimension source and comparison tests passed');
