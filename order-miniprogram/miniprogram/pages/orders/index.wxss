@@ -3,6 +3,23 @@
 .title { font-size:42rpx; font-weight:750; }
 .subtitle { margin-top:8rpx; color:#8492a1; font-size:24rpx; }
 .logout { margin:0; color:#647386; background:#fff; border-radius:12rpx; }
+.recent-section { margin-bottom:22rpx; }
+.recent-title-row { display:flex; align-items:center; justify-content:space-between; margin:0 4rpx 16rpx; }
+.recent-title { color:#1f2d3d; font-size:31rpx; font-weight:700; }
+.summary-loading { color:#8c98a5; font-size:22rpx; }
+.period-tabs { display:flex; padding:7rpx; background:#e7ebf0; border-radius:999rpx; }
+.period-tab { flex:1; padding:18rpx 8rpx; color:#687686; font-size:25rpx; text-align:center; border-radius:999rpx; }
+.period-tab.active { color:#1e2b38; background:#fff; box-shadow:0 5rpx 16rpx rgba(31,45,61,.14); font-weight:650; }
+.stats-card { display:flex; margin-top:16rpx; padding:22rpx 6rpx; background:#fff3f1; border:1rpx solid #ffe5e0; border-radius:18rpx; }
+.stat-item { position:relative; min-width:0; flex:1; text-align:center; }
+.stat-item + .stat-item::before { position:absolute; top:10rpx; bottom:10rpx; left:0; width:1rpx; background:#f0dcd8; content:''; }
+.stat-label,.stat-value,.stat-unit { display:block; }
+.stat-label { color:#596674; font-size:22rpx; }
+.stat-value { margin-top:8rpx; overflow:hidden; color:#1f2d3d; font-size:29rpx; font-weight:750; text-overflow:ellipsis; white-space:nowrap; }
+.stat-unit { margin-top:3rpx; color:#9a7f7a; font-size:18rpx; }
+.profit-value { color:#159866; }.sales-value { color:#d66d49; }
+.summary-basis { margin:12rpx 6rpx 0; color:#7b8896; font-size:21rpx; }
+.summary-pending { margin:7rpx 6rpx 0; color:#dc7a22; font-size:21rpx; }
 .filters { padding:22rpx; }
 .search { height:80rpx; padding:0 24rpx; background:#f5f7fa; border-radius:13rpx; font-size:28rpx; }
 .filter-row { display:flex; gap:18rpx; margin-top:18rpx; }
@@ -26,6 +43,7 @@
 .sku-meta { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .color-meta { flex:none; color:#5f6d7a; white-space:nowrap; }
 .order-date { padding-top:13rpx; color:#83909f; font-size:23rpx; }
+.dispatch-deadline { margin-top:10rpx; padding:10rpx 13rpx; color:#bd6b12; background:#fff6e8; border-radius:9rpx; font-size:22rpx; font-weight:600; }
 .money-row { display:flex; justify-content:space-between; align-items:flex-end; padding-top:20rpx; }
 .money-row view { display:flex; flex-direction:column; }.money-row view:last-child { text-align:right; }
 .label { color:#8b97a4; font-size:22rpx; }.amount { margin-top:5rpx; font-size:29rpx; font-weight:700; }.payout { color:#16a66a; }

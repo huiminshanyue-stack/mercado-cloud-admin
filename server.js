@@ -14,6 +14,7 @@ const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellati
   shouldCreateShippedAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
 const { normalizeOrderItems } = require('./order-items');
+const { normalizeSummaryPeriod,buildOrderWorkbenchSummary } = require('./order-workbench-summary');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
@@ -3035,7 +3036,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-27.51',
+    version: '2026-07-27.52',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3116,6 +3117,9 @@ app.get('/api/health/order-management', (req, res) => {
     wechatMiniProgramApiV1: true,
     wechatErpTestLogin: true,
     miniProgramHomeDashboard: true,
+    miniProgramOrderWorkbenchSummary: true,
+    miniProgramSalesUsesOfficialPayoutCny: true,
+    miniProgramPendingDispatchDeadline: true,
     miniProgramOrderCostWrite: true,
     orderItemVariationsPreserved: true,
     orderItemColorTranslation: true,
@@ -3769,6 +3773,29 @@ async function getOrderListData(authUser,query = {}) {
   }
   const packedRows = await aggregatePackedOrders(rows.rows);
   return { items: packedRows, total: count.rows[0].total, page, size };
+}
+
+async function getMiniOrderWorkbenchSummaryData(authUser,query = {}) {
+  const period=normalizeSummaryPeriod(query.period);
+  const params=[authUser.username],where=['o.owner_username=$1','o.hidden_at IS NULL'];
+  if (query.storeId) {
+    params.push(String(query.storeId));
+    where.push(`o.store_user_id=$${params.length}`);
+  }
+  const shanghaiDate=`(o.date_created AT TIME ZONE 'Asia/Shanghai')::date`;
+  if (period==='today') where.push(`${shanghaiDate}=(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date`);
+  else if (period==='week') where.push(`${shanghaiDate}>=date_trunc('week',CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date`);
+  else where.push(`${shanghaiDate}>=date_trunc('month',CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date`);
+
+  const { rows }=await pool.query(`SELECT o.ml_order_id AS "orderId",o.pack_id AS "packId",
+    o.net_amount_usd AS "netAmountUsd",o.gross_amount_usd AS "grossAmountUsd",
+    o.paid_amount AS "paidAmount",o.product_cost AS "productCost",o.finance_is_official AS "financeIsOfficial"
+    FROM ml_orders o WHERE ${where.join(' AND ')} ORDER BY o.date_created`,params);
+  // Reuse the locked payout aggregation boundary. This summary must never derive
+  // revenue from gross merchandise value or rebuild official payout from fees.
+  const packedOrders=await aggregatePackedOrders(rows);
+  const exchangeRate=await getUsdCnyRate(authUser.username);
+  return buildOrderWorkbenchSummary(packedOrders,exchangeRate,period);
 }
 
 app.get('/api/admin/orders', requireOrderAccess, async (req, res) => {
@@ -6483,7 +6510,7 @@ async function start() {
   });
   await mercadoLibreWebhookService.init();
   mercadoLibreWebhookService.registerRoutes(app);
-  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getOrderStoresData,refreshOrderDimensionsData,
+  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getMiniOrderWorkbenchSummaryData,getOrderStoresData,refreshOrderDimensionsData,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
     getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,translateOrderMessageData,getOrderRealtimeStateData,
     getOfficialNotificationPreferences:officialAccountService.getPreferences,

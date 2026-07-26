@@ -4,6 +4,21 @@
     <button class="logout" size="mini" bindtap="logout">退出</button>
   </view>
 
+  <view class="recent-section">
+    <view class="recent-title-row"><text class="recent-title">最近订单</text><text wx:if="{{summaryLoading}}" class="summary-loading">更新中</text></view>
+    <view class="period-tabs">
+      <view wx:for="{{periodTabs}}" wx:for-item="period" wx:key="value" class="period-tab {{summaryPeriod === period.value ? 'active' : ''}}" data-period="{{period.value}}" bindtap="onPeriodChange">{{period.name}}</view>
+    </view>
+    <view class="stats-card">
+      <view class="stat-item"><text class="stat-label">订单数</text><text class="stat-value">{{workbenchSummary.orderCount}}</text><text class="stat-unit">单</text></view>
+      <view class="stat-item"><text class="stat-label">利润</text><text class="stat-value profit-value">{{workbenchSummary.profitText}}</text><text class="stat-unit">CNY</text></view>
+      <view class="stat-item"><text class="stat-label">销售额</text><text class="stat-value sales-value">{{workbenchSummary.salesText}}</text><text class="stat-unit">CNY</text></view>
+      <view class="stat-item"><text class="stat-label">利润率</text><text class="stat-value">{{workbenchSummary.profitRateText}}</text><text class="stat-unit">回款口径</text></view>
+    </view>
+    <view class="summary-basis">销售额 = 官方应回款 USD × 汇率 {{workbenchSummary.exchangeRateText}}</view>
+    <view wx:if="{{workbenchSummary.pendingPayoutCount > 0}}" class="summary-pending">{{workbenchSummary.pendingPayoutCount}} 单官方回款待获取，暂未计入金额与利润率</view>
+  </view>
+
   <view class="card filters">
     <input class="search" placeholder="输入订单号" confirm-type="search" value="{{orderId}}" bindinput="onOrderId" bindconfirm="applyFilters" />
     <view class="filter-row">
@@ -38,6 +53,7 @@
       </view>
     </view>
     <view class="order-date">下单：{{item.dateText}}</view>
+    <view wx:if="{{item.stateKey === 'pending'}}" class="dispatch-deadline">{{item.dispatchDeadlineText}}</view>
     <view class="money-row">
       <view><text class="label">商品金额</text><text class="amount">{{item.grossText}}</text></view>
       <view><text class="label">应回款</text><text class="amount payout">{{item.payoutText}}</text></view>

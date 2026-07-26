@@ -39,7 +39,7 @@ async function runHandlers(handlers,req,res) {
 
 async function testRoutes() {
   process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
-  const routes=new Map(),listCalls=[],dimensionCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
+  const routes=new Map(),listCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -81,6 +81,10 @@ async function testRoutes() {
     getOrderListData:async (user,query) => {
       listCalls.push({ user,query });
       return { items:[{ orderId:'order-1' }],total:1,page:1,size:20 };
+    },
+    getMiniOrderWorkbenchSummaryData:async (user,query) => {
+      summaryCalls.push({ user,query });
+      return { period:query.period,orderCount:2,salesCny:72,profitCny:52,profitRate:72.2,pendingPayoutCount:1,exchangeRate:7.2 };
     },
     refreshOrderDimensionsData:async (user,orderId) => {
       dimensionCalls.push({ user,orderId });
@@ -142,6 +146,16 @@ async function testRoutes() {
   assert.equal(listCalls.length,1);
   assert.equal(listCalls[0].user.username,'CNTORO');
   assert.deepEqual(listCalls[0].query,{ page:'2',storeId:'store-1' });
+
+  const summaryRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/order-workbench-summary'),{
+    headers:{ authorization:'Bearer cntoro-token' },query:{ period:'month',storeId:'store-1' }
+  },summaryRes);
+  assert.equal(summaryRes.statusCode,200);
+  assert.equal(summaryRes.body.data.salesCny,72);
+  assert.equal(summaryCalls.length,1);
+  assert.equal(summaryCalls[0].user.username,'CNTORO');
+  assert.deepEqual(summaryCalls[0].query,{ period:'month',storeId:'store-1' });
 
   const dimensionsRes=responseRecorder();
   await runHandlers(routes.get('POST /api/miniprogram/v1/orders/:orderId/dimensions/refresh'),{
