@@ -65,10 +65,20 @@ function colorAttributes(entry, detail) {
 }
 
 function extractOrderItemColor(entry, detail) {
+  const item = entry?.item || {};
   const existing = entry?.item?.colorOriginal || entry?.item?.color_original || entry?.colorOriginal || '';
   if (String(existing).trim()) return String(existing).trim();
   const attribute = colorAttributes(entry, detail).find(candidate => isColorAttribute(candidate) && attributeValue(candidate));
-  return attributeValue(attribute);
+  const officialColor = attributeValue(attribute);
+  if (officialColor) return officialColor;
+
+  // Some historical order payloads no longer include variation attributes even
+  // though the seller SKU still ends in an unambiguous color value.  Use this
+  // only as a compatibility fallback for a known color translation; arbitrary
+  // SKU fragments must never be presented to the user as a color.
+  const sellerSku = String(item.seller_sku || item.sellerSku || entry?.seller_sku || '').trim();
+  const skuParts = sellerSku.split(/[-_]/).map(part => part.trim()).filter(Boolean).reverse();
+  return skuParts.find(part => COLOR_TRANSLATIONS.has(normalizedWords(part))) || '';
 }
 
 function translateColorPart(value) {

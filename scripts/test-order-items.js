@@ -31,6 +31,13 @@ const fallback = normalizeOrderItems([{ quantity: 2,item:{ id:'MLC1',variation_i
   variations:[{ id:88,attribute_combinations:[{ id:'COLOR',value_name:'Rojo' }] }]
 }]]));
 assert.strictEqual(fallback[0].item.colorNameZh, '红色');
+
+const historicalSkuFallback = normalizeOrderItems([
+  { quantity:1,item:{ id:'MLB1',seller_sku:'723665712-BLACK' } },
+  { quantity:1,item:{ id:'MLB1',seller_sku:'723665712-PINK' } },
+  { quantity:1,item:{ id:'MLB1',seller_sku:'723665712-XL' } }
+]);
+assert.deepStrictEqual(historicalSkuFallback.map(item => item.item.colorNameZh), ['黑色','粉色','']);
 assert.strictEqual(fallback[0].quantity, 2);
 
 console.log('order item normalization tests passed');

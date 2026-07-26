@@ -3035,7 +3035,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-26.47',
+    version: '2026-07-26.48',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3127,6 +3127,8 @@ app.get('/api/health/order-management', (req, res) => {
     wechatOfficialAccountPersistentOutbox: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
+    orderColorDisplay: true,
+    deployedOrderFrontend: true,
     commit: process.env.RAILWAY_GIT_COMMIT_SHA || ''
   } });
 });
