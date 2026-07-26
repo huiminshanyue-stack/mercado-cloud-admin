@@ -10,8 +10,16 @@ const statusOptions = [
 ];
 
 function normalize(order:any) {
-  const product = order.items?.[0] || {};
-  const item = product.item || {};
+  const products = (Array.isArray(order.items) ? order.items : []).map((product:any,index:number) => {
+    const item = product.item || {};
+    const sku = item.seller_sku || item.seller_custom_field || item.sku || '-';
+    return {
+      productKey:`${item.id || 'item'}:${item.variation_id || sku || 'variation'}:${index}`,
+      title:item.title || '商品信息待获取',image:item.picture_url || item.thumbnail || '',
+      quantity:Math.max(1,Number(product.quantity || 1)),sku,
+      color:item.colorNameZh || item.color_name_zh || '-'
+    };
+  });
   const stateText = orderState(order);
   const stateKey = stateText === '待发货' ? 'pending' : stateText === '运输中' ? 'shipping' : stateText === '已送达' ? 'done' : 'closed';
   const country = countryInfo(order.country);
@@ -19,8 +27,7 @@ function normalize(order:any) {
     ...order,
     displayOrderId:String(order.displayOrderId || order.orderId),stateText,stateKey,
     countryName:country.name,countryFlag:country.flag,dateText:formatDate(order.dateCreated),
-    productTitle:item.title || '商品信息待获取',productImage:item.picture_url || item.thumbnail || '',
-    quantity:product.quantity || 1,sku:item.seller_sku || item.sku || '-',
+    products,productCount:products.reduce((total:number,product:any)=>total+product.quantity,0),
     grossText:money(order.grossAmountUsd ?? order.paidAmount,'USD'),
     payoutText:money(order.netAmountUsd,'USD'),costText:Number(order.productCost || 0).toFixed(2)
   };

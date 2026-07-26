@@ -26,15 +26,18 @@
       <view class="country">{{item.countryFlag}} {{item.countryName}}</view>
       <view class="order-no">{{item.displayOrderId}}</view>
     </view>
-    <view class="store">{{item.storeName}}</view>
-    <view class="product">
-      <image class="image" mode="aspectFill" src="{{item.productImage}}" />
-      <view class="product-main">
-        <view class="product-title">{{item.productTitle}}</view>
-        <view class="meta">数量 ×{{item.quantity}}　SKU：{{item.sku}}</view>
-        <view class="meta">下单：{{item.dateText}}</view>
+    <view class="store-line"><view class="store">{{item.storeName}}</view><view class="product-count">共 {{item.productCount}} 件</view></view>
+    <view class="products-list">
+      <view wx:for="{{item.products}}" wx:for-item="product" wx:for-index="productIndex" wx:key="productKey" class="product">
+        <image class="image" mode="aspectFill" src="{{product.image}}" />
+        <view class="product-main">
+          <view class="product-title">{{product.title}}</view>
+          <view class="meta">数量 ×{{product.quantity}}</view>
+          <view class="variant-row"><text class="sku-meta">SKU：{{product.sku}}</text><text class="color-meta">颜色：{{product.color}}</text></view>
+        </view>
       </view>
     </view>
+    <view class="order-date">下单：{{item.dateText}}</view>
     <view class="money-row">
       <view><text class="label">商品金额</text><text class="amount">{{item.grossText}}</text></view>
       <view><text class="label">应回款</text><text class="amount payout">{{item.payoutText}}</text></view>

@@ -18,11 +18,13 @@ Page({
     try {
       const raw = await request<any>({ path:`/api/miniprogram/v1/orders/${encodeURIComponent(this.data.displayOrderId)}` });
       const country = countryInfo(raw.country);
-      const products=(raw.items || []).map((product:any) => {
+      const products=(raw.items || []).map((product:any,index:number) => {
         const item=product.item || {};
         return {
           title:item.title || '商品信息待获取',image:item.picture_url || item.thumbnail || '',itemId:item.id || '-',
-          sku:item.seller_sku || item.seller_custom_field || item.sku || '-',quantity:product.quantity || 1
+          sku:item.seller_sku || item.seller_custom_field || item.sku || '-',
+          color:item.colorNameZh || item.color_name_zh || '-',quantity:product.quantity || 1,
+          productKey:`${item.id || 'item'}:${item.variation_id || item.seller_sku || item.seller_custom_field || 'variation'}:${index}`
         };
       });
       this.setData({ order:{

@@ -10,9 +10,9 @@
 
     <view class="card section">
       <view class="section-title">商品信息</view>
-      <view wx:for="{{order.products}}" wx:key="itemId" class="product">
+      <view wx:for="{{order.products}}" wx:key="productKey" class="product">
         <image class="image" mode="aspectFit" src="{{item.image}}" data-index="{{index}}" bindtap="previewImage" />
-        <view class="product-main"><view class="product-title">{{item.title}}</view><view class="muted">商品ID：<text user-select="true">{{item.itemId}}</text></view><view class="muted">SKU：{{item.sku}}　数量 ×{{item.quantity}}</view></view>
+        <view class="product-main"><view class="product-title">{{item.title}}</view><view class="muted">商品ID：<text user-select="true">{{item.itemId}}</text></view><view class="muted">数量 ×{{item.quantity}}</view><view class="variant-row"><text class="sku-meta">SKU：{{item.sku}}</text><text class="color-meta">颜色：{{item.color}}</text></view></view>
       </view>
       <view class="row"><text>买家</text><text user-select="true">{{order.buyer || '-'}}</text></view>
     </view>

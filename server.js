@@ -13,6 +13,7 @@ const { dimensionSnapshotsDiffer } = require('./order-dimensions');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert,
   shouldCreateShippedAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
+const { normalizeOrderItems } = require('./order-items');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
@@ -3492,10 +3493,10 @@ async function syncOrdersForUser(authUser, body = {}) {
     const insertedDisplayOrderIds = new Set(), updatedDisplayOrderIds = new Set();
     for (const order of sourceOrders) {
       const shipment = order._shipment_detail || {};
-      const orderItems = (order.order_items || []).map(entry => {
+      const orderItems = normalizeOrderItems((order.order_items || []).map(entry => {
         const officialPicture = itemPictures.get(String(entry.item?.id)) || entry.item?.pictures?.[0]?.secure_url || entry.item?.pictures?.[0]?.url || entry.item?.picture_url || entry.item?.secure_thumbnail || entry.item?.thumbnail || '';
         return { ...entry, item: { ...entry.item, thumbnail: officialPicture, picture_url: officialPicture } };
-      });
+      }), itemDetails);
       const itemId = order.order_items?.[0]?.item?.id || '';
       const siteId = shipment.source?.site_id || shipment.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '';
       const country = ({ MLM:'MX', MLB:'BR', MLC:'CL', MCO:'CO', MLA:'AR' })[siteId] || siteId;
@@ -3739,6 +3740,9 @@ async function getOrderListData(authUser,query = {}) {
   const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE owner_username=$2 AND ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId),req.authUser.username]) : { rows: [] };
   const financeMap = new Map(financeRows.rows.map(row => [row.ml_order_id, row.billing_data]));
   for (const row of rows.rows) {
+    // Presentation normalization also covers orders cached before color support was added.
+    // Keep every official order line; never collapse different variations of the same item ID.
+    row.items = normalizeOrderItems(row.items);
     row.billingData = financeMap.get(row.orderId) || {};
     const reputation = extractReputationInfo(row.rawData);
     row.reputationImpact = reputation.impact;
