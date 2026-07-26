@@ -1,5 +1,5 @@
 import { request,showError } from '../../utils/request';
-import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWeightState,formatDate,money,onlineDeadlineText,orderState,reputationReasonText } from '../../utils/format';
+import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWeightState,formatDate,money,onlineDeadlineText,orderState,platformDimensionSourceNote,reputationReasonText } from '../../utils/format';
 
 Page({
   data:{ loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false },
@@ -40,6 +40,7 @@ Page({
         cancellationText:cancellationText(raw.cancellationReason),
         sellerDimensionText:dimensionSummary(dimensionSnapshot,'seller'),
         platformDimensionText:dimensionSummary(dimensionSnapshot,'platform'),
+        platformDimensionNote:platformDimensionSourceNote(dimensionSnapshot),
         sellerWeightHint:dimensionState.sellerHint,
         sellerWeightHintClass:dimensionState.sellerHintClass,
         weightAnomaly:dimensionState.weightAnomaly,

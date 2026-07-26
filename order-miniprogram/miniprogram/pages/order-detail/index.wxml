@@ -49,7 +49,7 @@
         <view class="dimension-note">卖家在店铺后台自行填写并随订单上报</view>
         <view class="dimension-value">{{order.sellerDimensionText}}<text wx:if="{{order.sellerWeightHint}}" class="weight-hint {{order.sellerWeightHintClass}}">{{order.sellerWeightHint}}</text></view>
         <view class="dimension-label">美客多平台返回的值</view>
-        <view class="dimension-note">美客多完成称重、核验后反馈的单件尺寸重量</view>
+        <view class="dimension-note">{{order.platformDimensionNote}}</view>
         <view class="dimension-value">{{order.platformDimensionText}}<text wx:if="{{order.weightAnomaly}}" class="weight-anomaly">重量异常</text></view>
         <view class="dimension-rule">系统比较两组数据，并以数值较高的一组作为运费计费依据；最终费用以美客多官方账单为准。</view>
       </block>

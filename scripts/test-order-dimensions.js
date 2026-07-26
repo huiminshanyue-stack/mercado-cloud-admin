@@ -14,6 +14,8 @@ assert.deepEqual(snapshotDeclaredValue(original),declared);
 assert.deepEqual(snapshotVerifiedValue(latest),verified);
 assert.deepEqual(snapshotListingValue(latest),listing);
 assert.deepEqual(snapshotBillableWeight(latest),{ weight:734,weightUnit:'g' });
+assert.deepEqual(snapshotListingValue({ items:[{ billableWeight:{ weight:223,weightUnit:'g' } }] }),
+  { weight:223,weightUnit:'g' },'美客多仅返回计费重量时，平台返回值不能显示为未返回');
 assert.equal(dimensionSnapshotsDiffer(original,latest),true);
 assert.equal(dimensionSnapshotsDiffer(original,{ package:{ dimensions:{ ...declared,length:12,width:15,height:20 } } }),false,
   '长宽高顺序变化但三边与重量相同，不应误判为平台修改');

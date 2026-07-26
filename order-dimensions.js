@@ -10,7 +10,9 @@ function snapshotVerifiedValue(snapshot) {
 }
 
 function snapshotListingValue(snapshot) {
-  return snapshot?.currentListing || snapshot?.items?.[0]?.listingDimensions || null;
+  return snapshot?.platformReturned || snapshot?.currentListing ||
+    snapshot?.items?.find(item=>item?.listingDimensions)?.listingDimensions ||
+    snapshotBillableWeight(snapshot) || null;
 }
 
 function snapshotBillableWeight(snapshot) {

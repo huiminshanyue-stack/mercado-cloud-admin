@@ -111,14 +111,21 @@ function dimensionValue(snapshot:any,mode:'seller'|'platform'): any {
   if (mode==='seller') {
     return snapshot?.verifiedPackage || snapshot?.package?.dimensions || snapshot?.declaredAtOrder || snapshot?.orderRecorded || snapshot?.items?.[0]?.orderDimensions || null;
   }
-  return snapshot?.currentListing || snapshot?.items?.find((item:any)=>item?.listingDimensions)?.listingDimensions || null;
+  return snapshot?.platformReturned || snapshot?.currentListing ||
+    snapshot?.items?.find((item:any)=>item?.listingDimensions)?.listingDimensions ||
+    snapshot?.billableWeight || snapshot?.items?.find((item:any)=>item?.billableWeight)?.billableWeight || null;
+}
+
+export function platformDimensionSourceNote(snapshot:any): string {
+  const hasDimensions=Boolean(snapshot?.currentListing || snapshot?.items?.some((item:any)=>item?.listingDimensions));
+  return hasDimensions ? '美客多称重核验后反馈（单件）' : '美客多官方仅返回计费重量';
 }
 
 export function dimensionSummary(snapshot:any,mode:'seller'|'platform'): string {
   const value=dimensionValue(snapshot,mode);
   if (!value) return '暂未获取';
   const length=compact(value.length),width=compact(value.width),height=compact(value.height),weight=compact(value.weight);
-  const size=length && width && height ? `${length}×${width}×${height} ${value.dimensionUnit || 'cm'}` : '长宽高未完整返回';
+  const size=length && width && height ? `${length}×${width}×${height} ${value.dimensionUnit || 'cm'}` : '尺寸暂未返回';
   return `${size} / ${weight ? `重量 ${weight} ${value.weightUnit || 'g'}` : '重量未返回'}`;
 }
 
