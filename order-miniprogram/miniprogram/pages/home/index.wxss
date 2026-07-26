@@ -1,1 +1,300 @@
-.home-page { padding-top:34rpx; }.hero { display:flex; justify-content:space-between; align-items:center; padding:20rpx 8rpx 36rpx; }.welcome { font-size:42rpx; font-weight:750; }.subtitle { margin-top:10rpx; color:#7e8a98; font-size:25rpx; }.logout { margin:0; color:#637285; background:#fff; }.overview { display:flex; justify-content:space-around; padding:30rpx 12rpx; text-align:center; }.overview view { display:flex; min-width:0; flex:1; flex-direction:column; border-right:1rpx solid #edf0f4; }.overview view:last-child { border:0; }.number { color:#1677ff; font-size:42rpx; font-weight:750; }.number.warning { color:#e58b00; }.number.danger { color:#ef5350; }.unit { margin-top:7rpx; color:#8995a2; font-size:22rpx; }.section-title { margin:38rpx 4rpx 20rpx; font-size:31rpx; font-weight:700; }.menu-card { display:flex; align-items:center; margin-bottom:20rpx; padding:28rpx 24rpx; color:#1f2d3d; background:#fff; border-radius:20rpx; box-shadow:0 8rpx 28rpx rgba(31,45,61,.05); }.icon { width:82rpx; height:82rpx; margin-right:22rpx; color:#fff; background:#1677ff; border-radius:22rpx; font-size:34rpx; font-weight:700; line-height:82rpx; text-align:center; }.inquiry-menu .icon { background:#f0a020; }.after-menu .icon { background:#ef5960; }.menu-main { min-width:0; flex:1; }.menu-title { font-size:31rpx; font-weight:700; }.menu-desc { margin-top:9rpx; color:#7f8b98; font-size:23rpx; line-height:1.5; }.arrow { margin-left:15rpx; color:#aab3bd; font-size:50rpx; }.badge { min-width:34rpx; height:34rpx; padding:0 8rpx; color:#fff; background:#f0a020; border-radius:20rpx; font-size:20rpx; line-height:34rpx; text-align:center; }.badge.red { background:#ef5960; }.security { padding:30rpx 10rpx; color:#9aa5b1; font-size:22rpx; text-align:center; }
+.home-page {
+  padding: 38rpx 30rpx 42rpx;
+  background: #f5f6f8;
+}
+
+.masthead {
+  padding: 2rpx 2rpx 0;
+}
+
+.masthead-meta,
+.product-name,
+.sync-state,
+.welcome-row,
+.panel-heading,
+.overview,
+.module-row,
+.security {
+  display: flex;
+  align-items: center;
+}
+
+.masthead-meta {
+  justify-content: space-between;
+}
+
+.product-name {
+  color: #526071;
+  font-size: 22rpx;
+  font-weight: 600;
+  letter-spacing: 1rpx;
+}
+
+.product-line {
+  width: 5rpx;
+  height: 24rpx;
+  margin-right: 12rpx;
+  background: #176fe5;
+  border-radius: 2rpx;
+}
+
+.sync-state {
+  color: #7d8997;
+  font-size: 20rpx;
+}
+
+.sync-dot {
+  width: 9rpx;
+  height: 9rpx;
+  margin-right: 9rpx;
+  background: #20a874;
+  border-radius: 50%;
+}
+
+.sync-dot.syncing {
+  background: #176fe5;
+  animation: blink 1s ease-in-out infinite;
+}
+
+.welcome-row {
+  justify-content: space-between;
+  margin-top: 30rpx;
+}
+
+.welcome-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.welcome {
+  overflow: hidden;
+  max-width: 500rpx;
+  color: #172132;
+  font-size: 42rpx;
+  font-weight: 700;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitle {
+  margin-top: 10rpx;
+  color: #7b8795;
+  font-size: 24rpx;
+}
+
+.logout {
+  width: auto;
+  margin: 0 0 0 18rpx;
+  padding: 0 20rpx;
+  color: #596779;
+  background: transparent;
+  border: 1rpx solid #d8dee7;
+  border-radius: 10rpx;
+  font-size: 22rpx;
+  line-height: 52rpx;
+}
+
+.summary-panel {
+  margin-top: 36rpx;
+  overflow: hidden;
+  background: #fff;
+  border: 1rpx solid #dfe4eb;
+  border-radius: 16rpx;
+  box-shadow: 0 5rpx 16rpx rgba(31, 45, 66, .035);
+}
+
+.panel-heading {
+  justify-content: space-between;
+  padding: 21rpx 24rpx;
+  border-bottom: 1rpx solid #edf0f4;
+}
+
+.panel-title {
+  color: #263447;
+  font-size: 25rpx;
+  font-weight: 650;
+}
+
+.panel-note {
+  color: #9aa4b1;
+  font-size: 19rpx;
+}
+
+.overview {
+  padding: 28rpx 0 30rpx;
+}
+
+.metric {
+  position: relative;
+  min-width: 0;
+  flex: 1;
+  text-align: center;
+}
+
+.metric + .metric::before {
+  position: absolute;
+  top: 5rpx;
+  bottom: 5rpx;
+  left: 0;
+  width: 1rpx;
+  background: #e9edf2;
+  content: '';
+}
+
+.metric-value {
+  color: #176fe5;
+  font-size: 38rpx;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.warning-value { color: #c77b09; }
+.danger-value { color: #df4b57; }
+
+.metric-label {
+  margin-top: 9rpx;
+  color: #7d8997;
+  font-size: 21rpx;
+}
+
+.section-heading {
+  margin: 40rpx 2rpx 18rpx;
+}
+
+.section-title {
+  color: #1c2737;
+  font-size: 32rpx;
+  font-weight: 700;
+}
+
+.section-subtitle {
+  margin-top: 7rpx;
+  color: #98a2af;
+  font-size: 21rpx;
+}
+
+.module-list {
+  overflow: hidden;
+  background: #fff;
+  border: 1rpx solid #dfe4eb;
+  border-radius: 16rpx;
+  box-shadow: 0 5rpx 16rpx rgba(31, 45, 66, .035);
+}
+
+.module-row {
+  position: relative;
+  box-sizing: border-box;
+  min-height: 128rpx;
+  margin-left: 24rpx;
+  padding: 24rpx 22rpx 24rpx 0;
+  border-bottom: 1rpx solid #edf0f4;
+  transition: background-color .12s ease;
+}
+
+.last-row {
+  border-bottom: 0;
+}
+
+.module-index {
+  box-sizing: border-box;
+  width: 58rpx;
+  height: 58rpx;
+  margin-right: 20rpx;
+  border: 1rpx solid currentColor;
+  border-radius: 10rpx;
+  font-size: 21rpx;
+  font-weight: 700;
+  line-height: 56rpx;
+  text-align: center;
+}
+
+.index-blue {
+  color: #176fe5;
+  background: #f2f7ff;
+}
+
+.index-amber {
+  color: #b76c00;
+  background: #fff8ed;
+}
+
+.index-red {
+  color: #d94552;
+  background: #fff5f5;
+}
+
+.index-green {
+  color: #148461;
+  background: #f1faf7;
+}
+
+.module-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.module-title {
+  color: #1e2a3a;
+  font-size: 29rpx;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.module-desc {
+  overflow: hidden;
+  margin-top: 8rpx;
+  color: #7c8795;
+  font-size: 21rpx;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending {
+  flex: 0 0 auto;
+  margin-left: 12rpx;
+  font-size: 19rpx;
+  font-weight: 600;
+}
+
+.warning-pending { color: #b66e00; }
+.danger-pending { color: #d94552; }
+
+.chevron {
+  width: 13rpx;
+  height: 13rpx;
+  margin: 0 5rpx 0 18rpx;
+  border-top: 2rpx solid #a6afba;
+  border-right: 2rpx solid #a6afba;
+  transform: rotate(45deg);
+}
+
+.security {
+  justify-content: center;
+  padding: 28rpx 12rpx 0;
+  color: #8c97a5;
+  font-size: 20rpx;
+  text-align: center;
+}
+
+.security-mark {
+  margin-right: 9rpx;
+  color: #178c67;
+  font-size: 22rpx;
+  font-weight: 700;
+}
+
+.row-pressed {
+  background: #f6f8fb;
+}
+
+.button-pressed {
+  color: #176fe5;
+  background: #edf4ff;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}

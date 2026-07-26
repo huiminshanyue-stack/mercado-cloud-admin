@@ -1,27 +1,93 @@
 <view class="page home-page">
-  <view class="hero">
-    <view><view class="welcome">你好，{{userName}}</view><view class="subtitle">今天也要顺利处理每一笔订单</view></view>
-    <button class="logout" size="mini" bindtap="logout">退出</button>
+  <view class="masthead">
+    <view class="masthead-meta">
+      <view class="product-name">
+        <view class="product-line"></view>
+        <text>山月订单中心</text>
+      </view>
+      <view class="sync-state">
+        <view class="sync-dot {{loading ? 'syncing' : ''}}"></view>
+        <text>{{loading ? '正在更新' : '数据已连接'}}</text>
+      </view>
+    </view>
+
+    <view class="welcome-row">
+      <view class="welcome-copy">
+        <view class="welcome">{{userName}}，你好</view>
+        <view class="subtitle">集中处理订单、咨询与售后消息</view>
+      </view>
+      <button class="logout" bindtap="logout" hover-class="button-pressed">退出</button>
+    </view>
   </view>
 
-  <view class="overview card">
-    <view><text class="number">{{summary.orderCount}}</text><text class="unit">订单</text></view>
-    <view><text class="number warning">{{summary.inquiryCount}}</text><text class="unit">售前待看</text></view>
-    <view><text class="number danger">{{summary.afterSalesCount}}</text><text class="unit">售后待看</text></view>
+  <view class="summary-panel">
+    <view class="panel-heading">
+      <text class="panel-title">业务概览</text>
+      <text class="panel-note">下拉页面可手动刷新</text>
+    </view>
+    <view class="overview">
+      <view class="metric">
+        <view class="metric-value">{{summary.orderCount}}</view>
+        <view class="metric-label">已同步订单</view>
+      </view>
+      <view class="metric">
+        <view class="metric-value warning-value">{{summary.inquiryCount}}</view>
+        <view class="metric-label">咨询待回复</view>
+      </view>
+      <view class="metric">
+        <view class="metric-value danger-value">{{summary.afterSalesCount}}</view>
+        <view class="metric-label">售后待回复</view>
+      </view>
+    </view>
   </view>
 
-  <view class="section-title">工作台</view>
-  <view class="menu-card order-menu" bindtap="openOrders">
-    <view class="icon">单</view><view class="menu-main"><view class="menu-title">订单工作台</view><view class="menu-desc">查看订单、账单、物流并填写商品成本</view></view><view class="arrow">›</view>
+  <view class="section-heading">
+    <view class="section-title">工作台</view>
+    <view class="section-subtitle">选择要处理的业务</view>
   </view>
-  <view class="menu-card inquiry-menu" bindtap="openInquiries">
-    <view class="icon">询</view><view class="menu-main"><view class="menu-title">售前咨询</view><view class="menu-desc">查看买家订单咨询，翻译后确认回复</view></view><view class="badge" wx:if="{{summary.inquiryCount}}">{{summary.inquiryCount}}</view><view class="arrow">›</view>
+
+  <view class="module-list">
+    <view class="module-row" bindtap="openOrders" hover-class="row-pressed">
+      <view class="module-index index-blue">01</view>
+      <view class="module-main">
+        <view class="module-title">订单工作台</view>
+        <view class="module-desc">订单 · 官方账单 · 物流 · 商品成本</view>
+      </view>
+      <view class="chevron"></view>
+    </view>
+
+    <view class="module-row" bindtap="openInquiries" hover-class="row-pressed">
+      <view class="module-index index-amber">02</view>
+      <view class="module-main">
+        <view class="module-title">售前咨询</view>
+        <view class="module-desc">查看买家问题，翻译并确认回复</view>
+      </view>
+      <view class="pending warning-pending" wx:if="{{summary.inquiryCount}}">{{summary.inquiryCount}} 待回复</view>
+      <view class="chevron"></view>
+    </view>
+
+    <view class="module-row" bindtap="openAfterSales" hover-class="row-pressed">
+      <view class="module-index index-red">03</view>
+      <view class="module-main">
+        <view class="module-title">售后消息</view>
+        <view class="module-desc">投诉 · 退款 · 售后申诉线程</view>
+      </view>
+      <view class="pending danger-pending" wx:if="{{summary.afterSalesCount}}">{{summary.afterSalesCount}} 待回复</view>
+      <view class="chevron"></view>
+    </view>
+
+    <view class="module-row last-row" bindtap="openNotifications" hover-class="row-pressed">
+      <view class="module-index index-green">04</view>
+      <view class="module-main">
+        <view class="module-title">公众号消息提醒</view>
+        <view class="module-desc">设置订单、取消、退款及消息通知</view>
+      </view>
+      <view class="chevron"></view>
+    </view>
   </view>
-  <view class="menu-card after-menu" bindtap="openAfterSales">
-    <view class="icon">售</view><view class="menu-main"><view class="menu-title">售后消息</view><view class="menu-desc">处理申诉和售后线程，不受退款状态限制</view></view><view class="badge red" wx:if="{{summary.afterSalesCount}}">{{summary.afterSalesCount}}</view><view class="arrow">›</view>
+
+  <view class="security">
+    <view class="security-mark">✓</view>
+    <text>当前页面仅展示本账号授权店铺的数据</text>
   </view>
-  <view class="menu-card notification-menu" bindtap="openNotifications">
-    <view class="icon">醒</view><view class="menu-main"><view class="menu-title">公众号消息提醒</view><view class="menu-desc">关注“山月跨境”，设置新订单、取消、退款及消息提醒</view></view><view class="arrow">›</view>
-  </view>
-  <view class="security">所有数据均按当前 ERP 账号的授权店铺隔离</view>
 </view>

@@ -1,1 +1,7 @@
-{ "navigationBarTitleText": "山月助手", "enablePullDownRefresh": true }
+{
+  "navigationBarTitleText": "山月助手",
+  "navigationBarBackgroundColor": "#176ee8",
+  "navigationBarTextStyle": "white",
+  "backgroundColor": "#f5f8ff",
+  "enablePullDownRefresh": true
+}
