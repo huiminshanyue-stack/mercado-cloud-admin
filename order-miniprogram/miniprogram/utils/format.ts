@@ -36,7 +36,8 @@ export function money(value: unknown,currency = 'USD'): string {
   const amount = Number(value);
   if (!Number.isFinite(amount)) return '待获取';
   const symbol=currency === 'USD' ? '$' : currency === 'CNY' ? '￥' : `${currency} `;
-  return `${symbol}${amount.toFixed(2)}`;
+  const sign=amount < 0 ? '-' : '';
+  return `${sign}${symbol}${Math.abs(amount).toFixed(2)}`;
 }
 
 export function countryInfo(code?: string): { name:string;flag:string } {
