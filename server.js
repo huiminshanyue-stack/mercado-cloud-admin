@@ -20,7 +20,8 @@ const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-m
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
 const { isGlobalSellingAuthorization,productQuestionSearchEndpoint,
-  productQuestionAnswerEndpoint } = require('./mercadolibre-communications');
+  productQuestionAnswerEndpoint,marketplaceClaimEndpoint,claimReplyReceiverRole,
+  officialCommunicationError } = require('./mercadolibre-communications');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -5609,13 +5610,52 @@ async function sendOrderClaimMessageData(authUser,claimId,body = {}) {
     const context = await resolveOrderStoreContext(authUser,String(body?.storeId || ''));
     if (!context) { const error=new Error('无法确定该售后线程所属店铺'); error.status=404; throw error; }
     const token = context.token;
-    const response = await axios.post(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(claimId)}/messages`, { receiver_role:'complainant',message:text }, { headers: { Authorization:`Bearer ${token}`,'Content-Type':'application/json' },timeout:20000 });
-    return response.data;
+    const headers = { Authorization:`Bearer ${token}`,'Content-Type':'application/json' };
+    const claimUrl = marketplaceClaimEndpoint(claimId);
+    const claimLink = await pool.query(`SELECT store_user_id,order_id,raw_data FROM order_api_audits
+      WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[authUser.username,String(claimId)]);
+    let claim = claimLink.rows[0]?.raw_data || null;
+    try {
+      const current = await axios.get(claimUrl,{ headers,timeout:12000 });
+      claim = current.data || claim;
+    } catch (error) {
+      console.warn('[Orders] claim state refresh before reply failed:',authUser.username,claimId,error.response?.status || error.message);
+    }
+    const status = String(claim?.status || '').toLowerCase();
+    if (status && status !== 'opened') {
+      const error = new Error(`该售后线程当前状态为“${status}”，已不能继续回复`);
+      error.status = 409;
+      throw error;
+    }
+    const receiverRole = claimReplyReceiverRole(claim) || 'complainant';
+    const requestData = { receiver_role:receiverRole,message:text,attachments:[] };
+    try {
+      const response = await axios.post(marketplaceClaimEndpoint(claimId,'actions/send-message'),requestData,{ headers,timeout:20000 });
+      await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '',
+        'claim_message_send',String(claimId),{ success:true,receiverRole,response:response.data || null });
+      try {
+        const messages = await axios.get(marketplaceClaimEndpoint(claimId,'messages'),{ headers,timeout:12000 });
+        await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '',
+          'claim_messages',String(claimId),messages.data);
+      } catch (syncError) {
+        console.warn('[Orders] claim messages refresh after reply failed:',authUser.username,claimId,syncError.response?.status || syncError.message);
+      }
+      if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE
+        WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[authUser.username,claimLink.rows[0].order_id]);
+      return response.data;
+    } catch (error) {
+      const official = officialCommunicationError(error,'售后回复发送失败');
+      await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '',
+        'claim_message_send',String(claimId),{ success:false,receiverRole,status:official.status,error:official.data || { message:official.message } }).catch(()=>{});
+      const replyError = new Error(official.message);
+      replyError.status = official.status;
+      throw replyError;
+    }
 }
 
 app.post('/api/admin/order-claims/:claimId/messages', requireOrderAccess, async (req, res) => {
   try { res.json({ code:0,data:await sendOrderClaimMessageData(req.authUser,req.params.claimId,req.body || {}) }); }
-  catch (e) { const status=e.status || e.response?.status || 502; res.status(status).json({ code:status,message:e.response?.data?.message || e.message }); }
+  catch (e) { const status=e.status || e.response?.status || 502; res.status(status).json({ code:status,message:e.message || e.response?.data?.message || '售后回复发送失败' }); }
 });
 
 async function translateOrderTextData(body = {}) {
