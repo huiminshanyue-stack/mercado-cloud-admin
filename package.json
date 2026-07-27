@@ -12,6 +12,7 @@
     "test:order-logistics": "node scripts/test-order-logistics.js",
     "test:order-dimensions": "node scripts/test-order-dimensions.js",
     "test:order-items": "node scripts/test-order-items.js",
+    "test:order-communications": "node scripts/test-order-communications.js",
     "test:order-workbench-summary": "node scripts/test-order-workbench-summary.js",
     "test:miniprogram": "node scripts/test-wechat-miniprogram.js",
     "test:webhook": "node scripts/test-mercadolibre-webhook.js",

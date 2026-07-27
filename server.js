@@ -18,6 +18,8 @@ const { normalizeSummaryPeriod,buildOrderWorkbenchSummary } = require('./order-w
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
+const { isGlobalSellingAuthorization,productQuestionSearchEndpoint,
+  productQuestionAnswerEndpoint } = require('./mercadolibre-communications');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -5226,9 +5228,12 @@ function mercadoLibreQuestionList(payload) {
   return Array.isArray(source) ? source : [];
 }
 
-async function fetchUnansweredProductQuestions(token,sellerIds) {
-  const responses=await Promise.all(sellerIds.map(sellerId=>axios.get('https://api.mercadolibre.com/questions/search',{
-    params:{ seller_id:sellerId,status:'UNANSWERED',sort_fields:'date_created',sort_types:'DESC',limit:50 },
+async function fetchUnansweredProductQuestions(token,sellerIds,useGlobalSellingApi = false) {
+  const endpoint=productQuestionSearchEndpoint({ site_id:useGlobalSellingApi ? 'CBT' : '' });
+  const targetSellerIds=useGlobalSellingApi ? sellerIds.slice(0,1) : sellerIds;
+  const responses=await Promise.all(targetSellerIds.map(sellerId=>axios.get(endpoint,{
+    params:{ seller_id:sellerId,status:'UNANSWERED',sort_fields:'date_created',sort_types:'DESC',limit:50,
+      ...(useGlobalSellingApi ? {} : { api_version:4 }) },
     headers:{ Authorization:`Bearer ${token}` },timeout:20000
   }).then(response=>({ sellerId:String(sellerId),questions:mercadoLibreQuestionList(response.data) }))
     .catch(error=>({ sellerId:String(sellerId),questions:[],error }))));
@@ -5242,7 +5247,10 @@ async function fetchUnansweredProductQuestions(token,sellerIds) {
 }
 
 async function productQuestionOrders(authUser,context,marketplaceSellerIds) {
-  const questions=await fetchUnansweredProductQuestions(context.token,marketplaceSellerIds);
+  const useGlobalSellingApi=isGlobalSellingAuthorization(context.authorization);
+  const questions=await fetchUnansweredProductQuestions(
+    context.token,useGlobalSellingApi ? [String(context.sellerId)] : marketplaceSellerIds,useGlobalSellingApi
+  );
   const itemIds=[...new Set(questions.map(question=>String(question.item_id || question.item?.id || '')).filter(Boolean))];
   const itemMap=new Map();
   for (let index=0;index<itemIds.length;index+=10) {
@@ -5269,7 +5277,8 @@ async function productQuestionOrders(authUser,context,marketplaceSellerIds) {
       `${auditPayload._item.title} 收到新的买家售前咨询`,`presale-question:${context.sellerId}:${questionId}`
     ]);
     newAlerts+=alertResult.rowCount || 0;
-    const country=({ MLM:'MX',MLB:'BR',MLC:'CL',MCO:'CO',MLA:'AR' })[String(item.site_id || '').toUpperCase()] || String(item.site_id || '');
+    const questionSiteId=String(question.site_id || item.site_id || '').toUpperCase();
+    const country=({ MLM:'MX',MLB:'BR',MLC:'CL',MCO:'CO',MLA:'AR' })[questionSiteId] || questionSiteId;
     orders.push({
       orderId:`question:${questionId}`,packId:'',displayOrderId:`售前问题 ${questionId}`,
       buyer:String(question.from?.nickname || question.from?.id || '买家'),country,
@@ -6147,7 +6156,8 @@ async function sendOrderMessageData(authUser,orderId,body = {}) {
       if (!auditResult.rows[0]) { const error=new Error('售前问题不存在或无权操作'); error.status=404; throw error; }
       const context=await getOrderStoreContext(authUser,auditResult.rows[0].storeId);
       if (!context) { const error=new Error('该售前问题所属店铺授权已失效'); error.status=403; throw error; }
-      const response=await axios.post('https://api.mercadolibre.com/answers',{
+      const answerEndpoint=productQuestionAnswerEndpoint(context.authorization);
+      const response=await axios.post(answerEndpoint,{
         question_id:Number.isSafeInteger(Number(questionId)) ? Number(questionId) : questionId,text
       },{ headers:{ Authorization:`Bearer ${context.token}`,'Content-Type':'application/json' },timeout:20000 });
       const nextRaw={ ...(auditResult.rows[0].rawData || {}),status:'ANSWERED',_answer:{
