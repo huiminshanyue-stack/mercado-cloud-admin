@@ -9,7 +9,8 @@ const { normalizeOfficialMoneyAmount,normalizeParsedOrderBilling } = require('./
 const { normalizeOfficialTrackingNumber,buildExternalTrackingUrl,collectTrackingNumberCandidates,
   isMelDistribution,chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf,
   publicOfficialTrackingNumber } = require('./order-logistics');
-const { dimensionSnapshotsDiffer } = require('./order-dimensions');
+const { dimensionSnapshotsDiffer,normalizeBillableWeight,
+  normalizeDimensionSnapshotWeights } = require('./order-dimensions');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert,
   shouldCreateShippedAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
@@ -2847,9 +2848,11 @@ async function aggregatePackedOrders(rows) {
     group.internalOrderIds.push(String(row.orderId));
     if (row.shippingId) group.shipmentIds.push(String(row.shippingId));
     group.items.push(...(Array.isArray(row.items) ? row.items : []));
-    if (row.dimensionsOriginal?.available && !group.dimensionsOriginal?.available) group.dimensionsOriginal = row.dimensionsOriginal;
+    if (row.dimensionsOriginal?.available && !group.dimensionsOriginal?.available) {
+      group.dimensionsOriginal = normalizeDimensionSnapshotWeights(row.dimensionsOriginal);
+    }
     if (row.dimensionsLatest?.available) {
-      group.dimensionsLatest = row.dimensionsLatest;
+      group.dimensionsLatest = normalizeDimensionSnapshotWeights(row.dimensionsLatest);
       group.dimensionsUpdatedAt = row.dimensionsUpdatedAt || row.dimensionsLatest.fetchedAt || null;
     }
     group.isMarked ||= Boolean(row.isMarked);
@@ -3256,11 +3259,11 @@ function buildOrderDimensionSnapshot(shipments, items) {
     const fromItem = itemDimensions(item);
     const billableWeightRaw = findBillableWeight(item?._shipping_cost_info);
     const billableWeightValue = dimensionNumber(billableWeightRaw);
-    const billableWeight = billableWeightValue === null ? null : {
+    const billableWeight = billableWeightValue === null ? null : normalizeBillableWeight({
       weight: billableWeightValue,
       weightUnit: String(billableWeightRaw?.unit || 'g'),
       source: 'shipping_options.cost.billable_weight'
-    };
+    },[fromShipment,fromItem].filter(Boolean));
     const dimensions = fromItem || fromShipment;
     return (dimensions || billableWeight) ? {
       itemId,
@@ -3274,7 +3277,7 @@ function buildOrderDimensionSnapshot(shipments, items) {
   }).filter(Boolean);
   const currentListing = itemRecords.find(item => item.listingDimensions)?.listingDimensions || null;
   const billableWeight = itemRecords.find(item => item.billableWeight)?.billableWeight || null;
-  return {
+  return normalizeDimensionSnapshotWeights({
     source: 'mercado_libre_official',
     fetchedAt: new Date().toISOString(),
     package: packageRecords[0] || null,
@@ -3287,7 +3290,7 @@ function buildOrderDimensionSnapshot(shipments, items) {
     billableWeight,
     platformReturned: currentListing || (billableWeight ? { ...billableWeight, platformWeightOnly: true } : null),
     available: Boolean(packageRecords.length || itemRecords.length)
-  };
+  });
 }
 
 async function fetchOfficialItemDetail(accessToken, itemId, marketplaceFirst = true) {

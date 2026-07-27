@@ -42,6 +42,66 @@ function normalizedDimensions(value) {
   return { sidesCm:sides,weightG:weight===null ? null : Number((weight*weightFactor).toFixed(3)) };
 }
 
+function weightInGrams(value) {
+  if (!value || typeof value!=='object') return null;
+  const weight=numericValue(value.weight);
+  if (weight===null) return null;
+  const unit=String(value.weightUnit || value.unit || 'g').trim().toLowerCase();
+  const factor=['kg','kgs','kilogram','kilograms'].includes(unit) ? 1000 :
+    (['mg','milligram','milligrams'].includes(unit) ? 0.001 :
+      (['lb','lbs','pound','pounds'].includes(unit) ? 453.59237 :
+        (['oz','ounce','ounces'].includes(unit) ? 28.349523125 : 1)));
+  return Number((weight*factor).toFixed(3));
+}
+
+function scaleRatio(left,right) {
+  if (!(left>0) || !(right>0)) return Number.POSITIVE_INFINITY;
+  return Math.max(left,right)/Math.min(left,right);
+}
+
+function normalizeBillableWeight(value,referenceValues=[]) {
+  if (!value || typeof value!=='object') return value || null;
+  const grams=weightInGrams(value);
+  const references=referenceValues.map(weightInGrams).filter(weight=>weight>0);
+  if (!(grams>=100000) || !references.length) return value;
+  const scaledGrams=grams/1000;
+  const originalRatio=Math.min(...references.map(weight=>scaleRatio(grams,weight)));
+  const scaledRatio=Math.min(...references.map(weight=>scaleRatio(scaledGrams,weight)));
+  if (originalRatio<100 || scaledRatio>4) return value;
+  return {
+    ...value,
+    weight:Number(scaledGrams.toFixed(3)),
+    weightUnit:'g',
+    unitScaleCorrected:true,
+    rawWeight:value.weight,
+    rawWeightUnit:value.weightUnit || value.unit || 'g'
+  };
+}
+
+function normalizeDimensionSnapshotWeights(snapshot) {
+  if (!snapshot || typeof snapshot!=='object') return snapshot;
+  const normalized={ ...snapshot };
+  const sourceItems=Array.isArray(snapshot.items) ? snapshot.items : [];
+  const references=[
+    snapshot.verifiedPackage,
+    snapshot.package?.dimensions,
+    snapshot.declaredAtOrder,
+    snapshot.orderRecorded,
+    snapshot.currentListing,
+    ...sourceItems.flatMap(item=>[item?.orderDimensions,item?.listingDimensions])
+  ].filter(Boolean);
+  const correctedTop=normalizeBillableWeight(snapshot.billableWeight,references);
+  if (correctedTop) normalized.billableWeight=correctedTop;
+  normalized.items=sourceItems.map(item=>{
+    if (!item || typeof item!=='object' || !item.billableWeight) return item;
+    return { ...item,billableWeight:normalizeBillableWeight(item.billableWeight,references) };
+  });
+  if (snapshot.platformReturned?.platformWeightOnly) {
+    normalized.platformReturned=normalizeBillableWeight(snapshot.platformReturned,references);
+  }
+  return normalized;
+}
+
 function dimensionSnapshotsDiffer(original,latest) {
   const declared=snapshotDeclaredValue(original);
   const verified=snapshotVerifiedValue(latest);
@@ -50,4 +110,5 @@ function dimensionSnapshotsDiffer(original,latest) {
 }
 
 module.exports={ snapshotDeclaredValue,snapshotVerifiedValue,snapshotListingValue,
-  snapshotBillableWeight,normalizedDimensions,dimensionSnapshotsDiffer };
+  snapshotBillableWeight,normalizedDimensions,dimensionSnapshotsDiffer,
+  normalizeBillableWeight,normalizeDimensionSnapshotWeights };

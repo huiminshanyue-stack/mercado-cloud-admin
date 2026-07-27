@@ -4,7 +4,8 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
 const { snapshotDeclaredValue,snapshotVerifiedValue,snapshotListingValue,
-  snapshotBillableWeight,dimensionSnapshotsDiffer }=require('../order-dimensions');
+  snapshotBillableWeight,dimensionSnapshotsDiffer,normalizeBillableWeight,
+  normalizeDimensionSnapshotWeights }=require('../order-dimensions');
 
 const declared={ length:20,width:12,height:15,weight:734,dimensionUnit:'cm',weightUnit:'g' };
 const verified={ length:12,width:15,height:20,weight:606,dimensionUnit:'cm',weightUnit:'g' };
@@ -23,6 +24,25 @@ assert.equal(dimensionSnapshotsDiffer(original,{ package:{ dimensions:{ ...decla
   '长宽高顺序变化但三边与重量相同，不应误判为平台修改');
 assert.equal(dimensionSnapshotsDiffer(original,{ items:[{ listingDimensions:listing }] }),false,
   '商品当前刊登值不能冒充订单包裹核验值');
+
+const corrected=normalizeBillableWeight({ weight:490,weightUnit:'kg',source:'shipping_options.cost.billable_weight' },[
+  { weight:458,weightUnit:'g' }
+]);
+assert.deepEqual({ weight:corrected.weight,weightUnit:corrected.weightUnit,unitScaleCorrected:corrected.unitScaleCorrected },
+  { weight:490,weightUnit:'g',unitScaleCorrected:true },
+  '同一订单中与 458g 参考值吻合的千倍单位异常应校正为 490g');
+assert.equal(normalizeBillableWeight({ weight:490,weightUnit:'kg' },[{ weight:458,weightUnit:'kg' }]).weight,490,
+  '真实大件货物的千克数值不得误改');
+const cached=normalizeDimensionSnapshotWeights({
+  available:true,
+  verifiedPackage:{ weight:458,weightUnit:'g' },
+  billableWeight:{ weight:490000,weightUnit:'g' },
+  platformReturned:{ weight:490000,weightUnit:'g',platformWeightOnly:true },
+  items:[{ billableWeight:{ weight:490000,weightUnit:'g' } }]
+});
+assert.equal(cached.billableWeight.weight,490);
+assert.equal(cached.platformReturned.weight,490);
+assert.equal(cached.items[0].billableWeight.weight,490);
 
 const serverSource=fs.readFileSync(path.join(__dirname,'..','server.js'),'utf8');
 const itemDimensionsSource=serverSource.match(/function itemDimensions\(item\) \{[\s\S]*?\n\}/)?.[0] || '';
