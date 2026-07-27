@@ -9,7 +9,7 @@ const {
   retryDelaySeconds
 }=require('../mercadolibre-webhook');
 
-assert.deepEqual([...SUPPORTED_TOPICS],['orders_v2','shipments','messages','claims']);
+assert.deepEqual([...SUPPORTED_TOPICS],['orders_v2','shipments','messages','questions','claims']);
 assert.equal(resourceId('/orders/123456789?caller.id=1'),'123456789');
 assert.equal(resourceId('/post-purchase/v1/claims/987654321'),'987654321');
 
@@ -28,6 +28,9 @@ assert.equal(event.resourceId,'123456789');
 assert.equal(event.userId,'3361645256');
 assert.equal(event.applicationId,'7654321');
 assert.equal(event.eventKey,normalizeMercadoLibreNotification({ ...payload,attempts:5 },'7654321').eventKey);
+const questionEvent=normalizeMercadoLibreNotification({ ...payload,_id:'question-1',topic:'questions',resource:'/questions/99887766' },'7654321');
+assert.equal(questionEvent.topic,'questions');
+assert.equal(questionEvent.resourceId,'99887766');
 assert.equal(normalizeMercadoLibreNotification({ ...payload,application_id:999 },'7654321'),null);
 assert.equal(normalizeMercadoLibreNotification({ ...payload,application_id:'' },'7654321'),null);
 assert.equal(normalizeMercadoLibreNotification({ ...payload,topic:'unsupported' },'7654321'),null);

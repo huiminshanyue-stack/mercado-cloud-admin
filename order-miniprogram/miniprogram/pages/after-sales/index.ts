@@ -13,7 +13,7 @@ Page({
   data:{ loading:false,claims:[] as any[],errors:[] as string[] },
   onShow() {
     this.loadData();
-    realtimeWatcher.start(state=>{ if (state.lastTopic === 'claims') return this.loadData(); });
+    realtimeWatcher.start(state=>{ if (state.lastTopic === 'claims' || state.lastTopic === 'communications') return this.loadData(); });
   },
   onHide() { realtimeWatcher.stop(); },
   onUnload() { realtimeWatcher.stop(); },

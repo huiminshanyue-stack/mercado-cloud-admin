@@ -3127,7 +3127,7 @@ app.get('/api/health/order-management', (req, res) => {
     miniProgramInquiryReply: true,
     miniProgramAfterSalesReply: true,
     officialClaimSearchUsesCurrentStoreIdentity: true,
-    mercadoLibreWebhookTopics: ['orders_v2','shipments','messages','claims'],
+    mercadoLibreWebhookTopics: ['orders_v2','shipments','messages','questions','claims'],
     persistentWebhookQueue: true,
     realtimeOrderStatePolling: true,
     wechatOfficialAccountNotifications: ['new_order','cancelled','deadline','refund','shipped','buyer_inquiry','after_sales','binding_success'],
@@ -5221,6 +5221,74 @@ app.get('/api/admin/order-profits', requireOrderAccess, async (req, res) => {
   res.json({ code: 0, data: { items: packedProfitRows, summary, exchangeRate } });
 });
 
+function mercadoLibreQuestionList(payload) {
+  const source=Array.isArray(payload) ? payload : (payload?.questions || payload?.results || payload?.data || []);
+  return Array.isArray(source) ? source : [];
+}
+
+async function fetchUnansweredProductQuestions(token,sellerIds) {
+  const responses=await Promise.all(sellerIds.map(sellerId=>axios.get('https://api.mercadolibre.com/questions/search',{
+    params:{ seller_id:sellerId,status:'UNANSWERED',sort_fields:'date_created',sort_types:'DESC',limit:50 },
+    headers:{ Authorization:`Bearer ${token}` },timeout:20000
+  }).then(response=>({ sellerId:String(sellerId),questions:mercadoLibreQuestionList(response.data) }))
+    .catch(error=>({ sellerId:String(sellerId),questions:[],error }))));
+  if (responses.length && responses.every(response=>response.error)) throw responses[0].error;
+  const unique=new Map();
+  for (const response of responses) for (const question of response.questions) {
+    const id=String(question?.id || '').trim();
+    if (id) unique.set(id,{ ...question,_seller_id:response.sellerId });
+  }
+  return [...unique.values()];
+}
+
+async function productQuestionOrders(authUser,context,marketplaceSellerIds) {
+  const questions=await fetchUnansweredProductQuestions(context.token,marketplaceSellerIds);
+  const itemIds=[...new Set(questions.map(question=>String(question.item_id || question.item?.id || '')).filter(Boolean))];
+  const itemMap=new Map();
+  for (let index=0;index<itemIds.length;index+=10) {
+    const batch=await Promise.all(itemIds.slice(index,index+10).map(itemId=>axios.get(
+      `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
+      { headers:{ Authorization:`Bearer ${context.token}` },timeout:12000 }
+    ).then(response=>[itemId,response.data || {}]).catch(()=>[itemId,{}])));
+    for (const [itemId,item] of batch) itemMap.set(itemId,item);
+  }
+  const orders=[];
+  let newAlerts=0;
+  for (const question of questions) {
+    const questionId=String(question.id),sellerId=String(question._seller_id || context.sellerId);
+    const itemId=String(question.item_id || question.item?.id || '');
+    const item=itemMap.get(itemId) || question.item || {};
+    const auditPayload={ ...question,_item:{
+      id:itemId,title:item.title || question.item?.title || `商品 ${itemId}`,
+      thumbnail:item.thumbnail || item.secure_thumbnail || question.item?.thumbnail || '',site_id:item.site_id || ''
+    } };
+    await saveOrderApiAudit(authUser.username,context.sellerId,`question:${questionId}`,'presale_question',questionId,auditPayload);
+    const alertResult=await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
+      VALUES($1,$2,'buyer_inquiry','售前咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING RETURNING id`,[
+      authUser.username,`question:${questionId}`,
+      `${auditPayload._item.title} 收到新的买家售前咨询`,`presale-question:${context.sellerId}:${questionId}`
+    ]);
+    newAlerts+=alertResult.rowCount || 0;
+    const country=({ MLM:'MX',MLB:'BR',MLC:'CL',MCO:'CO',MLA:'AR' })[String(item.site_id || '').toUpperCase()] || String(item.site_id || '');
+    orders.push({
+      orderId:`question:${questionId}`,packId:'',displayOrderId:`售前问题 ${questionId}`,
+      buyer:String(question.from?.nickname || question.from?.id || '买家'),country,
+      dateCreated:question.date_created || question.last_updated || null,storeId:context.sellerId,
+      inquiryType:'product_question',questionId,questionText:String(question.text || ''),
+      items:[{ item:{ id:itemId,title:auditPayload._item.title,thumbnail:auditPayload._item.thumbnail },quantity:1 }],
+      question:{ id:questionId,text:String(question.text || ''),message_date:question.date_created || question.last_updated,
+        from:question.from || {},inquiry_type:'product_question' }
+    });
+  }
+  const activeOrderIds=orders.map(order=>String(order.orderId));
+  await pool.query(`UPDATE order_alerts SET is_read=TRUE
+    WHERE owner_username=$1 AND alert_type='buyer_inquiry'
+      AND event_key LIKE $2 AND NOT (order_id=ANY($3::varchar[]))`,[
+    authUser.username,`presale-question:${context.sellerId}:%`,activeOrderIds
+  ]);
+  return { orders,newAlerts };
+}
+
 async function getOrderInquiriesData(authUser,query = {}) {
     const req={ authUser,query };
     const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
@@ -5263,7 +5331,7 @@ async function getOrderInquiriesData(authUser,query = {}) {
     const matchedUnreadOrders = todayPackIds.size ? unreadOrders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : unreadOrders;
 
     // “今日咨询”必须包含已经被管理员点开、但今天确实收到过买家消息的订单，不能只依赖 unread。
-    const recentResult = await pool.query(`SELECT DISTINCT ON (COALESCE(NULLIF(pack_id,''),ml_order_id)) ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND date_created >= NOW() - INTERVAL '2 days' ORDER BY COALESCE(NULLIF(pack_id,''),ml_order_id),date_created DESC LIMIT 40`, [req.authUser.username,sellerId]);
+    const recentResult = req.query.background ? { rows:[] } : await pool.query(`SELECT DISTINCT ON (COALESCE(NULLIF(pack_id,''),ml_order_id)) ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND date_created >= NOW() - INTERVAL '2 days' ORDER BY COALESCE(NULLIF(pack_id,''),ml_order_id),date_created DESC LIMIT 40`, [req.authUser.username,sellerId]);
     const conversationOrders = [];
     const conversationItems = [];
     for (let i = 0; i < recentResult.rows.length; i += 5) {
@@ -5290,18 +5358,31 @@ async function getOrderInquiriesData(authUser,query = {}) {
         conversationItems.push(...entry.messages.map(message => ({ ...message, order_id: entry.order.orderId, pack_id: entry.order.packId || entry.order.orderId })));
       }
     }
+    let productQuestions={ orders:[],newAlerts:0 };
+    let questionError='';
+    try {
+      productQuestions=await productQuestionOrders(req.authUser,context,marketplaceSellerIds);
+    } catch (error) {
+      questionError=String(error.response?.data?.message || error.message || error).slice(0,500);
+      console.warn('[Orders] 售前问题读取失败:',req.authUser.username,sellerId,error.response?.data || error.message);
+    }
     const orderMap = new Map();
     for (const order of [...matchedUnreadOrders, ...conversationOrders]) orderMap.set(String(order.packId || order.orderId), order);
+    for (const order of productQuestions.orders) orderMap.set(String(order.orderId),order);
     const itemMap = new Map();
     for (const item of [...todayItems, ...conversationItems]) itemMap.set(String(item.id || `${item.pack_id || item.order_id}:${item.message_date || item.date_created || ''}:${item.text || item.message || ''}`), item);
+    for (const order of productQuestions.orders) itemMap.set(`question:${order.questionId}`,order.question);
+    let newAlerts=Number(productQuestions.newAlerts || 0);
     for (const [messageKey, item] of itemMap) {
+      if (String(messageKey).startsWith('question:')) continue;
       const refs = messageOrderRefs(item);
       const linkedOrder = [...orderMap.values()].find(order => refs.includes(String(order.packId)) || refs.includes(String(order.orderId)));
       if (!linkedOrder) continue;
-      await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
+      const alertResult=await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING RETURNING id`,
         [req.authUser.username,String(linkedOrder.orderId),`买家 ${linkedOrder.buyer || ''} 发来新的订单咨询`,`inquiry:${sellerId}:${messageKey}`]);
+      newAlerts+=alertResult.rowCount || 0;
     }
-    return { count:itemMap.size,items:[...itemMap.values()],orders:[...orderMap.values()] };
+    return { count:itemMap.size,items:[...itemMap.values()],orders:[...orderMap.values()],newAlerts,questionError };
 }
 
 app.get('/api/admin/order-inquiries', requireOrderAccess, async (req, res) => {
@@ -5362,12 +5443,15 @@ async function getOrderAfterSalesData(authUser,query = {}) {
       }
       delete order.rawData;
     }
+    let newAlerts=0;
     for (const item of items) if (item.order) {
       await saveOrderApiAudit(req.authUser.username,sellerId,item.order.orderId,'claim',String(item.id),item);
-      await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
-        [req.authUser.username,String(item.order.orderId),`订单 ${item.order.packId || item.order.orderId} 存在待处理售后申诉`,`claim:${sellerId}:${item.id}`]);
+      const claimVersion=String(item.last_updated || item.date_created || 'opened');
+      const alertResult=await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING RETURNING id`,
+        [req.authUser.username,String(item.order.orderId),`订单 ${item.order.packId || item.order.orderId} 存在待处理售后申诉`,`claim:${sellerId}:${item.id}:${claimVersion}`]);
+      newAlerts+=alertResult.rowCount || 0;
     }
-    return { count:items.length,items,orders:items.map(item=>item.order).filter(Boolean) };
+    return { count:items.length,items,orders:items.map(item=>item.order).filter(Boolean),newAlerts };
 }
 
 app.get('/api/admin/order-after-sales', requireOrderAccess, async (req, res) => {
@@ -6007,6 +6091,26 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
 });
 
 async function getOrderMessagesData(authUser,orderId) {
+    const normalizedOrderId=String(orderId || '');
+    if (normalizedOrderId.startsWith('question:')) {
+      const questionId=normalizedOrderId.slice('question:'.length);
+      const auditResult=await pool.query(`SELECT store_user_id AS "storeId",raw_data AS "rawData"
+        FROM order_api_audits WHERE owner_username=$1 AND api_type='presale_question' AND external_id=$2 LIMIT 1`,
+      [authUser.username,questionId]);
+      if (!auditResult.rows[0]) { const error=new Error('售前问题不存在或无权查看'); error.status=404; throw error; }
+      const raw=auditResult.rows[0].rawData || {};
+      const messages=[{
+        id:`question:${questionId}`,from:raw.from || {},message_date:raw.date_created || raw.last_updated,
+        text:String(raw.text || ''),message_type:'product_question'
+      }];
+      if (raw._answer?.text) messages.push({
+        id:`answer:${questionId}`,from:{ user_id:auditResult.rows[0].storeId },
+        message_date:raw._answer.answered_at,text:String(raw._answer.text),message_type:'product_answer'
+      });
+      await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='buyer_inquiry'`,
+        [authUser.username,normalizedOrderId]);
+      return { messages };
+    }
     const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [String(orderId),authUser.username]);
     if (!rows[0]) { const error=new Error('订单不存在或无权查看'); error.status=404; throw error; }
     const context = await getOrderStoreContext(authUser,rows[0].store_user_id);
@@ -6034,6 +6138,26 @@ async function sendOrderMessageData(authUser,orderId,body = {}) {
     const text=String(body?.text || '').trim();
     if (!text) { const error=new Error('回复内容不能为空'); error.status=400; throw error; }
     if (text.length>5000) { const error=new Error('回复内容不能超过5000字'); error.status=400; throw error; }
+    const normalizedOrderId=String(orderId || '');
+    if (normalizedOrderId.startsWith('question:')) {
+      const questionId=normalizedOrderId.slice('question:'.length);
+      const auditResult=await pool.query(`SELECT store_user_id AS "storeId",raw_data AS "rawData"
+        FROM order_api_audits WHERE owner_username=$1 AND api_type='presale_question' AND external_id=$2 LIMIT 1`,
+      [authUser.username,questionId]);
+      if (!auditResult.rows[0]) { const error=new Error('售前问题不存在或无权操作'); error.status=404; throw error; }
+      const context=await getOrderStoreContext(authUser,auditResult.rows[0].storeId);
+      if (!context) { const error=new Error('该售前问题所属店铺授权已失效'); error.status=403; throw error; }
+      const response=await axios.post('https://api.mercadolibre.com/answers',{
+        question_id:Number.isSafeInteger(Number(questionId)) ? Number(questionId) : questionId,text
+      },{ headers:{ Authorization:`Bearer ${context.token}`,'Content-Type':'application/json' },timeout:20000 });
+      const nextRaw={ ...(auditResult.rows[0].rawData || {}),status:'ANSWERED',_answer:{
+        text,answered_at:new Date().toISOString(),official_response:response.data || {}
+      } };
+      await saveOrderApiAudit(authUser.username,auditResult.rows[0].storeId,normalizedOrderId,'presale_question',questionId,nextRaw);
+      await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='buyer_inquiry'`,
+        [authUser.username,normalizedOrderId]);
+      return response.data;
+    }
     const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [String(orderId),authUser.username]);
     if (!rows[0]) { const error=new Error('订单不存在或无权操作'); error.status=404; throw error; }
     const context = await getOrderStoreContext(authUser,rows[0].store_user_id);
@@ -6304,7 +6428,7 @@ let scheduledOrderSyncTimer = null;
 let scheduledOrderSyncRunning = false;
 let realtimeOrderDiscoveryTimer = null;
 let realtimeOrderDiscoveryRunning = false;
-let realtimeOrderDiscoveryState = { lastRunAt:null,storesChecked:0,missingImported:0,lastError:null };
+let realtimeOrderDiscoveryState = { lastRunAt:null,storesChecked:0,missingImported:0,communicationAlerts:0,lastError:null };
 let mercadoLibreWebhookService = null;
 let officialAccountService = null;
 
@@ -6423,9 +6547,15 @@ async function processMercadoLibreWebhookEvent(event,target) {
     if (orderId) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
       VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
     [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的买家咨询`,
-      `inquiry:${target.storeUserId}:${event.resourceId || event.id}`]);
+      `inquiry:${target.storeUserId}:${event.externalId || event.id || event.resourceId}`]);
     await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
     return { storeId:target.storeUserId,orderId,stored:true };
+  }
+
+  if (event.topic === 'questions') {
+    const result=await getOrderInquiriesData(authUser,{ storeId:target.storeUserId,background:true });
+    await touchOrderRealtimeState(pool,authUser.username,'communications',`question:${event.resourceId || ''}`);
+    return { storeId:target.storeUserId,questionId:event.resourceId || '',stored:true,newAlerts:result.newAlerts || 0 };
   }
 
   if (event.topic === 'claims') {
@@ -6439,7 +6569,7 @@ async function processMercadoLibreWebhookEvent(event,target) {
     if (orderId) await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
       VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
     [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的售后申诉`,
-      `claim:${target.storeUserId}:${event.resourceId || event.id}`]);
+      `claim:${target.storeUserId}:${event.resourceId || event.id}:${event.externalId || event.id || claim.last_updated || 'updated'}`]);
     await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
     return { storeId:target.storeUserId,orderId,stored:true };
   }
@@ -6486,7 +6616,7 @@ async function discoverLatestOfficialOrderIds(authorization) {
 async function runRealtimeOrderDiscovery() {
   if (realtimeOrderDiscoveryRunning) return;
   realtimeOrderDiscoveryRunning=true;
-  let storesChecked=0,missingImported=0,lastError=null;
+  let storesChecked=0,missingImported=0,communicationAlerts=0,lastError=null;
   try {
     const { rows:owners }=await pool.query(`SELECT DISTINCT a.owner_username,u.role
       FROM ml_store_authorizations a LEFT JOIN users u ON LOWER(u.username)=LOWER(a.owner_username)
@@ -6498,29 +6628,44 @@ async function runRealtimeOrderDiscovery() {
         storesChecked++;
         try {
           const ids=await discoverLatestOfficialOrderIds(authorization);
-          if (!ids.length) continue;
-          const local=await pool.query(`SELECT ml_order_id FROM ml_orders
-            WHERE owner_username=$1 AND store_user_id=$2 AND ml_order_id=ANY($3::varchar[])`,
-          [authUser.username,String(authorization.ml_user_id),ids]);
-          const cached=new Set(local.rows.map(row=>String(row.ml_order_id)));
-          const missing=ids.filter(id=>!cached.has(id)).slice(0,5);
-          for (const orderId of missing) {
-            const result=await syncOrdersForUser(authUser,{
-              storeId:String(authorization.ml_user_id),orderId,limit:1,automatic:true
-            });
-            await touchOrderRealtimeState(pool,authUser.username,'orders_v2',orderId);
-            missingImported++;
-            console.log('[Orders] realtime fallback imported:',authUser.username,authorization.ml_user_id,orderId,result.imported || 0);
+          if (ids.length) {
+            const local=await pool.query(`SELECT ml_order_id FROM ml_orders
+              WHERE owner_username=$1 AND store_user_id=$2 AND ml_order_id=ANY($3::varchar[])`,
+            [authUser.username,String(authorization.ml_user_id),ids]);
+            const cached=new Set(local.rows.map(row=>String(row.ml_order_id)));
+            const missing=ids.filter(id=>!cached.has(id)).slice(0,5);
+            for (const orderId of missing) {
+              const result=await syncOrdersForUser(authUser,{
+                storeId:String(authorization.ml_user_id),orderId,limit:1,automatic:true
+              });
+              await touchOrderRealtimeState(pool,authUser.username,'orders_v2',orderId);
+              missingImported++;
+              console.log('[Orders] realtime fallback imported:',authUser.username,authorization.ml_user_id,orderId,result.imported || 0);
+            }
           }
         } catch (error) {
           lastError=String(error.response?.data?.message || error.message || error).slice(0,500);
           console.error('[Orders] realtime fallback failed:',authUser.username,authorization.ml_user_id,error.response?.data || error.message);
         }
+        try {
+          const storeId=String(authorization.ml_user_id);
+          const [inquiries,afterSales]=await Promise.all([
+            getOrderInquiriesData(authUser,{ storeId,background:true }),
+            getOrderAfterSalesData(authUser,{ storeId,background:true })
+          ]);
+          const detected=Number(inquiries.newAlerts || 0)+Number(afterSales.newAlerts || 0);
+          communicationAlerts+=detected;
+          if (detected>0) await touchOrderRealtimeState(pool,authUser.username,'communications','');
+          if (inquiries.questionError) lastError=`售前咨询同步失败：${inquiries.questionError}`;
+        } catch (error) {
+          lastError=String(error.response?.data?.message || error.message || error).slice(0,500);
+          console.error('[Orders] communication fallback failed:',authUser.username,authorization.ml_user_id,error.response?.data || error.message);
+        }
       }
     }
   } finally {
     realtimeOrderDiscoveryRunning=false;
-    realtimeOrderDiscoveryState={ lastRunAt:new Date().toISOString(),storesChecked,missingImported,lastError };
+    realtimeOrderDiscoveryState={ lastRunAt:new Date().toISOString(),storesChecked,missingImported,communicationAlerts,lastError };
   }
 }
 

@@ -2,7 +2,7 @@ import { request } from './request';
 
 export interface RealtimeState {
   version: number;
-  lastTopic: 'orders_v2' | 'shipments' | 'messages' | 'claims' | '';
+  lastTopic: 'orders_v2' | 'shipments' | 'messages' | 'questions' | 'claims' | 'communications' | '';
   lastOrderId: string;
   updatedAt?: string | null;
 }

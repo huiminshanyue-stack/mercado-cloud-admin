@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 
-const SUPPORTED_TOPICS = new Set(['orders_v2','shipments','messages','claims']);
+const SUPPORTED_TOPICS = new Set(['orders_v2','shipments','messages','questions','claims']);
 const MAX_RETRIES = 8;
 const RETRY_DELAYS_SECONDS = [15,60,300,900,1800,3600,7200,14400];
 
