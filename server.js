@@ -3041,7 +3041,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-27.54',
+    version: '2026-07-27.55',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -5892,7 +5892,11 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
               const officialFinance = await normalizeParsedOrderBilling(
                 parseOrderBilling(detail,grossAmount),String(order.currency || '').toUpperCase(),getBillingFxRate
               );
-              if (!officialFinance) continue;
+              if (!officialFinance) {
+                await pool.query(`UPDATE ml_orders SET finance_last_error='official_billing_parse_pending'
+                  WHERE owner_username=$1 AND ml_order_id=$2`,[authUser.username,String(order.ml_order_id)]);
+                continue;
+              }
               const paymentOfficialNet=await normalizeOfficialPaymentNet(order.raw_data?.payments,
                 String(order.currency || '').toUpperCase(),order.raw_data?.site_id,grossAmount,officialFinance);
               const payoutResolution = resolveOfficialOrderPayout({
@@ -5913,6 +5917,11 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
                 finance_synced_at=NOW(),finance_last_error=NULL,updated_at=NOW()
                 WHERE owner_username=$7 AND ml_order_id=$8`,
                 [officialFinance.saleFee,officialFinance.shippingFee,officialFinance.otherFee,netAmount,netAmountUsd,JSON.stringify(detail),authUser.username,String(order.ml_order_id)]);
+              if (netAmountUsd === null) await pool.query(`UPDATE ml_orders SET finance_last_error=$1
+                WHERE owner_username=$2 AND ml_order_id=$3`,[
+                netAmount === null ? 'official_payout_pending' : 'official_fx_rate_pending',
+                authUser.username,String(order.ml_order_id)
+              ]);
               await saveOrderApiAudit(authUser.username,storeUserId,String(order.ml_order_id),'billing_backfill',String(order.ml_order_id),detail);
             }
           } catch (error) {
