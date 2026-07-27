@@ -284,6 +284,9 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS billing_data JSONB NOT NULL DEFAULT \'{}\'::jsonb');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_is_official BOOLEAN NOT NULL DEFAULT FALSE');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_synced_at TIMESTAMPTZ');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_last_attempt_at TIMESTAMPTZ');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_attempt_count INTEGER NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS finance_last_error VARCHAR(500)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_store ON ml_orders(store_user_id, date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_owner_date ON ml_orders(owner_username,date_created DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_ml_orders_buyer ON ml_orders(buyer_nickname, date_created DESC)');
@@ -3038,7 +3041,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-27.53',
+    version: '2026-07-27.54',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3100,6 +3103,8 @@ app.get('/api/health/order-management', (req, res) => {
     melOpaqueTrackingHiddenUntilResolved: true,
     preserveCachedOfficialPayout: true,
     backgroundOfficialPayoutBackfill: true,
+    automaticPendingPayoutRetry: true,
+    pendingPayoutRetryPolicy: '2m-10m-60m',
     officialLargeProductImages: true,
     reversalSafeOfficialPayout: true,
     cachedPayoutAggregationOnly: true,
@@ -5837,7 +5842,7 @@ function wakeMelPublicTrackingBackfill() {
 const payoutBackfillRunning = new Set();
 function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
   const key = `${String(authUser.username).toLowerCase()}:${storeUserId}`;
-  if (payoutBackfillRunning.has(key)) return;
+  if (payoutBackfillRunning.has(key)) return false;
   payoutBackfillRunning.add(key);
   setImmediate(async () => {
     try {
@@ -5849,6 +5854,13 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
             AND net_amount_usd<>0
           )
         )
+        AND (
+          finance_last_attempt_at IS NULL OR finance_last_attempt_at <= NOW() - CASE
+            WHEN finance_attempt_count < 3 THEN INTERVAL '2 minutes'
+            WHEN finance_attempt_count < 12 THEN INTERVAL '10 minutes'
+            ELSE INTERVAL '1 hour'
+          END
+        )
         ORDER BY date_created DESC LIMIT 200`,[authUser.username,String(storeUserId)]);
       const groups = new Map();
       for (const order of pending.rows) {
@@ -5859,15 +5871,23 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
       for (const [localSellerId,orders] of groups) {
         for (let index = 0; index < orders.length; index += 60) {
           const batch = orders.slice(index,index + 60);
+          const batchIds = batch.map(order => String(order.ml_order_id));
+          await pool.query(`UPDATE ml_orders SET finance_last_attempt_at=NOW(),
+            finance_attempt_count=finance_attempt_count+1,finance_last_error=NULL
+            WHERE owner_username=$1 AND ml_order_id=ANY($2::varchar[])`,[authUser.username,batchIds]);
           try {
             const response = await axios.get('https://api.mercadolibre.com/billing/integration/group/ML/order/details', {
-              params: { order_ids: batch.map(order => order.ml_order_id).join(','), seller_id: localSellerId },
+              params: { order_ids: batchIds.join(','), seller_id: localSellerId },
               headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000
             });
             const details = new Map((response.data?.results || []).map(detail => [String(detail.order_id),detail]));
             for (const order of batch) {
               const detail = details.get(String(order.ml_order_id));
-              if (!detail) continue;
+              if (!detail) {
+                await pool.query(`UPDATE ml_orders SET finance_last_error='official_billing_detail_pending'
+                  WHERE owner_username=$1 AND ml_order_id=$2`,[authUser.username,String(order.ml_order_id)]);
+                continue;
+              }
               const grossAmount = Number(order.paid_amount || 0), refundAmount = Number(order.refund_amount || 0);
               const officialFinance = await normalizeParsedOrderBilling(
                 parseOrderBilling(detail,grossAmount),String(order.currency || '').toUpperCase(),getBillingFxRate
@@ -5890,11 +5910,15 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
               const netAmountUsd = netAmount === null || usdRate === null ? null : Number((netAmount * usdRate).toFixed(2));
               await pool.query(`UPDATE ml_orders SET sale_fee=$1,shipping_fee=$2,other_fee=$3,net_amount=$4,
                 net_amount_usd=$5,billing_data=$6::jsonb,finance_is_official=TRUE,
-                finance_synced_at=NOW(),updated_at=NOW() WHERE owner_username=$7 AND ml_order_id=$8`,
+                finance_synced_at=NOW(),finance_last_error=NULL,updated_at=NOW()
+                WHERE owner_username=$7 AND ml_order_id=$8`,
                 [officialFinance.saleFee,officialFinance.shippingFee,officialFinance.otherFee,netAmount,netAmountUsd,JSON.stringify(detail),authUser.username,String(order.ml_order_id)]);
               await saveOrderApiAudit(authUser.username,storeUserId,String(order.ml_order_id),'billing_backfill',String(order.ml_order_id),detail);
             }
           } catch (error) {
+            const reason=String(error.response?.data?.message || error.response?.status || error.message || 'billing_backfill_failed').slice(0,500);
+            await pool.query(`UPDATE ml_orders SET finance_last_error=$1
+              WHERE owner_username=$2 AND ml_order_id=ANY($3::varchar[])`,[reason,authUser.username,batchIds]);
             console.warn('[Orders] 历史应回款补抓失败:', localSellerId, error.response?.status || error.message);
           }
         }
@@ -5903,6 +5927,7 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
       payoutBackfillRunning.delete(key);
     }
   });
+  return true;
 }
 
 app.get('/api/admin/orders/:orderId/logistics', requireOrderAccess, async (req, res) => {
@@ -6438,7 +6463,7 @@ let scheduledOrderSyncTimer = null;
 let scheduledOrderSyncRunning = false;
 let realtimeOrderDiscoveryTimer = null;
 let realtimeOrderDiscoveryRunning = false;
-let realtimeOrderDiscoveryState = { lastRunAt:null,storesChecked:0,missingImported:0,communicationAlerts:0,lastError:null };
+let realtimeOrderDiscoveryState = { lastRunAt:null,storesChecked:0,missingImported:0,communicationAlerts:0,payoutBackfillsQueued:0,lastError:null };
 let mercadoLibreWebhookService = null;
 let officialAccountService = null;
 
@@ -6626,7 +6651,7 @@ async function discoverLatestOfficialOrderIds(authorization) {
 async function runRealtimeOrderDiscovery() {
   if (realtimeOrderDiscoveryRunning) return;
   realtimeOrderDiscoveryRunning=true;
-  let storesChecked=0,missingImported=0,communicationAlerts=0,lastError=null;
+  let storesChecked=0,missingImported=0,communicationAlerts=0,payoutBackfillsQueued=0,lastError=null;
   try {
     const { rows:owners }=await pool.query(`SELECT DISTINCT a.owner_username,u.role
       FROM ml_store_authorizations a LEFT JOIN users u ON LOWER(u.username)=LOWER(a.owner_username)
@@ -6658,6 +6683,15 @@ async function runRealtimeOrderDiscovery() {
           console.error('[Orders] realtime fallback failed:',authUser.username,authorization.ml_user_id,error.response?.data || error.message);
         }
         try {
+          const accessToken=await getStoreAuthorizationToken(authorization);
+          if (accessToken && queuePendingOfficialPayoutBackfill(
+            authUser,String(authorization.ml_user_id),accessToken
+          )) payoutBackfillsQueued++;
+        } catch (error) {
+          lastError=String(error.response?.data?.message || error.message || error).slice(0,500);
+          console.error('[Orders] payout retry scheduling failed:',authUser.username,authorization.ml_user_id,error.response?.data || error.message);
+        }
+        try {
           const storeId=String(authorization.ml_user_id);
           const [inquiries,afterSales]=await Promise.all([
             getOrderInquiriesData(authUser,{ storeId,background:true }),
@@ -6675,7 +6709,7 @@ async function runRealtimeOrderDiscovery() {
     }
   } finally {
     realtimeOrderDiscoveryRunning=false;
-    realtimeOrderDiscoveryState={ lastRunAt:new Date().toISOString(),storesChecked,missingImported,communicationAlerts,lastError };
+    realtimeOrderDiscoveryState={ lastRunAt:new Date().toISOString(),storesChecked,missingImported,communicationAlerts,payoutBackfillsQueued,lastError };
   }
 }
 
