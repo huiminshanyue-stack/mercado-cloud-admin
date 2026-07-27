@@ -6304,6 +6304,7 @@ let scheduledOrderSyncTimer = null;
 let scheduledOrderSyncRunning = false;
 let realtimeOrderDiscoveryTimer = null;
 let realtimeOrderDiscoveryRunning = false;
+let realtimeOrderDiscoveryState = { lastRunAt:null,storesChecked:0,missingImported:0,lastError:null };
 let mercadoLibreWebhookService = null;
 let officialAccountService = null;
 
@@ -6485,6 +6486,7 @@ async function discoverLatestOfficialOrderIds(authorization) {
 async function runRealtimeOrderDiscovery() {
   if (realtimeOrderDiscoveryRunning) return;
   realtimeOrderDiscoveryRunning=true;
+  let storesChecked=0,missingImported=0,lastError=null;
   try {
     const { rows:owners }=await pool.query(`SELECT DISTINCT a.owner_username,u.role
       FROM ml_store_authorizations a LEFT JOIN users u ON LOWER(u.username)=LOWER(a.owner_username)
@@ -6493,6 +6495,7 @@ async function runRealtimeOrderDiscovery() {
       const authUser={ username:owner.owner_username,role:owner.role || 'user' };
       const authorizations=await listOrderStoreAuthorizations(authUser);
       for (const authorization of authorizations) {
+        storesChecked++;
         try {
           const ids=await discoverLatestOfficialOrderIds(authorization);
           if (!ids.length) continue;
@@ -6506,15 +6509,18 @@ async function runRealtimeOrderDiscovery() {
               storeId:String(authorization.ml_user_id),orderId,limit:1,automatic:true
             });
             await touchOrderRealtimeState(pool,authUser.username,'orders_v2',orderId);
+            missingImported++;
             console.log('[Orders] realtime fallback imported:',authUser.username,authorization.ml_user_id,orderId,result.imported || 0);
           }
         } catch (error) {
+          lastError=String(error.response?.data?.message || error.message || error).slice(0,500);
           console.error('[Orders] realtime fallback failed:',authUser.username,authorization.ml_user_id,error.response?.data || error.message);
         }
       }
     }
   } finally {
     realtimeOrderDiscoveryRunning=false;
+    realtimeOrderDiscoveryState={ lastRunAt:new Date().toISOString(),storesChecked,missingImported,lastError };
   }
 }
 
@@ -6525,6 +6531,11 @@ function startRealtimeOrderDiscovery() {
   realtimeOrderDiscoveryTimer=setInterval(tick,60000);
   realtimeOrderDiscoveryTimer.unref?.();
 }
+
+app.get('/api/health/order-realtime',(req,res) => res.json({ code:0,data:{
+  enabled:Boolean(realtimeOrderDiscoveryTimer),running:realtimeOrderDiscoveryRunning,
+  intervalSeconds:60,latestIdsPerStore:10,...realtimeOrderDiscoveryState
+} }));
 
 function nextBeijingOrderSyncAt(nowMs = Date.now()) {
   const beijingNow = new Date(nowMs + 8 * 3600000);
