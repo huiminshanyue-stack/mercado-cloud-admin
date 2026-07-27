@@ -30,6 +30,19 @@ function normalizeMercadoLibreNotification(payload,expectedApplicationId = '') {
   };
 }
 
+function rejectionReason(payload,expectedApplicationId = '') {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return 'invalid_payload';
+  const topic=String(payload.topic || '').trim().toLowerCase();
+  const resource=String(payload.resource || '').trim();
+  const userId=String(payload.user_id || payload.userId || '').trim();
+  const applicationId=String(payload.application_id || payload.applicationId || '').trim();
+  if (!SUPPORTED_TOPICS.has(topic)) return `unsupported_topic:${topic || 'empty'}`;
+  if (!resource) return 'missing_resource';
+  if (!userId) return 'missing_user_id';
+  if (expectedApplicationId && applicationId !== String(expectedApplicationId)) return 'application_id_mismatch';
+  return 'unknown';
+}
+
 function retryDelaySeconds(retryCount) {
   return RETRY_DELAYS_SECONDS[Math.min(Math.max(0,retryCount-1),RETRY_DELAYS_SECONDS.length-1)];
 }
@@ -70,7 +83,14 @@ function createMercadoLibreWebhookService({ pool,expectedApplicationId,resolveTa
 
   async function enqueue(payload) {
     const event=normalizeMercadoLibreNotification(payload,expectedApplicationId);
-    if (!event) return { accepted:false };
+    if (!event) {
+      const reason=rejectionReason(payload,expectedApplicationId);
+      logger.warn('[Webhook] ignored notification:',{
+        topic:String(payload?.topic || '').slice(0,50),reason,
+        hasResource:Boolean(payload?.resource),hasUserId:Boolean(payload?.user_id || payload?.userId)
+      });
+      return { accepted:false,reason };
+    }
     const { rowCount }=await pool.query(`INSERT INTO ml_webhook_events
       (event_key,external_id,topic,resource,resource_id,user_id,application_id,official_attempts,payload,sent_at)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
@@ -156,16 +176,33 @@ function createMercadoLibreWebhookService({ pool,expectedApplicationId,resolveTa
         res.status(503).json({ code:503,message:'queue unavailable' });
       }
     });
-    app.get('/api/health/mercadolibre-webhook',(req,res) => res.json({ code:0,data:{
-      enabled:Boolean(expectedApplicationId),topics:[...SUPPORTED_TOPICS],queueRunning:Boolean(timer) && !stopped,
-      processing:running,callback:'/api/webhooks/mercadolibre'
-    } }));
+    app.get('/api/health/mercadolibre-webhook',async (req,res) => {
+      try {
+        // Keep this diagnostic intentionally aggregate-only: it never returns a
+        // resource, user id, token, or payload.  It lets us distinguish “ML did
+        // not call us” from “the worker received but could not process it”.
+        const { rows }=await pool.query(`SELECT
+          COUNT(*) FILTER (WHERE status IN ('pending','retry','processing'))::int AS queued,
+          COUNT(*) FILTER (WHERE status='failed')::int AS failed,
+          MAX(received_at) AS "lastReceivedAt",
+          MAX(processed_at) FILTER (WHERE status='done') AS "lastProcessedAt",
+          MAX(updated_at) FILTER (WHERE status='processing') AS "lastProcessingAt",
+          MAX(last_error) FILTER (WHERE status IN ('retry','failed')) AS "lastError"
+          FROM ml_webhook_events`);
+        res.json({ code:0,data:{
+          enabled:Boolean(expectedApplicationId),topics:[...SUPPORTED_TOPICS],queueRunning:Boolean(timer) && !stopped,
+          processing:running,callback:'/api/webhooks/mercadolibre',queue:rows[0] || {}
+        } });
+      } catch (error) {
+        res.status(503).json({ code:503,message:'webhook health unavailable' });
+      }
+    });
   }
 
   return { init,enqueue,run,start,stop,registerRoutes };
 }
 
 module.exports={
-  SUPPORTED_TOPICS,normalizeMercadoLibreNotification,resourceId,retryDelaySeconds,
+  SUPPORTED_TOPICS,normalizeMercadoLibreNotification,rejectionReason,resourceId,retryDelaySeconds,
   touchOrderRealtimeState,getOrderRealtimeState,createMercadoLibreWebhookService
 };

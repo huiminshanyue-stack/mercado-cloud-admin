@@ -4,6 +4,7 @@ const assert=require('node:assert/strict');
 const {
   SUPPORTED_TOPICS,
   normalizeMercadoLibreNotification,
+  rejectionReason,
   resourceId,
   retryDelaySeconds
 }=require('../mercadolibre-webhook');
@@ -31,6 +32,9 @@ assert.equal(normalizeMercadoLibreNotification({ ...payload,application_id:999 }
 assert.equal(normalizeMercadoLibreNotification({ ...payload,application_id:'' },'7654321'),null);
 assert.equal(normalizeMercadoLibreNotification({ ...payload,topic:'unsupported' },'7654321'),null);
 assert.equal(normalizeMercadoLibreNotification({ ...payload,resource:'' },'7654321'),null);
+assert.equal(rejectionReason({ ...payload,application_id:999 },'7654321'),'application_id_mismatch');
+assert.equal(rejectionReason({ ...payload,topic:'items' },'7654321'),'unsupported_topic:items');
+assert.equal(rejectionReason({ ...payload,resource:'' },'7654321'),'missing_resource');
 
 assert.equal(retryDelaySeconds(1),15);
 assert.equal(retryDelaySeconds(2),60);

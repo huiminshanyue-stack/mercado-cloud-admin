@@ -6302,6 +6302,8 @@ app.get('/api/health', async (req, res) => {
 // ========== 订单定时同步（北京时间 00:00 / 12:00） ==========
 let scheduledOrderSyncTimer = null;
 let scheduledOrderSyncRunning = false;
+let realtimeOrderDiscoveryTimer = null;
+let realtimeOrderDiscoveryRunning = false;
 let mercadoLibreWebhookService = null;
 let officialAccountService = null;
 
@@ -6452,6 +6454,78 @@ app.get('/api/admin/orders/realtime-state',requireOrderAccess,async (req,res) =>
   catch (error) { res.status(500).json({ code:500,message:error.message || 'Failed to read realtime order state' }); }
 });
 
+async function discoverLatestOfficialOrderIds(authorization) {
+  const accessToken=await getStoreAuthorizationToken(authorization);
+  if (!accessToken) return [];
+  const sellerId=String(authorization.ml_user_id || '');
+  const account=await axios.get('https://api.mercadolibre.com/users/me',{
+    headers:{ Authorization:`Bearer ${accessToken}` },timeout:15000
+  });
+  const me=account.data || {};
+  if (String(me.site_id || '').toUpperCase() === 'CBT') {
+    const response=await axios.get('https://api.mercadolibre.com/marketplace/orders/search',{
+      params:{ sort:'date_desc',limit:10,offset:0 },
+      headers:{ Authorization:`Bearer ${accessToken}` },timeout:20000
+    });
+    return [...new Set((response.data?.results || []).flatMap(pack =>
+      (pack?.orders || []).map(order=>String(order?.id || '')).filter(Boolean)
+    ))];
+  }
+  const response=await axios.get('https://api.mercadolibre.com/orders/search',{
+    params:{ seller:String(me.id || sellerId),sort:'date_desc',limit:10,offset:0 },
+    headers:{ Authorization:`Bearer ${accessToken}` },timeout:20000
+  });
+  return [...new Set((response.data?.results || []).map(order=>String(order?.id || '')).filter(Boolean))];
+}
+
+// Webhooks remain the primary real-time path. Mercado Libre can occasionally
+// omit/delay a callback, so this bounded discovery pass only reads the latest
+// ten official ids and imports ids that are not cached yet. It does not run a
+// full 50-order synchronization and therefore keeps server/API load predictable.
+async function runRealtimeOrderDiscovery() {
+  if (realtimeOrderDiscoveryRunning) return;
+  realtimeOrderDiscoveryRunning=true;
+  try {
+    const { rows:owners }=await pool.query(`SELECT DISTINCT a.owner_username,u.role
+      FROM ml_store_authorizations a LEFT JOIN users u ON LOWER(u.username)=LOWER(a.owner_username)
+      WHERE a.enabled=TRUE AND (u.role='admin' OR UPPER(a.owner_username)='CNTORO')`);
+    for (const owner of owners) {
+      const authUser={ username:owner.owner_username,role:owner.role || 'user' };
+      const authorizations=await listOrderStoreAuthorizations(authUser);
+      for (const authorization of authorizations) {
+        try {
+          const ids=await discoverLatestOfficialOrderIds(authorization);
+          if (!ids.length) continue;
+          const local=await pool.query(`SELECT ml_order_id FROM ml_orders
+            WHERE owner_username=$1 AND store_user_id=$2 AND ml_order_id=ANY($3::varchar[])`,
+          [authUser.username,String(authorization.ml_user_id),ids]);
+          const cached=new Set(local.rows.map(row=>String(row.ml_order_id)));
+          const missing=ids.filter(id=>!cached.has(id)).slice(0,5);
+          for (const orderId of missing) {
+            const result=await syncOrdersForUser(authUser,{
+              storeId:String(authorization.ml_user_id),orderId,limit:1,automatic:true
+            });
+            await touchOrderRealtimeState(pool,authUser.username,'orders_v2',orderId);
+            console.log('[Orders] realtime fallback imported:',authUser.username,authorization.ml_user_id,orderId,result.imported || 0);
+          }
+        } catch (error) {
+          console.error('[Orders] realtime fallback failed:',authUser.username,authorization.ml_user_id,error.response?.data || error.message);
+        }
+      }
+    }
+  } finally {
+    realtimeOrderDiscoveryRunning=false;
+  }
+}
+
+function startRealtimeOrderDiscovery() {
+  if (realtimeOrderDiscoveryTimer) return;
+  const tick=()=>runRealtimeOrderDiscovery().catch(error=>console.error('[Orders] realtime fallback error:',error.message));
+  setTimeout(tick,10000).unref?.();
+  realtimeOrderDiscoveryTimer=setInterval(tick,60000);
+  realtimeOrderDiscoveryTimer.unref?.();
+}
+
 function nextBeijingOrderSyncAt(nowMs = Date.now()) {
   const beijingNow = new Date(nowMs + 8 * 3600000);
   const year = beijingNow.getUTCFullYear(), month = beijingNow.getUTCMonth(), day = beijingNow.getUTCDate();
@@ -6536,11 +6610,13 @@ async function start() {
   });
   mercadoLibreWebhookService.start();
   officialAccountService.start();
+  startRealtimeOrderDiscovery();
   scheduleMelPublicTrackingBackfill(3000);
   scheduleNextOrderSync();
   const shutdown = signal => {
     console.log(`[Server] ${signal} received, closing gracefully`);
     if (scheduledOrderSyncTimer) clearTimeout(scheduledOrderSyncTimer);
+    if (realtimeOrderDiscoveryTimer) clearInterval(realtimeOrderDiscoveryTimer);
     if (melTrackingBackfillTimer) clearTimeout(melTrackingBackfillTimer);
     mercadoLibreWebhookService?.stop();
     officialAccountService?.stop();
