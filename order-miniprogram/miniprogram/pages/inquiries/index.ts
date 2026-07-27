@@ -7,7 +7,8 @@ const realtimeWatcher=createRealtimeWatcher();
 function normalize(order:any,storeNames:Map<string,string>) {
   const item=order.items?.[0]?.item || {},country=countryInfo(order.country);
   const isProductQuestion=order.inquiryType === 'product_question';
-  return { ...order,isProductQuestion,key:String(order.orderId),displayOrderId:isProductQuestion ? `售前问题 ${order.questionId}` : String(order.packId || order.orderId),storeName:storeNames.get(String(order.storeId)) || '授权店铺',countryText:`${country.flag} ${country.name}`,dateText:formatDate(order.dateCreated),productTitle:item.title || '商品信息待获取',productImage:item.picture_url || item.thumbnail || '' };
+  const productImage=String(item.picture_url || item.secure_thumbnail || item.thumbnail || '').replace(/^http:/i,'https:');
+  return { ...order,isProductQuestion,key:String(order.orderId),displayOrderId:isProductQuestion ? `售前问题 ${order.questionId}` : String(order.packId || order.orderId),storeName:storeNames.get(String(order.storeId)) || '授权店铺',countryText:`${country.flag} ${country.name}`,dateText:formatDate(order.dateCreated),productTitle:item.title || '商品信息待获取',productImage };
 }
 
 Page({

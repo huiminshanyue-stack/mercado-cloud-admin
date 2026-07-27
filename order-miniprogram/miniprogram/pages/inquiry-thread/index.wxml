@@ -1,5 +1,5 @@
 <view class="thread-page">
-  <view class="thread-head">订单 {{orderNo}}</view>
+  <view class="thread-head">{{threadLabel}} {{orderNo}}</view>
   <scroll-view class="messages" scroll-y enhanced>
     <view wx:if="{{loading}}" class="empty">正在读取咨询记录…</view>
     <view wx:elif="{{!messages.length}}" class="empty">美客多暂未返回可显示的咨询</view>

@@ -5236,11 +5236,11 @@ function mercadoLibreQuestionList(payload) {
   return Array.isArray(source) ? source : [];
 }
 
-async function fetchUnansweredProductQuestions(token,sellerIds,useGlobalSellingApi = false) {
+async function fetchProductQuestions(token,sellerIds,useGlobalSellingApi = false,status = 'UNANSWERED') {
   const endpoint=productQuestionSearchEndpoint({ site_id:useGlobalSellingApi ? 'CBT' : '' });
   const targetSellerIds=useGlobalSellingApi ? sellerIds.slice(0,1) : sellerIds;
   const responses=await Promise.all(targetSellerIds.map(sellerId=>axios.get(endpoint,{
-    params:{ seller_id:sellerId,status:'UNANSWERED',sort_fields:'date_created',sort_types:'DESC',limit:50,
+    params:{ seller_id:sellerId,status,sort_fields:'date_created',sort_types:'DESC',limit:50,
       ...(useGlobalSellingApi ? {} : { api_version:4 }) },
     headers:{ Authorization:`Bearer ${token}` },timeout:20000
   }).then(response=>({ sellerId:String(sellerId),questions:mercadoLibreQuestionList(response.data) }))
@@ -5256,17 +5256,53 @@ async function fetchUnansweredProductQuestions(token,sellerIds,useGlobalSellingA
 
 async function productQuestionOrders(authUser,context,marketplaceSellerIds) {
   const useGlobalSellingApi=isGlobalSellingAuthorization(context.authorization);
-  const questions=await fetchUnansweredProductQuestions(
-    context.token,useGlobalSellingApi ? [String(context.sellerId)] : marketplaceSellerIds,useGlobalSellingApi
-  );
+  const targetSellerIds=useGlobalSellingApi ? [String(context.sellerId)] : marketplaceSellerIds;
+  const [questions,answeredQuestions]=await Promise.all([
+    fetchProductQuestions(context.token,targetSellerIds,useGlobalSellingApi,'UNANSWERED'),
+    fetchProductQuestions(context.token,targetSellerIds,useGlobalSellingApi,'ANSWERED').catch(error=>{
+      console.warn('[Orders] answered product question sync failed:',authUser.username,context.sellerId,error.response?.data || error.message);
+      return [];
+    })
+  ]);
+  const answeredIds=answeredQuestions.map(question=>String(question.id || '')).filter(Boolean);
+  const answeredAuditResult=answeredIds.length ? await pool.query(`SELECT external_id AS id,raw_data AS "rawData"
+    FROM order_api_audits WHERE owner_username=$1 AND api_type='presale_question'
+      AND external_id=ANY($2::varchar[])`,[authUser.username,answeredIds]) : { rows:[] };
+  const answeredAuditMap=new Map(answeredAuditResult.rows.map(row=>[String(row.id),row.rawData || {}]));
   const itemIds=[...new Set(questions.map(question=>String(question.item_id || question.item?.id || '')).filter(Boolean))];
   const itemMap=new Map();
   for (let index=0;index<itemIds.length;index+=10) {
-    const batch=await Promise.all(itemIds.slice(index,index+10).map(itemId=>axios.get(
-      `https://api.mercadolibre.com/items/${encodeURIComponent(itemId)}`,
-      { headers:{ Authorization:`Bearer ${context.token}` },timeout:12000 }
-    ).then(response=>[itemId,response.data || {}]).catch(()=>[itemId,{}])));
+    const batch=await Promise.all(itemIds.slice(index,index+10).map(async itemId=>{
+      const paths=useGlobalSellingApi ? [`marketplace/items/${itemId}`,`items/${itemId}`] : [`items/${itemId}`,`marketplace/items/${itemId}`];
+      for (const path of paths) {
+        try {
+          const response=await axios.get(`https://api.mercadolibre.com/${path}`,{
+            headers:{ Authorization:`Bearer ${context.token}` },timeout:12000
+          });
+          return [itemId,response.data || {}];
+        } catch (_) { /* Try the alternate official item endpoint. */ }
+      }
+      return [itemId,{}];
+    }));
     for (const [itemId,item] of batch) itemMap.set(itemId,item);
+  }
+  for (const question of answeredQuestions) {
+    const questionId=String(question.id),itemId=String(question.item_id || question.item?.id || '');
+    const previous=answeredAuditMap.get(questionId) || {};
+    const questionItem=question.item || {};
+    const rawThumbnail=previous._item?.thumbnail || questionItem.picture_url || questionItem.secure_thumbnail || questionItem.thumbnail || '';
+    const officialAnswer=question.answer || (Array.isArray(question.answers) ? question.answers[0] : null);
+    const auditPayload={ ...previous,...question,_item:{
+      ...(previous._item || {}),id:itemId,title:previous._item?.title || questionItem.title || `商品 ${itemId}`,
+      thumbnail:String(rawThumbnail || '').replace(/^http:/i,'https:'),site_id:previous._item?.site_id || question.site_id || ''
+    },...(officialAnswer?.text ? { _answer:{
+      text:String(officialAnswer.text),answered_at:officialAnswer.date_created || question.last_updated || null,
+      official_response:officialAnswer
+    } } : (previous._answer ? { _answer:previous._answer } : {})) };
+    await saveOrderApiAudit(authUser.username,context.sellerId,`question:${questionId}`,'presale_question',questionId,auditPayload);
+    await pool.query(`UPDATE order_alerts SET is_read=TRUE
+      WHERE owner_username=$1 AND order_id=$2 AND alert_type='buyer_inquiry'`,
+    [authUser.username,`question:${questionId}`]);
   }
   const orders=[];
   let newAlerts=0;
@@ -5274,9 +5310,14 @@ async function productQuestionOrders(authUser,context,marketplaceSellerIds) {
     const questionId=String(question.id),sellerId=String(question._seller_id || context.sellerId);
     const itemId=String(question.item_id || question.item?.id || '');
     const item=itemMap.get(itemId) || question.item || {};
+    const rawThumbnail=item.pictures?.[0]?.secure_url || item.pictures?.[0]?.url || item.picture_url ||
+      item.secure_thumbnail || item.thumbnail || question.item?.pictures?.[0]?.secure_url ||
+      question.item?.pictures?.[0]?.url || question.item?.picture_url || question.item?.secure_thumbnail ||
+      question.item?.thumbnail || '';
+    const thumbnail=String(rawThumbnail || '').replace(/^http:/i,'https:');
     const auditPayload={ ...question,_item:{
       id:itemId,title:item.title || question.item?.title || `商品 ${itemId}`,
-      thumbnail:item.thumbnail || item.secure_thumbnail || question.item?.thumbnail || '',site_id:item.site_id || ''
+      thumbnail,site_id:item.site_id || ''
     } };
     await saveOrderApiAudit(authUser.username,context.sellerId,`question:${questionId}`,'presale_question',questionId,auditPayload);
     const alertResult=await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
@@ -5292,7 +5333,7 @@ async function productQuestionOrders(authUser,context,marketplaceSellerIds) {
       buyer:String(question.from?.nickname || question.from?.id || '买家'),country,
       dateCreated:question.date_created || question.last_updated || null,storeId:context.sellerId,
       inquiryType:'product_question',questionId,questionText:String(question.text || ''),
-      items:[{ item:{ id:itemId,title:auditPayload._item.title,thumbnail:auditPayload._item.thumbnail },quantity:1 }],
+      items:[{ item:{ id:itemId,title:auditPayload._item.title,thumbnail,picture_url:thumbnail },quantity:1 }],
       question:{ id:questionId,text:String(question.text || ''),message_date:question.date_created || question.last_updated,
         from:question.from || {},inquiry_type:'product_question' }
     });
@@ -5346,6 +5387,34 @@ async function getOrderInquiriesData(authUser,query = {}) {
     });
     const todayPackIds = new Set(todayItems.flatMap(messageOrderRefs));
     const matchedUnreadOrders = todayPackIds.size ? unreadOrders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : unreadOrders;
+
+    // Cache complete active inquiry threads in the background, including seller replies made
+    // directly in Mercado Libre. Pending counters still come from the official unread response.
+    if (req.query.background) {
+      const activeInquiryResult=await pool.query(`SELECT DISTINCT ON (o.ml_order_id)
+        o.ml_order_id AS "orderId",o.pack_id AS "packId",o.store_user_id AS "storeId"
+        FROM order_alerts a JOIN ml_orders o
+          ON o.owner_username=a.owner_username AND o.ml_order_id=a.order_id
+        WHERE a.owner_username=$1 AND o.store_user_id=$2 AND a.alert_type='buyer_inquiry'
+          AND a.is_read=FALSE AND a.created_at >= NOW() - INTERVAL '30 days'
+        ORDER BY o.ml_order_id,a.created_at DESC LIMIT 20`,[req.authUser.username,sellerId]);
+      const threads=[...new Map([...matchedUnreadOrders,...activeInquiryResult.rows]
+        .map(order=>[String(order.packId || order.orderId),order])).values()];
+      for (let index=0;index<threads.length;index+=5) {
+        await Promise.all(threads.slice(index,index+5).map(async order=>{
+          const packId=String(order.packId || order.orderId || '');
+          if (!packId) return;
+          try {
+            const response=await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`,{
+              headers:{ Authorization:`Bearer ${token}` },timeout:12000
+            });
+            await saveOrderApiAudit(req.authUser.username,sellerId,String(order.orderId),'order_messages',packId,response.data);
+          } catch (error) {
+            console.warn('[Orders] background inquiry thread sync failed:',req.authUser.username,packId,error.response?.status || error.message);
+          }
+        }));
+      }
+    }
 
     // “今日咨询”必须包含已经被管理员点开、但今天确实收到过买家消息的订单，不能只依赖 unread。
     const recentResult = req.query.background ? { rows:[] } : await pool.query(`SELECT DISTINCT ON (COALESCE(NULLIF(pack_id,''),ml_order_id)) ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId" FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND date_created >= NOW() - INTERVAL '2 days' ORDER BY COALESCE(NULLIF(pack_id,''),ml_order_id),date_created DESC LIMIT 40`, [req.authUser.username,sellerId]);
@@ -5442,6 +5511,31 @@ async function getOrderAfterSalesData(authUser,query = {}) {
     const ordersById = new Map();
     for (const order of orderResult.rows) { ordersById.set(String(order.orderId), order); ordersById.set(String(order.packId), order); }
     const items = claims.map(claim => ({ ...claim, storeId: sellerId, order: ordersById.get(claimOrderReference(claim)) || null }));
+    const claimIds=items.map(item=>String(item.id || '')).filter(Boolean);
+    const cachedMessageResult=claimIds.length ? await pool.query(`SELECT external_id AS id,fetched_at AS "fetchedAt"
+      FROM order_api_audits WHERE owner_username=$1 AND api_type='claim_messages'
+        AND external_id=ANY($2::varchar[])`,[req.authUser.username,claimIds]) : { rows:[] };
+    const cachedMessageMap=new Map(cachedMessageResult.rows.map(row=>[String(row.id),row.fetchedAt]));
+    const claimsNeedingMessages=items.filter(item=>{
+      if (!item.id || !item.order) return false;
+      const cachedAt=cachedMessageMap.get(String(item.id));
+      if (!cachedAt) return true;
+      const officialUpdatedAt=new Date(item.last_updated || item.date_created || 0).getTime();
+      const localFetchedAt=new Date(cachedAt).getTime();
+      return Number.isFinite(officialUpdatedAt) && Number.isFinite(localFetchedAt) && officialUpdatedAt>localFetchedAt;
+    });
+    for (let index=0;index<claimsNeedingMessages.length;index+=5) {
+      await Promise.all(claimsNeedingMessages.slice(index,index+5).map(async item=>{
+        try {
+          const response=await axios.get(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(item.id)}/messages`,{
+            headers:{ Authorization:`Bearer ${token}` },timeout:12000
+          });
+          await saveOrderApiAudit(req.authUser.username,sellerId,item.order.orderId,'claim_messages',String(item.id),response.data);
+        } catch (error) {
+          console.warn('[Orders] background claim message sync failed:',req.authUser.username,item.id,error.response?.status || error.message);
+        }
+      }));
+    }
     for (const order of orderResult.rows) {
       const linkedClaims = items.filter(item => item.order === order).map(item => {
         const { order: _linkedOrder, ...claim } = item;

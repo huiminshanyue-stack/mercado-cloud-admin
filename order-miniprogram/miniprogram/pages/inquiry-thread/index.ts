@@ -1,10 +1,23 @@
 import { request,showError } from '../../utils/request';
 import { isSellerMessage,messageList } from '../../utils/messages';
 
+function decodeRouteValue(value:string | undefined) {
+  let decoded=String(value || '');
+  for (let index=0;index<2 && /%[0-9a-f]{2}/i.test(decoded);index+=1) {
+    try { decoded=decodeURIComponent(decoded); }
+    catch (_) { break; }
+  }
+  return decoded;
+}
+
 Page({
-  data:{ orderId:'',storeId:'',orderNo:'',messages:[] as any[],loading:true,translating:false,sending:false,chineseText:'',englishText:'' },
+  data:{ orderId:'',storeId:'',orderNo:'',threadLabel:'订单',messages:[] as any[],loading:true,translating:false,sending:false,chineseText:'',englishText:'' },
   async onLoad(options:Record<string,string | undefined>) {
-    this.setData({ orderId:String(options.orderId || ''),storeId:String(options.storeId || ''),orderNo:String(options.orderNo || options.orderId || '') });
+    const orderId=decodeRouteValue(options.orderId);
+    const isProductQuestion=orderId.startsWith('question:');
+    const routeOrderNo=decodeRouteValue(options.orderNo || options.orderId);
+    const orderNo=isProductQuestion ? routeOrderNo.replace(/^售前问题\s*/,'') : routeOrderNo;
+    this.setData({ orderId,storeId:decodeRouteValue(options.storeId),orderNo,threadLabel:isProductQuestion ? '售前问题' : '订单' });
     await this.loadMessages();
   },
   async loadMessages() {
