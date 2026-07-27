@@ -5490,12 +5490,22 @@ async function getOrderAfterSalesData(authUser,query = {}) {
       params: { status: 'opened', user_id: localSellerId, role: 'respondent', sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     }).catch(error => ({ error }))));
     if (claimResponses.every(response => response.error)) throw claimResponses[0].error;
-    let claims = [...new Map(claimResponses.flatMap(response => {
+    const closedClaimResponses=req.query.background ? await Promise.all(marketplaceSellerIds.map(localSellerId=>axios.get(
+      'https://api.mercadolibre.com/post-purchase/v1/claims/search',{
+        params:{ status:'closed',user_id:localSellerId,role:'respondent',sort:'last_updated:desc',limit:50 },
+        headers:{ Authorization:`Bearer ${token}` },timeout:20000
+      }).catch(()=>({ error:true })))) : [];
+    const responseClaims=response=>{
       if (response.error) return [];
-      const raw = response.data || {};
-      const source = Array.isArray(raw) ? raw : (raw.data || raw.results || []);
+      const raw=response.data || {};
+      const source=Array.isArray(raw) ? raw : (raw.data || raw.results || []);
       return Array.isArray(source) ? source : [];
+    };
+    let claims = [...new Map(claimResponses.flatMap(response => {
+      return responseClaims(response);
     }).map(claim=>[String(claim.id || `${claim.resource_id}:${claim.last_updated || ''}`),claim])).values()];
+    const recentlyClosedClaims=[...new Map(closedClaimResponses.flatMap(responseClaims)
+      .map(claim=>[String(claim.id || `${claim.resource_id}:${claim.last_updated || ''}`),claim])).values()];
     const enrichedClaims = [];
     for (let i = 0; i < claims.length; i += 5) {
       const batch = await Promise.all(claims.slice(i,i+5).map(async claim => {
@@ -5506,17 +5516,19 @@ async function getOrderAfterSalesData(authUser,query = {}) {
       enrichedClaims.push(...batch);
     }
     claims = enrichedClaims;
-    const orderIds = [...new Set(claims.map(claimOrderReference).filter(Boolean))];
+    const orderIds = [...new Set([...claims,...recentlyClosedClaims].map(claimOrderReference).filter(Boolean))];
     const orderResult = orderIds.length ? await pool.query(`SELECT ml_order_id AS "orderId",pack_id AS "packId",buyer_nickname AS buyer,country,date_created AS "dateCreated",items,store_user_id AS "storeId",raw_data AS "rawData" FROM ml_orders WHERE owner_username=$2 AND store_user_id=$3 AND (ml_order_id=ANY($1::varchar[]) OR pack_id=ANY($1::varchar[]))`, [orderIds,req.authUser.username,sellerId]) : { rows: [] };
     const ordersById = new Map();
     for (const order of orderResult.rows) { ordersById.set(String(order.orderId), order); ordersById.set(String(order.packId), order); }
     const items = claims.map(claim => ({ ...claim, storeId: sellerId, order: ordersById.get(claimOrderReference(claim)) || null }));
-    const claimIds=items.map(item=>String(item.id || '')).filter(Boolean);
+    const messageSyncItems=[...items,...recentlyClosedClaims.map(claim=>({ ...claim,storeId:sellerId,
+      order:ordersById.get(claimOrderReference(claim)) || null }))];
+    const claimIds=messageSyncItems.map(item=>String(item.id || '')).filter(Boolean);
     const cachedMessageResult=claimIds.length ? await pool.query(`SELECT external_id AS id,fetched_at AS "fetchedAt"
       FROM order_api_audits WHERE owner_username=$1 AND api_type='claim_messages'
         AND external_id=ANY($2::varchar[])`,[req.authUser.username,claimIds]) : { rows:[] };
     const cachedMessageMap=new Map(cachedMessageResult.rows.map(row=>[String(row.id),row.fetchedAt]));
-    const claimsNeedingMessages=items.filter(item=>{
+    const claimsNeedingMessages=messageSyncItems.filter(item=>{
       if (!item.id || !item.order) return false;
       const cachedAt=cachedMessageMap.get(String(item.id));
       if (!cachedAt) return true;
