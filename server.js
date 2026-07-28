@@ -5540,7 +5540,7 @@ async function getOrderAfterSalesData(authUser,query = {}) {
     for (let index=0;index<claimsNeedingMessages.length;index+=5) {
       await Promise.all(claimsNeedingMessages.slice(index,index+5).map(async item=>{
         try {
-          const response=await axios.get(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(item.id)}/messages`,{
+          const response=await axios.get(marketplaceClaimEndpoint(item.id,'messages'),{
             headers:{ Authorization:`Bearer ${token}` },timeout:12000
           });
           await saveOrderApiAudit(req.authUser.username,sellerId,item.order.orderId,'claim_messages',String(item.id),response.data);
@@ -5591,7 +5591,7 @@ async function getOrderClaimMessagesData(authUser,claimId,storeId = '') {
     const context = await resolveOrderStoreContext(authUser,String(storeId || ''));
     if (!context) { const error=new Error('无法确定该售后线程所属店铺'); error.status=404; throw error; }
     const token = context.token;
-    const response = await axios.get(`https://api.mercadolibre.com/post-purchase/v1/claims/${encodeURIComponent(claimId)}/messages`, { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+    const response = await axios.get(marketplaceClaimEndpoint(claimId,'messages'), { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
     const claimLink = await pool.query(`SELECT order_id FROM order_api_audits WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[authUser.username,String(claimId)]);
     await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '','claim_messages',String(claimId),response.data);
     if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[authUser.username,claimLink.rows[0].order_id]);
@@ -5642,7 +5642,17 @@ async function sendOrderClaimMessageData(authUser,claimId,body = {}) {
       }
       if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE
         WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[authUser.username,claimLink.rows[0].order_id]);
-      return response.data;
+      const officialResponse = response.data && typeof response.data === 'object' ? response.data : {};
+      return {
+        ...officialResponse,
+        sentMessage: {
+          id: officialResponse.id || `local:${claimId}:${Date.now()}`,
+          sender_role: 'respondent',
+          message: text,
+          date_created: new Date().toISOString(),
+          pending_official_sync: true
+        }
+      };
     } catch (error) {
       const official = officialCommunicationError(error,'售后回复发送失败');
       await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '',

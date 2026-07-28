@@ -29,6 +29,10 @@ assert.equal(
   marketplaceClaimEndpoint('5294629673','actions/send-message'),
   'https://api.mercadolibre.com/marketplace/v2/claims/5294629673/actions/send-message'
 );
+assert.equal(
+  marketplaceClaimEndpoint('5294629673','messages'),
+  'https://api.mercadolibre.com/marketplace/v2/claims/5294629673/messages'
+);
 const buyerReplyClaim = { players:[{ role:'respondent',available_actions:[{ action:'send_message_to_complainant' }] }] };
 const mediatorReplyClaim = { players:[{ role:'respondent',available_actions:[{ action:'send_message_to_mediator' }] }] };
 assert.deepEqual(claimAvailableActionNames(buyerReplyClaim),['send_message_to_complainant']);
