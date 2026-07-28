@@ -9,9 +9,17 @@ const {
   isGlobalSellingAuthorization,
   productQuestionSearchEndpoint,
   productQuestionAnswerEndpoint,
+  productQuestionDetailEndpoint,
+  communicationMessageDateValue,
+  communicationMessageTimestamp,
   MARKETPLACE_ORDER_MESSAGE_ENDPOINT,
+  ORDER_MESSAGE_ENDPOINT,
   marketplaceOrderUnreadEndpoint,
   marketplaceOrderPackMessagesEndpoint,
+  localOrderPackMessagesEndpoint,
+  orderPackMessagesEndpoint,
+  orderPackMessagesParams,
+  orderPackSendBody,
   marketplaceOrderUnreadParams,
   marketplaceClaimEndpoint,
   claimAvailableActionNames,
@@ -28,12 +36,36 @@ assert.equal(productQuestionSearchEndpoint({ site_id:'CBT' }),MARKETPLACE_QUESTI
 assert.equal(productQuestionSearchEndpoint({ site_id:'MLB' }),LOCAL_QUESTION_SEARCH_ENDPOINT);
 assert.equal(productQuestionAnswerEndpoint({ site_id:'CBT' }),MARKETPLACE_ANSWER_ENDPOINT);
 assert.equal(productQuestionAnswerEndpoint({ site_id:'MLB' }),LOCAL_ANSWER_ENDPOINT);
+assert.equal(productQuestionDetailEndpoint({ site_id:'CBT' },'123'),'https://api.mercadolibre.com/marketplace/questions/123');
+assert.equal(productQuestionDetailEndpoint({ site_id:'MLB' },'123'),'https://api.mercadolibre.com/questions/123');
+assert.equal(communicationMessageDateValue({ message_date:{ received:'2026-07-28T01:02:03Z',created:'old' } }),'2026-07-28T01:02:03Z');
+assert.equal(communicationMessageDateValue({ date_created:'2026-07-27T01:02:03Z' }),'2026-07-27T01:02:03Z');
+assert.equal(communicationMessageTimestamp({ message_date:{ created:'2026-07-28T01:02:03Z' } }),Date.parse('2026-07-28T01:02:03Z'));
 
 assert.equal(marketplaceOrderUnreadEndpoint(),`${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/unread`);
 assert.equal(
   marketplaceOrderPackMessagesEndpoint('2000014204613187'),
   `${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/packs/2000014204613187`
 );
+assert.equal(
+  localOrderPackMessagesEndpoint('2000014204613187','3361645256'),
+  `${ORDER_MESSAGE_ENDPOINT}/packs/2000014204613187/sellers/3361645256`
+);
+assert.equal(orderPackMessagesEndpoint({ site_id:'CBT' },'123','456'),`${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/packs/123`);
+assert.equal(orderPackMessagesEndpoint({ site_id:'MLB' },'123','456'),`${ORDER_MESSAGE_ENDPOINT}/packs/123/sellers/456`);
+assert.deepEqual(orderPackMessagesParams({ site_id:'CBT' }),{ limit:50,offset:0 });
+assert.deepEqual(orderPackMessagesParams({ site_id:'MLB' }),{
+  limit:50,offset:0,tag:'post_sale',mark_as_read:false
+});
+assert.deepEqual(orderPackMessagesParams({ site_id:'MLB' },{ markAsRead:true,limit:20,offset:10 }),{
+  limit:20,offset:10,tag:'post_sale',mark_as_read:true
+});
+assert.deepEqual(orderPackSendBody({ site_id:'CBT' },{ text:'Hello',textTranslated:'Hola' }),{
+  text:'Hello',text_translated:'Hola',attachments:[]
+});
+assert.deepEqual(orderPackSendBody({ site_id:'MLB' },{ sellerId:'123',buyerId:'456',text:'Hello' }),{
+  from:{ user_id:123 },to:{ user_id:456 },text:'Hello',attachments:[]
+});
 assert.deepEqual(marketplaceOrderUnreadParams('3361645256'),{
   user_id:'3361645256',role:'seller',tag:'post_sale'
 });

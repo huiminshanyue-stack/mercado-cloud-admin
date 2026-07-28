@@ -20,8 +20,10 @@ const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-m
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
 const { isGlobalSellingAuthorization,productQuestionSearchEndpoint,
-  productQuestionAnswerEndpoint,marketplaceClaimEndpoint,claimReplyReceiverRole,
-  marketplaceOrderUnreadEndpoint,marketplaceOrderPackMessagesEndpoint,
+  productQuestionAnswerEndpoint,productQuestionDetailEndpoint,communicationMessageDateValue,communicationMessageTimestamp,
+  marketplaceClaimEndpoint,claimReplyReceiverRole,
+  marketplaceClaimSearchEndpoint,
+  marketplaceOrderUnreadEndpoint,orderPackMessagesEndpoint,orderPackMessagesParams,orderPackSendBody,
   marketplaceOrderUnreadParams,officialCommunicationError } = require('./mercadolibre-communications');
 
 const app = express();
@@ -3046,7 +3048,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-27.55',
+    version: '2026-07-28.01',
     dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
     onlineDeadlineRule: 'handling-deadline-plus-24h',
     officialPayoutFromLedger: true,
@@ -3139,7 +3141,11 @@ app.get('/api/health/order-management', (req, res) => {
     miniProgramInquiryReply: true,
     miniProgramAfterSalesReply: true,
     officialClaimSearchUsesCurrentStoreIdentity: true,
-    mercadoLibreWebhookTopics: ['orders_v2','shipments','messages','questions','claims'],
+    mercadoLibreWebhookTopics: ['orders_v2','marketplace_orders','marketplace_orders_on_site','shipments','marketplace_shipments','messages','marketplace_messages','questions','marketplace_questions','claims','marketplace_claims'],
+    mercadoLibreCurrentGlobalEndpoints: true,
+    multiStoreCommunicationAggregation: true,
+    communicationMessageObjectDates: true,
+    communicationMissedFeedRecovery: true,
     persistentWebhookQueue: true,
     realtimeOrderStatePolling: true,
     wechatOfficialAccountNotifications: ['new_order','cancelled','deadline','refund','shipped','buyer_inquiry','after_sales','binding_success'],
@@ -3475,10 +3481,10 @@ async function syncOrdersForUser(authUser, body = {}) {
       if (order.pack_id) sourceOrderByRef.set(String(order.pack_id), order);
     }
     try {
-      const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
+      const marketplaceSellerIds = await getOrderMarketplaceSellerIds(authUser.username,sellerId);
       const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId =>
-        axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
-          params: { user_id: localSellerId, role: 'respondent', sort: 'last_updated:desc', limit: 100 },
+        axios.get(marketplaceClaimSearchEndpoint(), {
+          params: { user_id: localSellerId, player_role: 'respondent', limit: 100 },
           headers: { Authorization: `Bearer ${accessToken}` }, timeout: 20000
         }).catch(() => null)));
       const claims = [...new Map(claimResponses.flatMap(response => {
@@ -5350,6 +5356,33 @@ async function productQuestionOrders(authUser,context,marketplaceSellerIds) {
 }
 
 async function getOrderInquiriesData(authUser,query = {}) {
+    if (!String(query.storeId || '').trim()) {
+      const authorizations=await listOrderStoreAuthorizations(authUser);
+      if (authorizations.length>1) {
+        const settled=await Promise.allSettled(authorizations.map(authorization=>getOrderInquiriesData(authUser,{
+          ...query,storeId:String(authorization.ml_user_id)
+        })));
+        const results=settled.filter(result=>result.status==='fulfilled').map(result=>result.value);
+        if (!results.length) throw settled[0].reason;
+        const mergeBy=(rows,keyOf)=>[...new Map(results.flatMap(result=>result[rows] || [])
+          .map(item=>[keyOf(item),item])).values()];
+        const productQuestionOrders=mergeBy('productQuestionOrders',item=>String(item.questionId || item.orderId || ''));
+        const orderMessageOrders=mergeBy('orderMessageOrders',item=>String(item.packId || item.orderId || ''));
+        const productQuestionItems=mergeBy('productQuestionItems',item=>String(item.id || item.question_id || item.questionId || ''));
+        const orderMessageItems=mergeBy('orderMessageItems',item=>String(item.id || `${item.pack_id || item.order_id}:${communicationMessageDateValue(item)}:${item.text || item.message || ''}`));
+        return {
+          count:productQuestionOrders.length+orderMessageOrders.length,
+          productQuestionCount:productQuestionOrders.length,
+          orderMessageCount:orderMessageOrders.length,
+          items:[...productQuestionItems,...orderMessageItems],
+          productQuestionItems,orderMessageItems,
+          orders:[...productQuestionOrders,...orderMessageOrders],
+          productQuestionOrders,orderMessageOrders,
+          newAlerts:results.reduce((sum,result)=>sum+Number(result.newAlerts || 0),0),
+          questionError:results.map(result=>result.questionError).filter(Boolean).join('；')
+        };
+      }
+    }
     const req={ authUser,query };
     const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
     if (!context) { const error=new Error('当前账号没有可用的店铺授权'); error.status=404; throw error; }
@@ -5383,9 +5416,8 @@ async function getOrderInquiriesData(authUser,query = {}) {
     const chinaNow = new Date(Date.now() + 8 * 3600000);
     const todayStart = new Date(Date.UTC(chinaNow.getUTCFullYear(),chinaNow.getUTCMonth(),chinaNow.getUTCDate()) - 8 * 3600000);
     const todayItems = list.filter(item => {
-      const value = item.message_date || item.date_created || item.created_at || item.last_updated;
-      const date = value ? new Date(value) : null;
-      return !date || Number.isNaN(date.getTime()) || date >= todayStart;
+      const timestamp = communicationMessageTimestamp(item);
+      return !Number.isFinite(timestamp) || timestamp >= todayStart.getTime();
     });
     const todayPackIds = new Set(todayItems.flatMap(messageOrderRefs));
     const matchedUnreadOrders = todayPackIds.size ? unreadOrders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : unreadOrders;
@@ -5407,7 +5439,8 @@ async function getOrderInquiriesData(authUser,query = {}) {
           const packId=String(order.packId || order.orderId || '');
           if (!packId) return;
           try {
-            const response=await axios.get(marketplaceOrderPackMessagesEndpoint(packId),{
+            const response=await axios.get(orderPackMessagesEndpoint(context.authorization,packId,sellerId),{
+              params:orderPackMessagesParams(context.authorization,{ markAsRead:false }),
               headers:{ Authorization:`Bearer ${token}` },timeout:12000
             });
             await saveOrderApiAudit(req.authUser.username,sellerId,String(order.orderId),'order_messages',packId,response.data);
@@ -5426,7 +5459,8 @@ async function getOrderInquiriesData(authUser,query = {}) {
       const batch = await Promise.all(recentResult.rows.slice(i, i + 5).map(async order => {
         const packId = order.packId || order.orderId;
         try {
-          const response = await axios.get(marketplaceOrderPackMessagesEndpoint(packId), {
+          const response = await axios.get(orderPackMessagesEndpoint(context.authorization,packId,sellerId), {
+            params:orderPackMessagesParams(context.authorization,{ markAsRead:false }),
             headers: { Authorization: `Bearer ${token}` }, timeout: 12000
           });
           const payload = response.data || {};
@@ -5434,9 +5468,8 @@ async function getOrderInquiriesData(authUser,query = {}) {
           const buyerMessages = messages.filter(message => {
             const sender = String(message.from?.user_id || message.from || message.sender_id || '');
             if (sender && marketplaceSellerIds.includes(sender)) return false;
-            const rawDate = message.message_date || message.date_created || message.created_at;
-            const date = rawDate ? new Date(rawDate) : null;
-            return !date || Number.isNaN(date.getTime()) || date >= todayStart;
+            const timestamp = communicationMessageTimestamp(message);
+            return !Number.isFinite(timestamp) || timestamp >= todayStart.getTime();
           });
           return buyerMessages.length ? { order, messages: buyerMessages } : null;
         } catch (_) { return null; }
@@ -5462,7 +5495,7 @@ async function getOrderInquiriesData(authUser,query = {}) {
     const productQuestionOrderMap=new Map(productQuestions.orders.map(order=>[String(order.orderId),order]));
     const orderMap = new Map([...orderMessageMap,...productQuestionOrderMap]);
     const itemMap = new Map();
-    for (const item of [...todayItems, ...conversationItems]) itemMap.set(String(item.id || `${item.pack_id || item.order_id}:${item.message_date || item.date_created || ''}:${item.text || item.message || ''}`), item);
+    for (const item of [...todayItems, ...conversationItems]) itemMap.set(String(item.id || `${item.pack_id || item.order_id}:${communicationMessageDateValue(item)}:${item.text || item.message || ''}`), item);
     for (const order of productQuestions.orders) itemMap.set(`question:${order.questionId}`,order.question);
     let newAlerts=Number(productQuestions.newAlerts || 0);
     for (const [messageKey, item] of itemMap) {
@@ -5502,18 +5535,37 @@ app.get('/api/admin/order-inquiries', requireOrderAccess, async (req, res) => {
 });
 
 async function getOrderAfterSalesData(authUser,query = {}) {
+    if (!String(query.storeId || '').trim()) {
+      const authorizations=await listOrderStoreAuthorizations(authUser);
+      if (authorizations.length>1) {
+        const settled=await Promise.allSettled(authorizations.map(authorization=>getOrderAfterSalesData(authUser,{
+          ...query,storeId:String(authorization.ml_user_id)
+        })));
+        const results=settled.filter(result=>result.status==='fulfilled').map(result=>result.value);
+        if (!results.length) throw settled[0].reason;
+        const items=[...new Map(results.flatMap(result=>result.items || [])
+          .map(item=>[String(item.id || `${item.storeId}:${claimOrderReference(item)}:${item.last_updated || ''}`),item])).values()];
+        return {
+          count:items.length,
+          items,
+          orders:[...new Map(items.map(item=>item.order).filter(Boolean)
+            .map(order=>[String(order.orderId || order.packId),order])).values()],
+          newAlerts:results.reduce((sum,result)=>sum+Number(result.newAlerts || 0),0)
+        };
+      }
+    }
     const req={ authUser,query };
     const context = await resolveOrderStoreContext(req.authUser, String(req.query.storeId || ''));
     if (!context) { const error=new Error('当前账号没有可用的店铺授权'); error.status=404; throw error; }
     const { token, sellerId } = context;
     const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
-    const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId => axios.get('https://api.mercadolibre.com/post-purchase/v1/claims/search', {
-      params: { status: 'opened', user_id: localSellerId, role: 'respondent', sort: 'last_updated:desc' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    const claimResponses = await Promise.all(marketplaceSellerIds.map(localSellerId => axios.get(marketplaceClaimSearchEndpoint(), {
+      params: { status: 'opened', user_id: localSellerId, player_role: 'respondent' }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     }).catch(error => ({ error }))));
     if (claimResponses.every(response => response.error)) throw claimResponses[0].error;
     const closedClaimResponses=req.query.background ? await Promise.all(marketplaceSellerIds.map(localSellerId=>axios.get(
-      'https://api.mercadolibre.com/post-purchase/v1/claims/search',{
-        params:{ status:'closed',user_id:localSellerId,role:'respondent',sort:'last_updated:desc',limit:50 },
+      marketplaceClaimSearchEndpoint(),{
+      params:{ status:'closed',user_id:localSellerId,player_role:'respondent',limit:50 },
         headers:{ Authorization:`Bearer ${token}` },timeout:20000
       }).catch(()=>({ error:true })))) : [];
     const responseClaims=response=>{
@@ -6362,14 +6414,28 @@ async function getOrderMessagesData(authUser,orderId) {
         FROM order_api_audits WHERE owner_username=$1 AND api_type='presale_question' AND external_id=$2 LIMIT 1`,
       [authUser.username,questionId]);
       if (!auditResult.rows[0]) { const error=new Error('售前问题不存在或无权查看'); error.status=404; throw error; }
-      const raw=auditResult.rows[0].rawData || {};
+      const context=await getOrderStoreContext(authUser,auditResult.rows[0].storeId);
+      if (!context) { const error=new Error('该售前问题所属店铺授权已失效'); error.status=403; throw error; }
+      let raw=auditResult.rows[0].rawData || {};
+      try {
+        const response=await axios.get(productQuestionDetailEndpoint(context.authorization,questionId),{
+          headers:{ Authorization:`Bearer ${context.token}` },timeout:20000
+        });
+        raw={ ...raw,...(response.data || {}) };
+        await saveOrderApiAudit(authUser.username,auditResult.rows[0].storeId,normalizedOrderId,'presale_question',questionId,raw);
+      } catch (error) {
+        if (!raw || !Object.keys(raw).length) throw error;
+        console.warn('[Orders] product question detail refresh failed, using audit cache:',authUser.username,questionId,error.response?.status || error.message);
+      }
       const messages=[{
         id:`question:${questionId}`,from:raw.from || {},message_date:raw.date_created || raw.last_updated,
         text:String(raw.text || ''),message_type:'product_question'
       }];
-      if (raw._answer?.text) messages.push({
+      const answer=raw.answer?.text ? raw.answer : raw._answer;
+      if (answer?.text) messages.push({
         id:`answer:${questionId}`,from:{ user_id:auditResult.rows[0].storeId },
-        message_date:raw._answer.answered_at,text:String(raw._answer.text),message_type:'product_answer'
+        message_date:answer.date_created || answer.answered_at || raw.last_updated,
+        text:String(answer.text),message_type:'product_answer'
       });
       await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='buyer_inquiry'`,
         [authUser.username,normalizedOrderId]);
@@ -6381,7 +6447,8 @@ async function getOrderMessagesData(authUser,orderId) {
     if (!context) { const error=new Error('该订单所属店铺授权已失效'); error.status=403; throw error; }
     const token = context.token;
     const packId = rows[0].pack_id || String(orderId);
-    const response = await axios.get(marketplaceOrderPackMessagesEndpoint(packId), {
+    const response = await axios.get(orderPackMessagesEndpoint(context.authorization,packId,context.sellerId), {
+      params:orderPackMessagesParams(context.authorization,{ markAsRead:true }),
       headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     });
     await saveOrderApiAudit(authUser.username,rows[0].store_user_id,String(orderId),'order_messages',String(packId),response.data);
@@ -6423,15 +6490,23 @@ async function sendOrderMessageData(authUser,orderId,body = {}) {
         [authUser.username,normalizedOrderId]);
       return response.data;
     }
-    const { rows } = await pool.query('SELECT pack_id,store_user_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [String(orderId),authUser.username]);
+    const { rows } = await pool.query('SELECT pack_id,store_user_id,buyer_id FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [String(orderId),authUser.username]);
     if (!rows[0]) { const error=new Error('订单不存在或无权操作'); error.status=404; throw error; }
     const context = await getOrderStoreContext(authUser,rows[0].store_user_id);
     if (!context) { const error=new Error('该订单所属店铺授权已失效'); error.status=403; throw error; }
     const token = context.token;
     const packId = rows[0].pack_id || String(orderId);
-    const response = await axios.post(marketplaceOrderPackMessagesEndpoint(packId), {
-      text,text_translated:String(body?.textTranslated || '') || undefined,attachments:[]
-    }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
+    const buyerId=String(rows[0].buyer_id || '').trim();
+    if (!isGlobalSellingAuthorization(context.authorization) && !buyerId) {
+      const error=new Error('订单缺少美客多买家身份，暂时无法通过官方接口回复');
+      error.status=422;
+      throw error;
+    }
+    const response = await axios.post(orderPackMessagesEndpoint(context.authorization,packId,context.sellerId),
+      orderPackSendBody(context.authorization,{
+        sellerId:context.sellerId,buyerId,text,textTranslated:body?.textTranslated
+      }),
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
     return response.data;
 }
 
@@ -6694,6 +6769,9 @@ let scheduledOrderSyncRunning = false;
 let realtimeOrderDiscoveryTimer = null;
 let realtimeOrderDiscoveryRunning = false;
 let realtimeOrderDiscoveryState = { lastRunAt:null,storesChecked:0,missingImported:0,communicationAlerts:0,payoutBackfillsQueued:0,lastError:null };
+let mercadoLibreMissedFeedTimer = null;
+let mercadoLibreMissedFeedRunning = false;
+let mercadoLibreMissedFeedState = { lastRunAt:null,received:0,accepted:0,lastError:null };
 let mercadoLibreWebhookService = null;
 let officialAccountService = null;
 
@@ -6801,7 +6879,19 @@ async function processMercadoLibreWebhookEvent(event,target) {
   }
 
   if (event.topic === 'messages') {
-    const message=await fetchWebhookResource(target,event);
+    // Real-time callbacks normally contain a /marketplace/messages/... path,
+    // while the official missed-feeds endpoint can return only the opaque
+    // message id. In that case there is no valid resource URL to GET, so use
+    // the official unread/messages endpoints to rebuild the local thread.
+    const hasResourcePath=String(event.resource || '').startsWith('/');
+    let message={};
+    if (hasResourcePath) {
+      try { message=await fetchWebhookResource(target,event); }
+      catch (error) {
+        const status=Number(error.response?.status || error.status || 0);
+        if (![403,404].includes(status)) throw error;
+      }
+    }
     const refs=webhookOrderReferences(message);
     const linked=refs.length ? await pool.query(`SELECT ml_order_id,COALESCE(NULLIF(pack_id,''),ml_order_id) AS display_id
       FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2
@@ -6813,8 +6903,9 @@ async function processMercadoLibreWebhookEvent(event,target) {
       VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
     [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的买家咨询`,
       `inquiry:${target.storeUserId}:${event.externalId || event.id || event.resourceId}`]);
-    await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
-    return { storeId:target.storeUserId,orderId,stored:true };
+    const recovered=await getOrderInquiriesData(authUser,{ storeId:target.storeUserId,background:true });
+    await touchOrderRealtimeState(pool,authUser.username,'communications',orderId || `message:${event.resourceId || ''}`);
+    return { storeId:target.storeUserId,orderId,stored:true,newAlerts:recovered.newAlerts || 0 };
   }
 
   if (event.topic === 'questions') {
@@ -6824,7 +6915,15 @@ async function processMercadoLibreWebhookEvent(event,target) {
   }
 
   if (event.topic === 'claims') {
-    const claim=await fetchWebhookResource(target,event);
+    let claim={};
+    const hasResourcePath=String(event.resource || '').startsWith('/');
+    if (hasResourcePath) {
+      try { claim=await fetchWebhookResource(target,event); }
+      catch (error) {
+        const status=Number(error.response?.status || error.status || 0);
+        if (![403,404].includes(status)) throw error;
+      }
+    }
     const reference=String(claimOrderReference(claim) || '');
     const linked=reference ? await pool.query(`SELECT ml_order_id,COALESCE(NULLIF(pack_id,''),ml_order_id) AS display_id
       FROM ml_orders WHERE owner_username=$1 AND store_user_id=$2 AND (ml_order_id=$3 OR pack_id=$3)
@@ -6835,8 +6934,9 @@ async function processMercadoLibreWebhookEvent(event,target) {
       VALUES($1,$2,'after_sales','售后申诉待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
     [authUser.username,orderId,`订单 ${linked.rows[0].display_id || orderId} 收到新的售后申诉`,
       `claim:${target.storeUserId}:${event.resourceId || event.id}:${event.externalId || event.id || claim.last_updated || 'updated'}`]);
-    await touchOrderRealtimeState(pool,authUser.username,event.topic,orderId);
-    return { storeId:target.storeUserId,orderId,stored:true };
+    const recovered=await getOrderAfterSalesData(authUser,{ storeId:target.storeUserId,background:true });
+    await touchOrderRealtimeState(pool,authUser.username,'communications',orderId || `claim:${event.resourceId || ''}`);
+    return { storeId:target.storeUserId,orderId,stored:true,newAlerts:recovered.newAlerts || 0 };
   }
   return { ignored:true };
 }
@@ -6951,6 +7051,58 @@ function startRealtimeOrderDiscovery() {
   realtimeOrderDiscoveryTimer.unref?.();
 }
 
+async function runMercadoLibreMissedFeedRecovery() {
+  if (mercadoLibreMissedFeedRunning || !mercadoLibreWebhookService || !ML_CLIENT_ID) return;
+  mercadoLibreMissedFeedRunning=true;
+  let received=0,accepted=0,lastError=null;
+  try {
+    const { rows }=await pool.query(`SELECT a.*,COALESCE(u.role,'user') AS role
+      FROM ml_store_authorizations a
+      LEFT JOIN users u ON LOWER(u.username)=LOWER(a.owner_username)
+      WHERE a.enabled=TRUE ORDER BY a.updated_at DESC LIMIT 5`);
+    let response=null;
+    for (const authorization of rows) {
+      try {
+        const token=await getStoreAuthorizationToken(authorization);
+        if (!token) continue;
+        response=await axios.get('https://api.mercadolibre.com/missed_feeds',{
+          params:{ app_id:ML_CLIENT_ID },
+          headers:{ Authorization:`Bearer ${token}` },timeout:20000
+        });
+        lastError=null;
+        break;
+      } catch (error) {
+        lastError=String(error.response?.data?.message || error.message || error).slice(0,500);
+      }
+    }
+    const messages=Array.isArray(response?.data?.messages) ? response.data.messages : [];
+    received=messages.length;
+    for (const notification of messages) {
+      const result=await mercadoLibreWebhookService.enqueue(notification);
+      if (result?.accepted) accepted++;
+    }
+  } finally {
+    mercadoLibreMissedFeedRunning=false;
+    mercadoLibreMissedFeedState={ lastRunAt:new Date().toISOString(),received,accepted,lastError };
+  }
+}
+
+function startMercadoLibreMissedFeedRecovery() {
+  if (mercadoLibreMissedFeedTimer) return;
+  const tick=()=>runMercadoLibreMissedFeedRecovery().catch(error=>{
+    mercadoLibreMissedFeedState={ ...mercadoLibreMissedFeedState,lastRunAt:new Date().toISOString(),lastError:String(error.message || error).slice(0,500) };
+    console.error('[Mercado Libre] missed feeds recovery failed:',error.response?.data || error.message);
+  });
+  setTimeout(tick,15000).unref?.();
+  mercadoLibreMissedFeedTimer=setInterval(tick,5*60*1000);
+  mercadoLibreMissedFeedTimer.unref?.();
+}
+
+app.get('/api/health/mercadolibre-missed-feeds',(req,res) => res.json({ code:0,data:{
+  enabled:Boolean(mercadoLibreMissedFeedTimer),running:mercadoLibreMissedFeedRunning,
+  intervalSeconds:300,...mercadoLibreMissedFeedState
+} }));
+
 app.get('/api/health/order-realtime',(req,res) => res.json({ code:0,data:{
   enabled:Boolean(realtimeOrderDiscoveryTimer),running:realtimeOrderDiscoveryRunning,
   intervalSeconds:60,latestIdsPerStore:10,...realtimeOrderDiscoveryState
@@ -7039,6 +7191,7 @@ async function start() {
     console.log('============================================');
   });
   mercadoLibreWebhookService.start();
+  startMercadoLibreMissedFeedRecovery();
   officialAccountService.start();
   startRealtimeOrderDiscovery();
   scheduleMelPublicTrackingBackfill(3000);
@@ -7047,6 +7200,7 @@ async function start() {
     console.log(`[Server] ${signal} received, closing gracefully`);
     if (scheduledOrderSyncTimer) clearTimeout(scheduledOrderSyncTimer);
     if (realtimeOrderDiscoveryTimer) clearInterval(realtimeOrderDiscoveryTimer);
+    if (mercadoLibreMissedFeedTimer) clearInterval(mercadoLibreMissedFeedTimer);
     if (melTrackingBackfillTimer) clearTimeout(melTrackingBackfillTimer);
     mercadoLibreWebhookService?.stop();
     officialAccountService?.stop();

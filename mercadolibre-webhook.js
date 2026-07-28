@@ -2,9 +2,27 @@
 
 const crypto = require('crypto');
 
-const SUPPORTED_TOPICS = new Set(['orders_v2','shipments','messages','questions','claims']);
+// Mercado Libre currently publishes the `marketplace_*` topic names for
+// Global Selling, while local sites and a few older Global Selling
+// integrations still deliver the legacy names.  Normalize both forms to one
+// internal topic so a migration at Mercado Libre cannot silently drop events.
+const TOPIC_ALIASES = Object.freeze({
+  orders_v2:'orders_v2',
+  marketplace_orders:'orders_v2',
+  marketplace_orders_on_site:'orders_v2',
+  shipments:'shipments',
+  marketplace_shipments:'shipments',
+  messages:'messages',
+  marketplace_messages:'messages',
+  questions:'questions',
+  marketplace_questions:'questions',
+  claims:'claims',
+  marketplace_claims:'claims'
+});
+const SUPPORTED_TOPICS = new Set(Object.keys(TOPIC_ALIASES));
 const MAX_RETRIES = 8;
 const RETRY_DELAYS_SECONDS = [15,60,300,900,1800,3600,7200,14400];
+const CALLBACK_ACK_DEADLINE_MS = 350;
 
 function resourceId(resource) {
   const parts=String(resource || '').split('?')[0].split('/').filter(Boolean);
@@ -13,19 +31,20 @@ function resourceId(resource) {
 
 function normalizeMercadoLibreNotification(payload,expectedApplicationId = '') {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
-  const topic=String(payload.topic || '').trim().toLowerCase();
+  const officialTopic=String(payload.topic || '').trim().toLowerCase();
+  const topic=TOPIC_ALIASES[officialTopic] || '';
   const resource=String(payload.resource || '').trim().slice(0,500);
   const userId=String(payload.user_id || payload.userId || '').trim().slice(0,100);
   const applicationId=String(payload.application_id || payload.applicationId || '').trim().slice(0,100);
-  if (!SUPPORTED_TOPICS.has(topic) || !resource || !userId) return null;
+  if (!topic || !resource || !userId) return null;
   if (expectedApplicationId && applicationId !== String(expectedApplicationId)) return null;
   const externalId=String(payload._id || payload.id || '').trim().slice(0,180);
   const rawSentAt=String(payload.sent || '').trim();
   const sentAt=rawSentAt && Number.isFinite(Date.parse(rawSentAt)) ? rawSentAt : '';
-  const base=externalId || [topic,resource,userId,applicationId,sentAt].join('|');
+  const base=externalId || [officialTopic,resource,userId,applicationId,sentAt].join('|');
   const eventKey=crypto.createHash('sha256').update(base).digest('hex');
   return {
-    eventKey,externalId,topic,resource,resourceId:resourceId(resource),userId,applicationId,
+    eventKey,externalId,topic,officialTopic,resource,resourceId:resourceId(resource),userId,applicationId,
     attempts:Math.max(0,Number(payload.attempts) || 0),sentAt:sentAt || null,payload
   };
 }
@@ -97,7 +116,7 @@ function createMercadoLibreWebhookService({ pool,expectedApplicationId,resolveTa
       ON CONFLICT(event_key) DO UPDATE SET official_attempts=GREATEST(ml_webhook_events.official_attempts,EXCLUDED.official_attempts),
       received_at=NOW(),updated_at=NOW()`,[
       event.eventKey,event.externalId || null,event.topic,event.resource,event.resourceId || null,event.userId,event.applicationId || null,
-      event.attempts,JSON.stringify(event.payload),event.sentAt
+      event.attempts,JSON.stringify({ ...event.payload,_normalized_topic:event.topic,_official_topic:event.officialTopic }),event.sentAt
     ]);
     trigger();
     return { accepted:true,inserted:Boolean(rowCount),eventKey:event.eventKey };
@@ -167,14 +186,28 @@ function createMercadoLibreWebhookService({ pool,expectedApplicationId,resolveTa
 
   function registerRoutes(app) {
     app.post('/api/webhooks/mercadolibre',async (req,res) => {
-      // Persist before acknowledging; processing stays asynchronous and does not delay the callback.
-      try {
-        const result=await enqueue(req.body || {});
-        res.status(200).json({ code:0,message:'received',accepted:result.accepted });
-      } catch (error) {
-        logger.error('[Webhook] notification persistence failed:',error.message);
-        res.status(503).json({ code:503,message:'queue unavailable' });
+      // Mercado Libre requires a 200 response within 500 ms. Usually the queue
+      // insert finishes first; if the database is briefly slow, acknowledge at
+      // 350 ms and let the already-started insert finish in the background.
+      // The missed-feeds recovery job provides a second safety net.
+      const persistence=enqueue(req.body || {})
+        .then(result=>({ result }))
+        .catch(error=>({ error }));
+      const outcome=await Promise.race([
+        persistence,
+        new Promise(resolve=>setTimeout(()=>resolve({ timedOut:true }),CALLBACK_ACK_DEADLINE_MS))
+      ]);
+      if (outcome.timedOut) {
+        persistence.then(lateOutcome=>{
+          if (lateOutcome.error) logger.error('[Webhook] late notification persistence failed:',lateOutcome.error.message);
+        });
+        return res.status(200).json({ code:0,message:'received',accepted:true,queue:'pending' });
       }
+      if (outcome.error) {
+        logger.error('[Webhook] notification persistence failed:',outcome.error.message);
+        return res.status(503).json({ code:503,message:'queue unavailable' });
+      }
+      return res.status(200).json({ code:0,message:'received',accepted:outcome.result.accepted });
     });
     app.get('/api/health/mercadolibre-webhook',async (req,res) => {
       try {
@@ -203,6 +236,6 @@ function createMercadoLibreWebhookService({ pool,expectedApplicationId,resolveTa
 }
 
 module.exports={
-  SUPPORTED_TOPICS,normalizeMercadoLibreNotification,rejectionReason,resourceId,retryDelaySeconds,
+  TOPIC_ALIASES,SUPPORTED_TOPICS,CALLBACK_ACK_DEADLINE_MS,normalizeMercadoLibreNotification,rejectionReason,resourceId,retryDelaySeconds,
   touchOrderRealtimeState,getOrderRealtimeState,createMercadoLibreWebhookService
 };

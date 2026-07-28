@@ -3,13 +3,17 @@
 const assert=require('node:assert/strict');
 const {
   SUPPORTED_TOPICS,
+  TOPIC_ALIASES,
+  CALLBACK_ACK_DEADLINE_MS,
   normalizeMercadoLibreNotification,
   rejectionReason,
   resourceId,
   retryDelaySeconds
 }=require('../mercadolibre-webhook');
 
-assert.deepEqual([...SUPPORTED_TOPICS],['orders_v2','shipments','messages','questions','claims']);
+assert.equal(TOPIC_ALIASES.marketplace_orders,'orders_v2');
+assert.equal(SUPPORTED_TOPICS.has('marketplace_claims'),true);
+assert.equal(CALLBACK_ACK_DEADLINE_MS,350);
 assert.equal(resourceId('/orders/123456789?caller.id=1'),'123456789');
 assert.equal(resourceId('/post-purchase/v1/claims/987654321'),'987654321');
 
@@ -24,6 +28,7 @@ const payload={
 };
 const event=normalizeMercadoLibreNotification(payload,'7654321');
 assert.equal(event.topic,'orders_v2');
+assert.equal(event.officialTopic,'orders_v2');
 assert.equal(event.resourceId,'123456789');
 assert.equal(event.userId,'3361645256');
 assert.equal(event.applicationId,'7654321');
@@ -31,6 +36,12 @@ assert.equal(event.eventKey,normalizeMercadoLibreNotification({ ...payload,attem
 const questionEvent=normalizeMercadoLibreNotification({ ...payload,_id:'question-1',topic:'questions',resource:'/questions/99887766' },'7654321');
 assert.equal(questionEvent.topic,'questions');
 assert.equal(questionEvent.resourceId,'99887766');
+const globalOrderEvent=normalizeMercadoLibreNotification({ ...payload,_id:'marketplace-order-1',topic:'marketplace_orders',resource:'/marketplace/orders/123456789' },'7654321');
+assert.equal(globalOrderEvent.topic,'orders_v2');
+assert.equal(globalOrderEvent.officialTopic,'marketplace_orders');
+assert.equal(globalOrderEvent.resourceId,'123456789');
+const globalClaimEvent=normalizeMercadoLibreNotification({ ...payload,_id:'marketplace-claim-1',topic:'marketplace_claims',resource:'/marketplace/v2/claims/99887766' },'7654321');
+assert.equal(globalClaimEvent.topic,'claims');
 assert.equal(normalizeMercadoLibreNotification({ ...payload,application_id:999 },'7654321'),null);
 assert.equal(normalizeMercadoLibreNotification({ ...payload,application_id:'' },'7654321'),null);
 assert.equal(normalizeMercadoLibreNotification({ ...payload,topic:'unsupported' },'7654321'),null);

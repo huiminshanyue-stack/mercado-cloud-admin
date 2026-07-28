@@ -2,10 +2,14 @@
 
 const MARKETPLACE_QUESTION_SEARCH_ENDPOINT = 'https://api.mercadolibre.com/marketplace/questions/search';
 const LOCAL_QUESTION_SEARCH_ENDPOINT = 'https://api.mercadolibre.com/questions/search';
+const MARKETPLACE_QUESTION_ENDPOINT = 'https://api.mercadolibre.com/marketplace/questions';
+const LOCAL_QUESTION_ENDPOINT = 'https://api.mercadolibre.com/questions';
 const MARKETPLACE_ANSWER_ENDPOINT = 'https://api.mercadolibre.com/marketplace/answers';
 const LOCAL_ANSWER_ENDPOINT = 'https://api.mercadolibre.com/answers';
 const MARKETPLACE_CLAIM_ENDPOINT = 'https://api.mercadolibre.com/marketplace/v2/claims';
+const MARKETPLACE_CLAIM_SEARCH_ENDPOINT = `${MARKETPLACE_CLAIM_ENDPOINT}/search`;
 const MARKETPLACE_ORDER_MESSAGE_ENDPOINT = 'https://api.mercadolibre.com/marketplace/messages';
+const ORDER_MESSAGE_ENDPOINT = 'https://api.mercadolibre.com/messages';
 
 function isGlobalSellingAuthorization(authorization) {
   return String(authorization?.site_id || '').trim().toUpperCase() === 'CBT';
@@ -23,10 +27,38 @@ function productQuestionAnswerEndpoint(authorization) {
     : LOCAL_ANSWER_ENDPOINT;
 }
 
+function productQuestionDetailEndpoint(authorization, questionId) {
+  const base = isGlobalSellingAuthorization(authorization)
+    ? MARKETPLACE_QUESTION_ENDPOINT
+    : LOCAL_QUESTION_ENDPOINT;
+  return `${base}/${encodeURIComponent(String(questionId || '').trim())}`;
+}
+
+function communicationMessageDateValue(message) {
+  const messageDate = message?.message_date;
+  if (messageDate && typeof messageDate === 'object') {
+    return messageDate.received || messageDate.available || messageDate.created ||
+      messageDate.notified || messageDate.read || '';
+  }
+  return messageDate || message?.date_created || message?.created_at ||
+    message?.last_updated || '';
+}
+
+function communicationMessageTimestamp(message) {
+  const value = communicationMessageDateValue(message);
+  if (!value) return NaN;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : NaN;
+}
+
 function marketplaceClaimEndpoint(claimId, suffix = '') {
   const id = encodeURIComponent(String(claimId || '').trim());
   const normalizedSuffix = String(suffix || '').replace(/^\/+/, '');
   return `${MARKETPLACE_CLAIM_ENDPOINT}/${id}${normalizedSuffix ? `/${normalizedSuffix}` : ''}`;
+}
+
+function marketplaceClaimSearchEndpoint() {
+  return MARKETPLACE_CLAIM_SEARCH_ENDPOINT;
 }
 
 function marketplaceOrderUnreadEndpoint() {
@@ -35,6 +67,43 @@ function marketplaceOrderUnreadEndpoint() {
 
 function marketplaceOrderPackMessagesEndpoint(packId) {
   return `${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/packs/${encodeURIComponent(String(packId || '').trim())}`;
+}
+
+function localOrderPackMessagesEndpoint(packId, sellerId) {
+  return `${ORDER_MESSAGE_ENDPOINT}/packs/${encodeURIComponent(String(packId || '').trim())}/sellers/${encodeURIComponent(String(sellerId || '').trim())}`;
+}
+
+function orderPackMessagesEndpoint(authorization, packId, sellerId) {
+  return isGlobalSellingAuthorization(authorization)
+    ? marketplaceOrderPackMessagesEndpoint(packId)
+    : localOrderPackMessagesEndpoint(packId, sellerId);
+}
+
+function orderPackMessagesParams(authorization, { markAsRead = false, limit = 50, offset = 0 } = {}) {
+  if (isGlobalSellingAuthorization(authorization)) return { limit, offset };
+  return {
+    limit,
+    offset,
+    tag:'post_sale',
+    mark_as_read:Boolean(markAsRead)
+  };
+}
+
+function orderPackSendBody(authorization, { sellerId, buyerId, text, textTranslated = '' } = {}) {
+  if (isGlobalSellingAuthorization(authorization)) {
+    return {
+      text:String(text || '').trim(),
+      ...(String(textTranslated || '').trim() ? { text_translated:String(textTranslated).trim() } : {}),
+      attachments:[]
+    };
+  }
+  const apiUserId=value=>/^\d+$/.test(String(value || '')) && Number.isSafeInteger(Number(value)) ? Number(value) : value;
+  return {
+    from:{ user_id:apiUserId(sellerId) },
+    to:{ user_id:apiUserId(buyerId) },
+    text:String(text || '').trim(),
+    attachments:[]
+  };
 }
 
 function marketplaceOrderUnreadParams(userId) {
@@ -84,14 +153,26 @@ module.exports = {
   LOCAL_QUESTION_SEARCH_ENDPOINT,
   MARKETPLACE_ANSWER_ENDPOINT,
   LOCAL_ANSWER_ENDPOINT,
+  MARKETPLACE_QUESTION_ENDPOINT,
+  LOCAL_QUESTION_ENDPOINT,
   isGlobalSellingAuthorization,
   productQuestionSearchEndpoint,
   productQuestionAnswerEndpoint,
+  productQuestionDetailEndpoint,
+  communicationMessageDateValue,
+  communicationMessageTimestamp,
   MARKETPLACE_CLAIM_ENDPOINT,
+  MARKETPLACE_CLAIM_SEARCH_ENDPOINT,
   MARKETPLACE_ORDER_MESSAGE_ENDPOINT,
+  ORDER_MESSAGE_ENDPOINT,
   marketplaceClaimEndpoint,
+  marketplaceClaimSearchEndpoint,
   marketplaceOrderUnreadEndpoint,
   marketplaceOrderPackMessagesEndpoint,
+  localOrderPackMessagesEndpoint,
+  orderPackMessagesEndpoint,
+  orderPackMessagesParams,
+  orderPackSendBody,
   marketplaceOrderUnreadParams,
   claimAvailableActionNames,
   claimReplyReceiverRole,
