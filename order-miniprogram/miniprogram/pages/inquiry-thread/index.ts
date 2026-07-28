@@ -11,13 +11,15 @@ function decodeRouteValue(value:string | undefined) {
 }
 
 Page({
-  data:{ orderId:'',storeId:'',orderNo:'',threadLabel:'订单',messages:[] as any[],loading:true,translating:false,sending:false,chineseText:'',englishText:'' },
+  data:{ orderId:'',storeId:'',orderNo:'',threadLabel:'订单咨询',messages:[] as any[],loading:true,translating:false,sending:false,chineseText:'',englishText:'' },
   async onLoad(options:Record<string,string | undefined>) {
     const orderId=decodeRouteValue(options.orderId);
     const isProductQuestion=orderId.startsWith('question:');
     const routeOrderNo=decodeRouteValue(options.orderNo || options.orderId);
     const orderNo=isProductQuestion ? routeOrderNo.replace(/^售前问题\s*/,'') : routeOrderNo;
-    this.setData({ orderId,storeId:decodeRouteValue(options.storeId),orderNo,threadLabel:isProductQuestion ? '售前问题' : '订单' });
+    const threadLabel=isProductQuestion ? '商品售前问题' : '订单咨询';
+    this.setData({ orderId,storeId:decodeRouteValue(options.storeId),orderNo,threadLabel });
+    wx.setNavigationBarTitle({ title:`${threadLabel}回复` });
     await this.loadMessages();
   },
   async loadMessages() {
@@ -63,7 +65,7 @@ Page({
     const text=this.data.englishText.trim();
     if (!text) { wx.showToast({ title:'请先翻译并确认英文',icon:'none' }); return; }
     const confirmed=await new Promise<boolean>(resolve=>wx.showModal({
-      title:'确认发送售前回复',
+      title:`确认发送${this.data.threadLabel}回复`,
       content:'将把当前英文内容发送给买家。请再次确认内容无误。',
       confirmText:'确认发送',
       success:result=>resolve(result.confirm),

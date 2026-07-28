@@ -31,8 +31,12 @@
         <view class="metric-label">已同步订单</view>
       </view>
       <view class="metric">
-        <view class="metric-value warning-value">{{summary.inquiryCount}}</view>
-        <view class="metric-label">咨询待回复</view>
+        <view class="metric-value warning-value">{{summary.productQuestionCount}}</view>
+        <view class="metric-label">商品售前</view>
+      </view>
+      <view class="metric">
+        <view class="metric-value message-value">{{summary.orderMessageCount}}</view>
+        <view class="metric-label">订单咨询</view>
       </view>
       <view class="metric">
         <view class="metric-value danger-value">{{summary.afterSalesCount}}</view>
@@ -56,18 +60,28 @@
       <view class="chevron"></view>
     </view>
 
-    <view class="module-row" bindtap="openInquiries" hover-class="row-pressed">
+    <view class="module-row" bindtap="openProductQuestions" hover-class="row-pressed">
       <view class="module-index index-amber">02</view>
       <view class="module-main">
-        <view class="module-title">售前咨询</view>
-        <view class="module-desc">查看买家问题，翻译并确认回复</view>
+        <view class="module-title">商品售前问题</view>
+        <view class="module-desc">买家下单前的商品问题与公开问答</view>
       </view>
-      <view class="pending warning-pending" wx:if="{{summary.inquiryCount}}">{{summary.inquiryCount}} 待回复</view>
+      <view class="pending warning-pending" wx:if="{{summary.productQuestionCount}}">{{summary.productQuestionCount}} 待回复</view>
+      <view class="chevron"></view>
+    </view>
+
+    <view class="module-row" bindtap="openOrderMessages" hover-class="row-pressed">
+      <view class="module-index index-cyan">03</view>
+      <view class="module-main">
+        <view class="module-title">订单咨询消息</view>
+        <view class="module-desc">买家下单后的订单私信与咨询</view>
+      </view>
+      <view class="pending message-pending" wx:if="{{summary.orderMessageCount}}">{{summary.orderMessageCount}} 待回复</view>
       <view class="chevron"></view>
     </view>
 
     <view class="module-row" bindtap="openAfterSales" hover-class="row-pressed">
-      <view class="module-index index-red">03</view>
+      <view class="module-index index-red">04</view>
       <view class="module-main">
         <view class="module-title">售后消息</view>
         <view class="module-desc">投诉 · 退款 · 售后申诉线程</view>
@@ -77,7 +91,7 @@
     </view>
 
     <view class="module-row last-row" bindtap="openNotifications" hover-class="row-pressed">
-      <view class="module-index index-green">04</view>
+      <view class="module-index index-green">05</view>
       <view class="module-main">
         <view class="module-title">公众号消息提醒</view>
         <view class="module-desc">设置订单、取消、退款及消息通知</view>

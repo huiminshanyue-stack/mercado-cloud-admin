@@ -68,7 +68,7 @@ async function testRoutes() {
       }
       if (sql.includes('FROM order_alerts') && sql.includes("alert_type IN ('buyer_inquiry','after_sales')")) {
         assert.equal(params[0],'CNTORO');
-        return { rows:[{ alert_type:'buyer_inquiry',count:2 },{ alert_type:'after_sales',count:1 }] };
+        return { rows:[{ product_question_count:1,order_message_count:2,after_sales_count:1 }] };
       }
       return { rows:[] };
     }
@@ -94,7 +94,11 @@ async function testRoutes() {
       costCalls.push({ user,orderId,body });
       return { orderId,cost:body.cost,note:body.note || '' };
     },
-    getOrderInquiriesData:async()=>({ count:0,items:[],orders:[] }),
+    getOrderInquiriesData:async()=>({
+      count:2,items:[],orders:[{ orderId:'question:1',inquiryType:'product_question' },{ orderId:'order-1',inquiryType:'order_message' }],
+      productQuestionOrders:[{ orderId:'question:1',inquiryType:'product_question' }],
+      orderMessageOrders:[{ orderId:'order-1',inquiryType:'order_message' }],productQuestionItems:[],orderMessageItems:[]
+    }),
     getOrderAfterSalesData:async()=>({ count:0,items:[],orders:[] }),
     getOrderMessagesData:async()=>({ messages:[] }),
     sendOrderMessageData:async (user,orderId,body)=>{
@@ -181,7 +185,21 @@ async function testRoutes() {
   await runHandlers(routes.get('GET /api/miniprogram/v1/home-summary'),{
     headers:{ authorization:'Bearer cntoro-token' }
   },homeRes);
-  assert.deepEqual(homeRes.body.data,{ orderCount:7,inquiryCount:2,afterSalesCount:1 });
+  assert.deepEqual(homeRes.body.data,{ orderCount:7,productQuestionCount:1,orderMessageCount:2,inquiryCount:3,afterSalesCount:1 });
+
+  const productQuestionRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/inquiries'),{
+    headers:{ authorization:'Bearer cntoro-token' },query:{ storeId:'store-1',channel:'product_question' }
+  },productQuestionRes);
+  assert.equal(productQuestionRes.body.data.count,1);
+  assert.equal(productQuestionRes.body.data.orders[0].inquiryType,'product_question');
+
+  const orderMessageRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/inquiries'),{
+    headers:{ authorization:'Bearer cntoro-token' },query:{ storeId:'store-1',channel:'order_message' }
+  },orderMessageRes);
+  assert.equal(orderMessageRes.body.data.count,1);
+  assert.equal(orderMessageRes.body.data.orders[0].inquiryType,'order_message');
 
   const realtimeRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/realtime-state'),{

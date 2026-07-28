@@ -150,6 +150,7 @@
 }
 
 .warning-value { color: #c77b09; }
+.message-value { color: #167f9b; }
 .danger-value { color: #df4b57; }
 
 .metric-label {
@@ -224,6 +225,11 @@
   background: #fff5f5;
 }
 
+.index-cyan {
+  color: #167f9b;
+  background: #f0f9fb;
+}
+
 .index-green {
   color: #148461;
   background: #f1faf7;
@@ -259,6 +265,7 @@
 }
 
 .warning-pending { color: #b66e00; }
+.message-pending { color: #167f9b; }
 .danger-pending { color: #d94552; }
 
 .chevron {

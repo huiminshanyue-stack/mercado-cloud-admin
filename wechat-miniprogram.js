@@ -361,10 +361,25 @@ function registerMiniProgramRoutes(app, dependencies) {
     try {
       const [orders,alerts] = await Promise.all([
         pool.query(`SELECT COUNT(DISTINCT COALESCE(NULLIF(pack_id,''),ml_order_id))::int AS count FROM ml_orders WHERE owner_username=$1 AND hidden_at IS NULL`,[req.authUser.username]),
-        pool.query(`SELECT alert_type,COUNT(*)::int AS count FROM order_alerts WHERE owner_username=$1 AND is_read=FALSE AND alert_type IN ('buyer_inquiry','after_sales') GROUP BY alert_type`,[req.authUser.username])
+        pool.query(`SELECT
+          COUNT(DISTINCT order_id) FILTER (WHERE alert_type='buyer_inquiry'
+            AND (order_id LIKE 'question:%' OR event_key LIKE 'presale-question:%'))::int AS product_question_count,
+          COUNT(DISTINCT order_id) FILTER (WHERE alert_type='buyer_inquiry'
+            AND NOT (order_id LIKE 'question:%' OR event_key LIKE 'presale-question:%'))::int AS order_message_count,
+          COUNT(DISTINCT order_id) FILTER (WHERE alert_type='after_sales')::int AS after_sales_count
+          FROM order_alerts WHERE owner_username=$1 AND is_read=FALSE
+            AND alert_type IN ('buyer_inquiry','after_sales')`,[req.authUser.username])
       ]);
-      const counts=Object.fromEntries(alerts.rows.map(row=>[row.alert_type,Number(row.count || 0)]));
-      res.json({ code:0,data:{ orderCount:Number(orders.rows[0]?.count || 0),inquiryCount:counts.buyer_inquiry || 0,afterSalesCount:counts.after_sales || 0 } });
+      const counts=alerts.rows[0] || {};
+      const productQuestionCount=Number(counts.product_question_count || 0);
+      const orderMessageCount=Number(counts.order_message_count || 0);
+      res.json({ code:0,data:{
+        orderCount:Number(orders.rows[0]?.count || 0),
+        productQuestionCount,
+        orderMessageCount,
+        inquiryCount:productQuestionCount + orderMessageCount,
+        afterSalesCount:Number(counts.after_sales_count || 0)
+      } });
     } catch (error) { res.status(500).json({ code:500,message:error.message || '读取主页数据失败' }); }
   });
 
@@ -374,7 +389,22 @@ function registerMiniProgramRoutes(app, dependencies) {
   });
 
   app.get('/api/miniprogram/v1/inquiries',requireBoundOrderUser,async (req,res) => {
-    try { res.json({ code:0,data:await getOrderInquiriesData(req.authUser,req.query || {}) }); }
+    try {
+      const data=await getOrderInquiriesData(req.authUser,req.query || {});
+      const channel=String(req.query?.channel || '').trim().toLowerCase();
+      if (channel==='product_question') {
+        data.orders=Array.isArray(data.productQuestionOrders) ? data.productQuestionOrders :
+          (data.orders || []).filter(order=>order.inquiryType==='product_question');
+        data.items=Array.isArray(data.productQuestionItems) ? data.productQuestionItems : [];
+        data.count=data.orders.length;
+      } else if (channel==='order_message') {
+        data.orders=Array.isArray(data.orderMessageOrders) ? data.orderMessageOrders :
+          (data.orders || []).filter(order=>order.inquiryType==='order_message');
+        data.items=Array.isArray(data.orderMessageItems) ? data.orderMessageItems : [];
+        data.count=data.orders.length;
+      }
+      res.json({ code:0,data });
+    }
     catch (error) { const status=error.status || error.response?.status || 502; res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '读取售前咨询失败' }); }
   });
 

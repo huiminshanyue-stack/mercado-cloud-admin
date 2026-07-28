@@ -1,12 +1,12 @@
 <view class="page list-page">
-  <view class="intro card"><view class="intro-title">售前咨询待回复</view><view class="intro-desc">包含商品售前问题和订单咨询，输入中文后翻译为英文，确认后发送。</view></view>
+  <view class="intro card"><view class="intro-title">{{introTitle}}</view><view class="intro-desc">{{introDesc}}</view></view>
   <view wx:if="{{errors.length}}" class="error-box"><view wx:for="{{errors}}" wx:key="*this">{{item}}</view></view>
-  <view wx:if="{{loading && !orders.length}}" class="empty">正在检查所有授权店铺的咨询…</view>
-  <view wx:elif="{{!loading && !orders.length}}" class="empty">目前没有待回复售前咨询</view>
+  <view wx:if="{{loading && !orders.length}}" class="empty">{{loadingText}}</view>
+  <view wx:elif="{{!loading && !orders.length}}" class="empty">{{emptyText}}</view>
   <view wx:for="{{orders}}" wx:key="key" class="card thread" data-id="{{item.orderId}}" bindtap="openThread">
     <view class="head"><text class="country">{{item.countryText}}</text><text class="order-no">{{item.displayOrderId}}</text></view>
     <view class="store">{{item.storeName}} · 买家 {{item.buyer || '-'}}</view>
     <view class="product"><image class="image" mode="aspectFit" src="{{item.productImage}}" /><view class="product-main"><view class="title">{{item.productTitle}}</view><view class="time">{{item.isProductQuestion ? '咨询时间' : '下单'}}：{{item.dateText}}</view></view></view>
-    <view class="open">打开咨询并回复 ›</view>
+    <view class="open">{{channel === 'order_message' ? '打开订单咨询并回复' : '打开商品问题并回复'}} ›</view>
   </view>
 </view>

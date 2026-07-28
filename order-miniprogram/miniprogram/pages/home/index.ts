@@ -4,7 +4,7 @@ import { createRealtimeWatcher } from '../../utils/realtime';
 const realtimeWatcher=createRealtimeWatcher();
 
 Page({
-  data:{ userName:'内测账号',loading:false,summary:{ orderCount:0,inquiryCount:0,afterSalesCount:0 } },
+  data:{ userName:'内测账号',loading:false,summary:{ orderCount:0,productQuestionCount:0,orderMessageCount:0,inquiryCount:0,afterSalesCount:0 } },
   onShow() {
     const app=getApp<IAppOption>();
     if (!app.globalData.token) { wx.reLaunch({ url:'/pages/login/index' }); return; }
@@ -23,7 +23,8 @@ Page({
     finally { this.setData({ loading:false }); }
   },
   openOrders() { wx.navigateTo({ url:'/pages/orders/index' }); },
-  openInquiries() { wx.navigateTo({ url:'/pages/inquiries/index' }); },
+  openProductQuestions() { wx.navigateTo({ url:'/pages/inquiries/index?channel=product_question' }); },
+  openOrderMessages() { wx.navigateTo({ url:'/pages/inquiries/index?channel=order_message' }); },
   openAfterSales() { wx.navigateTo({ url:'/pages/after-sales/index' }); },
   openNotifications() { wx.navigateTo({ url:'/pages/notifications/index' }); },
   logout() {
