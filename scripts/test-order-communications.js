@@ -9,6 +9,10 @@ const {
   isGlobalSellingAuthorization,
   productQuestionSearchEndpoint,
   productQuestionAnswerEndpoint,
+  MARKETPLACE_ORDER_MESSAGE_ENDPOINT,
+  marketplaceOrderUnreadEndpoint,
+  marketplaceOrderPackMessagesEndpoint,
+  marketplaceOrderUnreadParams,
   marketplaceClaimEndpoint,
   claimAvailableActionNames,
   claimReplyReceiverRole,
@@ -24,6 +28,17 @@ assert.equal(productQuestionSearchEndpoint({ site_id:'CBT' }),MARKETPLACE_QUESTI
 assert.equal(productQuestionSearchEndpoint({ site_id:'MLB' }),LOCAL_QUESTION_SEARCH_ENDPOINT);
 assert.equal(productQuestionAnswerEndpoint({ site_id:'CBT' }),MARKETPLACE_ANSWER_ENDPOINT);
 assert.equal(productQuestionAnswerEndpoint({ site_id:'MLB' }),LOCAL_ANSWER_ENDPOINT);
+
+assert.equal(marketplaceOrderUnreadEndpoint(),`${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/unread`);
+assert.equal(
+  marketplaceOrderPackMessagesEndpoint('2000014204613187'),
+  `${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/packs/2000014204613187`
+);
+assert.deepEqual(marketplaceOrderUnreadParams('3361645256'),{
+  user_id:'3361645256',role:'seller',tag:'post_sale'
+});
+assert.notEqual(marketplaceOrderUnreadEndpoint(),MARKETPLACE_QUESTION_SEARCH_ENDPOINT);
+assert.notEqual(marketplaceOrderPackMessagesEndpoint('1'),marketplaceClaimEndpoint('1','messages'));
 
 assert.equal(
   marketplaceClaimEndpoint('5294629673','actions/send-message'),

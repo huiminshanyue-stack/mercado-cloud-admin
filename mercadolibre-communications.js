@@ -5,6 +5,7 @@ const LOCAL_QUESTION_SEARCH_ENDPOINT = 'https://api.mercadolibre.com/questions/s
 const MARKETPLACE_ANSWER_ENDPOINT = 'https://api.mercadolibre.com/marketplace/answers';
 const LOCAL_ANSWER_ENDPOINT = 'https://api.mercadolibre.com/answers';
 const MARKETPLACE_CLAIM_ENDPOINT = 'https://api.mercadolibre.com/marketplace/v2/claims';
+const MARKETPLACE_ORDER_MESSAGE_ENDPOINT = 'https://api.mercadolibre.com/marketplace/messages';
 
 function isGlobalSellingAuthorization(authorization) {
   return String(authorization?.site_id || '').trim().toUpperCase() === 'CBT';
@@ -26,6 +27,22 @@ function marketplaceClaimEndpoint(claimId, suffix = '') {
   const id = encodeURIComponent(String(claimId || '').trim());
   const normalizedSuffix = String(suffix || '').replace(/^\/+/, '');
   return `${MARKETPLACE_CLAIM_ENDPOINT}/${id}${normalizedSuffix ? `/${normalizedSuffix}` : ''}`;
+}
+
+function marketplaceOrderUnreadEndpoint() {
+  return `${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/unread`;
+}
+
+function marketplaceOrderPackMessagesEndpoint(packId) {
+  return `${MARKETPLACE_ORDER_MESSAGE_ENDPOINT}/packs/${encodeURIComponent(String(packId || '').trim())}`;
+}
+
+function marketplaceOrderUnreadParams(userId) {
+  return {
+    user_id:String(userId || '').trim(),
+    role:'seller',
+    tag:'post_sale'
+  };
 }
 
 function claimAvailableActionNames(claim) {
@@ -71,7 +88,11 @@ module.exports = {
   productQuestionSearchEndpoint,
   productQuestionAnswerEndpoint,
   MARKETPLACE_CLAIM_ENDPOINT,
+  MARKETPLACE_ORDER_MESSAGE_ENDPOINT,
   marketplaceClaimEndpoint,
+  marketplaceOrderUnreadEndpoint,
+  marketplaceOrderPackMessagesEndpoint,
+  marketplaceOrderUnreadParams,
   claimAvailableActionNames,
   claimReplyReceiverRole,
   officialCommunicationError

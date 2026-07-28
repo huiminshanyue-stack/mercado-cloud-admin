@@ -21,7 +21,8 @@ const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtim
 const { createOfficialAccountService } = require('./wechat-official-account');
 const { isGlobalSellingAuthorization,productQuestionSearchEndpoint,
   productQuestionAnswerEndpoint,marketplaceClaimEndpoint,claimReplyReceiverRole,
-  officialCommunicationError } = require('./mercadolibre-communications');
+  marketplaceOrderUnreadEndpoint,marketplaceOrderPackMessagesEndpoint,
+  marketplaceOrderUnreadParams,officialCommunicationError } = require('./mercadolibre-communications');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -5354,8 +5355,8 @@ async function getOrderInquiriesData(authUser,query = {}) {
     if (!context) { const error=new Error('当前账号没有可用的店铺授权'); error.status=404; throw error; }
     const { token, sellerId } = context;
     const marketplaceSellerIds = await getOrderMarketplaceSellerIds(req.authUser.username,sellerId);
-    const unreadResponses = await Promise.all(marketplaceSellerIds.map(userId => axios.get('https://api.mercadolibre.com/marketplace/messages/unread', {
-      params: { user_id: userId }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+    const unreadResponses = await Promise.all(marketplaceSellerIds.map(userId => axios.get(marketplaceOrderUnreadEndpoint(), {
+      params: marketplaceOrderUnreadParams(userId), headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     }).catch(() => ({ data: {} }))));
     const list = unreadResponses.flatMap(unreadResponse => {
       const raw = unreadResponse.data || {};
@@ -5406,7 +5407,7 @@ async function getOrderInquiriesData(authUser,query = {}) {
           const packId=String(order.packId || order.orderId || '');
           if (!packId) return;
           try {
-            const response=await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`,{
+            const response=await axios.get(marketplaceOrderPackMessagesEndpoint(packId),{
               headers:{ Authorization:`Bearer ${token}` },timeout:12000
             });
             await saveOrderApiAudit(req.authUser.username,sellerId,String(order.orderId),'order_messages',packId,response.data);
@@ -5425,7 +5426,7 @@ async function getOrderInquiriesData(authUser,query = {}) {
       const batch = await Promise.all(recentResult.rows.slice(i, i + 5).map(async order => {
         const packId = order.packId || order.orderId;
         try {
-          const response = await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
+          const response = await axios.get(marketplaceOrderPackMessagesEndpoint(packId), {
             headers: { Authorization: `Bearer ${token}` }, timeout: 12000
           });
           const payload = response.data || {};
@@ -5453,9 +5454,13 @@ async function getOrderInquiriesData(authUser,query = {}) {
       questionError=String(error.response?.data?.message || error.message || error).slice(0,500);
       console.warn('[Orders] 售前问题读取失败:',req.authUser.username,sellerId,error.response?.data || error.message);
     }
-    const orderMap = new Map();
-    for (const order of [...matchedUnreadOrders, ...conversationOrders]) orderMap.set(String(order.packId || order.orderId), order);
-    for (const order of productQuestions.orders) orderMap.set(String(order.orderId),order);
+    const orderMessageMap = new Map();
+    for (const order of [...matchedUnreadOrders, ...conversationOrders]) {
+      orderMessageMap.set(String(order.packId || order.orderId),{ ...order,inquiryType:'order_message' });
+    }
+    const orderMessageOrders=[...orderMessageMap.values()];
+    const productQuestionOrderMap=new Map(productQuestions.orders.map(order=>[String(order.orderId),order]));
+    const orderMap = new Map([...orderMessageMap,...productQuestionOrderMap]);
     const itemMap = new Map();
     for (const item of [...todayItems, ...conversationItems]) itemMap.set(String(item.id || `${item.pack_id || item.order_id}:${item.message_date || item.date_created || ''}:${item.text || item.message || ''}`), item);
     for (const order of productQuestions.orders) itemMap.set(`question:${order.questionId}`,order.question);
@@ -5463,13 +5468,28 @@ async function getOrderInquiriesData(authUser,query = {}) {
     for (const [messageKey, item] of itemMap) {
       if (String(messageKey).startsWith('question:')) continue;
       const refs = messageOrderRefs(item);
-      const linkedOrder = [...orderMap.values()].find(order => refs.includes(String(order.packId)) || refs.includes(String(order.orderId)));
+      const linkedOrder = [...orderMessageMap.values()].find(order => refs.includes(String(order.packId)) || refs.includes(String(order.orderId)));
       if (!linkedOrder) continue;
       const alertResult=await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'buyer_inquiry','买家订单咨询待回复',$3,$4) ON CONFLICT(event_key) DO NOTHING RETURNING id`,
         [req.authUser.username,String(linkedOrder.orderId),`买家 ${linkedOrder.buyer || ''} 发来新的订单咨询`,`inquiry:${sellerId}:${messageKey}`]);
       newAlerts+=alertResult.rowCount || 0;
     }
-    return { count:itemMap.size,items:[...itemMap.values()],orders:[...orderMap.values()],newAlerts,questionError };
+    const productQuestionItems=[...itemMap.entries()]
+      .filter(([key])=>String(key).startsWith('question:')).map(([,item])=>item);
+    const orderMessageItems=[...itemMap.entries()]
+      .filter(([key])=>!String(key).startsWith('question:')).map(([,item])=>item);
+    return {
+      count:orderMessageOrders.length + productQuestions.orders.length,
+      productQuestionCount:productQuestions.orders.length,
+      orderMessageCount:orderMessageOrders.length,
+      items:[...itemMap.values()],
+      productQuestionItems,
+      orderMessageItems,
+      orders:[...orderMap.values()],
+      productQuestionOrders:productQuestions.orders,
+      orderMessageOrders,
+      newAlerts,questionError
+    };
 }
 
 app.get('/api/admin/order-inquiries', requireOrderAccess, async (req, res) => {
@@ -5587,15 +5607,58 @@ app.get('/api/admin/order-after-sales', requireOrderAccess, async (req, res) => 
   }
 });
 
+function communicationMessageList(payload) {
+  if (Array.isArray(payload)) return payload;
+  const source=payload?.messages || payload?.results || payload?.data?.messages || [];
+  return Array.isArray(source) ? source : [];
+}
+
+function claimMessageTextValue(message) {
+  return String(message?.message || message?.text || message?.message_text || message?.body || '').trim();
+}
+
+function claimMessageIsSeller(message) {
+  const role=String(message?.sender_role || message?.role || '').toLowerCase();
+  return ['respondent','seller','mediator'].includes(role);
+}
+
+function mergeClaimMessagePayload(payload,localMessages) {
+  const official=communicationMessageList(payload);
+  const merged=[...official];
+  for (const localMessage of localMessages) {
+    const localText=claimMessageTextValue(localMessage);
+    const localAt=new Date(localMessage?.date_created || localMessage?.created_at || 0).getTime();
+    const exists=official.some(message=>{
+      if (String(message?.id || '') === String(localMessage?.id || '')) return true;
+      if (!localText || !claimMessageIsSeller(message) || claimMessageTextValue(message)!==localText) return false;
+      const messageAt=new Date(message?.date_created || message?.created_at || 0).getTime();
+      return Number.isFinite(localAt) && Number.isFinite(messageAt) && Math.abs(messageAt-localAt)<=10*60*1000;
+    });
+    if (!exists) merged.push(localMessage);
+  }
+  if (Array.isArray(payload)) return merged;
+  if (Array.isArray(payload?.messages)) return { ...payload,messages:merged };
+  if (Array.isArray(payload?.results)) return { ...payload,results:merged };
+  if (payload?.data && typeof payload.data==='object') return { ...payload,data:{ ...payload.data,messages:merged } };
+  return { ...(payload && typeof payload==='object' ? payload : {}),messages:merged };
+}
+
 async function getOrderClaimMessagesData(authUser,claimId,storeId = '') {
-    const context = await resolveOrderStoreContext(authUser,String(storeId || ''));
+    const claimLink = await pool.query(`SELECT store_user_id AS "storeId",order_id FROM order_api_audits
+      WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[authUser.username,String(claimId)]);
+    if (!claimLink.rows[0]) { const error=new Error('售后线程不存在或无权查看'); error.status=404; throw error; }
+    const context = await getOrderStoreContext(authUser,claimLink.rows[0].storeId || String(storeId || ''));
     if (!context) { const error=new Error('无法确定该售后线程所属店铺'); error.status=404; throw error; }
     const token = context.token;
     const response = await axios.get(marketplaceClaimEndpoint(claimId,'messages'), { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
-    const claimLink = await pool.query(`SELECT order_id FROM order_api_audits WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[authUser.username,String(claimId)]);
     await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '','claim_messages',String(claimId),response.data);
     if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[authUser.username,claimLink.rows[0].order_id]);
-    return response.data;
+    const sentAuditResult=await pool.query(`SELECT raw_data AS "rawData" FROM order_api_audits
+      WHERE owner_username=$1 AND api_type='claim_message_send'
+        AND (external_id=$2 OR external_id LIKE $2 || ':%')
+        AND raw_data->>'success'='true' ORDER BY fetched_at ASC`,[authUser.username,String(claimId)]);
+    const localMessages=sentAuditResult.rows.map(row=>row.rawData?.sentMessage).filter(Boolean);
+    return mergeClaimMessagePayload(response.data,localMessages);
 }
 
 app.get('/api/admin/order-claims/:claimId/messages', requireOrderAccess, async (req, res) => {
@@ -5607,13 +5670,14 @@ async function sendOrderClaimMessageData(authUser,claimId,body = {}) {
     const text=String(body?.text || '').trim();
     if (!text) { const error=new Error('回复内容不能为空'); error.status=400; throw error; }
     if (text.length>5000) { const error=new Error('回复内容不能超过5000字'); error.status=400; throw error; }
-    const context = await resolveOrderStoreContext(authUser,String(body?.storeId || ''));
+    const claimLink = await pool.query(`SELECT store_user_id,order_id,raw_data FROM order_api_audits
+      WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[authUser.username,String(claimId)]);
+    if (!claimLink.rows[0]) { const error=new Error('售后线程不存在或无权回复'); error.status=404; throw error; }
+    const context = await getOrderStoreContext(authUser,claimLink.rows[0].store_user_id || String(body?.storeId || ''));
     if (!context) { const error=new Error('无法确定该售后线程所属店铺'); error.status=404; throw error; }
     const token = context.token;
     const headers = { Authorization:`Bearer ${token}`,'Content-Type':'application/json' };
     const claimUrl = marketplaceClaimEndpoint(claimId);
-    const claimLink = await pool.query(`SELECT store_user_id,order_id,raw_data FROM order_api_audits
-      WHERE owner_username=$1 AND api_type='claim' AND external_id=$2 LIMIT 1`,[authUser.username,String(claimId)]);
     let claim = claimLink.rows[0]?.raw_data || null;
     try {
       const current = await axios.get(claimUrl,{ headers,timeout:12000 });
@@ -5631,8 +5695,15 @@ async function sendOrderClaimMessageData(authUser,claimId,body = {}) {
     const requestData = { receiver_role:receiverRole,message:text,attachments:[] };
     try {
       const response = await axios.post(marketplaceClaimEndpoint(claimId,'actions/send-message'),requestData,{ headers,timeout:20000 });
+      const sentAt=new Date().toISOString();
+      const officialResponse = response.data && typeof response.data === 'object' ? response.data : {};
+      const sentMessage={
+        id:officialResponse.id || `local:${claimId}:${Date.now()}`,
+        sender_role:'respondent',message:text,date_created:sentAt,pending_official_sync:true
+      };
       await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '',
-        'claim_message_send',String(claimId),{ success:true,receiverRole,response:response.data || null });
+        'claim_message_send',`${claimId}:${Date.now()}`,{ success:true,claimId:String(claimId),receiverRole,
+          request:requestData,response:response.data || null,sentMessage });
       try {
         const messages = await axios.get(marketplaceClaimEndpoint(claimId,'messages'),{ headers,timeout:12000 });
         await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '',
@@ -5642,21 +5713,12 @@ async function sendOrderClaimMessageData(authUser,claimId,body = {}) {
       }
       if (claimLink.rows[0]?.order_id) await pool.query(`UPDATE order_alerts SET is_read=TRUE
         WHERE owner_username=$1 AND order_id=$2 AND alert_type='after_sales'`,[authUser.username,claimLink.rows[0].order_id]);
-      const officialResponse = response.data && typeof response.data === 'object' ? response.data : {};
-      return {
-        ...officialResponse,
-        sentMessage: {
-          id: officialResponse.id || `local:${claimId}:${Date.now()}`,
-          sender_role: 'respondent',
-          message: text,
-          date_created: new Date().toISOString(),
-          pending_official_sync: true
-        }
-      };
+      return { ...officialResponse,sentMessage };
     } catch (error) {
       const official = officialCommunicationError(error,'售后回复发送失败');
       await saveOrderApiAudit(authUser.username,context.sellerId,claimLink.rows[0]?.order_id || '',
-        'claim_message_send',String(claimId),{ success:false,receiverRole,status:official.status,error:official.data || { message:official.message } }).catch(()=>{});
+        'claim_message_send',`${claimId}:failed:${Date.now()}`,{ success:false,claimId:String(claimId),receiverRole,
+          request:requestData,status:official.status,error:official.data || { message:official.message } }).catch(()=>{});
       const replyError = new Error(official.message);
       replyError.status = official.status;
       throw replyError;
@@ -6319,7 +6381,7 @@ async function getOrderMessagesData(authUser,orderId) {
     if (!context) { const error=new Error('该订单所属店铺授权已失效'); error.status=403; throw error; }
     const token = context.token;
     const packId = rows[0].pack_id || String(orderId);
-    const response = await axios.get(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
+    const response = await axios.get(marketplaceOrderPackMessagesEndpoint(packId), {
       headers: { Authorization: `Bearer ${token}` }, timeout: 20000
     });
     await saveOrderApiAudit(authUser.username,rows[0].store_user_id,String(orderId),'order_messages',String(packId),response.data);
@@ -6367,7 +6429,7 @@ async function sendOrderMessageData(authUser,orderId,body = {}) {
     if (!context) { const error=new Error('该订单所属店铺授权已失效'); error.status=403; throw error; }
     const token = context.token;
     const packId = rows[0].pack_id || String(orderId);
-    const response = await axios.post(`https://api.mercadolibre.com/marketplace/messages/packs/${packId}`, {
+    const response = await axios.post(marketplaceOrderPackMessagesEndpoint(packId), {
       text,text_translated:String(body?.textTranslated || '') || undefined,attachments:[]
     }, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 });
     return response.data;
