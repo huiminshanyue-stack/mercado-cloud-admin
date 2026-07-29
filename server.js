@@ -300,6 +300,7 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_latest JSONB NOT NULL DEFAULT \'{}\'::jsonb');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS shipping_dimensions_updated_at TIMESTAMPTZ');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS is_marked BOOLEAN NOT NULL DEFAULT FALSE');
+  await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS mark_type VARCHAR(20)');
   await pool.query('ALTER TABLE ml_orders ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_shipping_labels (
     owner_username VARCHAR(120) NOT NULL,
@@ -2860,6 +2861,7 @@ async function aggregatePackedOrders(rows) {
       group.dimensionsUpdatedAt = row.dimensionsUpdatedAt || row.dimensionsLatest.fetchedAt || null;
     }
     group.isMarked ||= Boolean(row.isMarked);
+    if (row.isMarked && row.markType) group.markType = row.markType;
     if (row.reputationImpact === true) {
       group.reputationImpact = true;
       group.reputationFeedback ||= row.reputationFeedback || '';
@@ -3771,7 +3773,7 @@ async function getOrderListData(authUser,query = {}) {
     SELECT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) AS display_id,MAX(o.date_created) AS group_date
     FROM ml_orders o ${clause} GROUP BY COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)
     ORDER BY group_date DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}
-  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",o.is_marked AS "isMarked",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.shipping_dimensions_original AS "dimensionsOriginal",o.shipping_dimensions_latest AS "dimensionsLatest",o.shipping_dimensions_updated_at AS "dimensionsUpdatedAt"
+  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",o.is_marked AS "isMarked",o.mark_type AS "markType",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.shipping_dimensions_original AS "dimensionsOriginal",o.shipping_dimensions_latest AS "dimensionsLatest",o.shipping_dimensions_updated_at AS "dimensionsUpdatedAt"
     FROM page_groups pg JOIN ml_orders o ON COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)=pg.display_id AND o.owner_username=$1
     LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ORDER BY pg.group_date DESC NULLS LAST,o.date_created`, params);
   const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE owner_username=$2 AND ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId),req.authUser.username]) : { rows: [] };
@@ -5168,11 +5170,20 @@ app.patch('/api/admin/orders/:orderId/cost', requireOrderAccess, async (req, res
 
 app.patch('/api/admin/orders/:orderId/mark', requireOrderAccess, async (req, res) => {
   const marked = Boolean(req.body?.marked);
-  const { rowCount } = await pool.query(`UPDATE ml_orders SET is_marked=$1,updated_at=NOW()
-    WHERE owner_username=$2 AND (ml_order_id=$3 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$3)`,
-    [marked,req.authUser.username,String(req.params.orderId)]);
+  const requestedType = req.body?.markType == null ? null : String(req.body.markType).trim();
+  const allowedTypes = new Set(['purchased', 'problem']);
+  if (marked && requestedType && !allowedTypes.has(requestedType)) {
+    return res.status(400).json({ code: 400, message: '标记类型无效' });
+  }
+  const markType = marked ? requestedType : null;
+  const { rowCount } = await pool.query(`UPDATE ml_orders
+    SET is_marked=$1,
+        mark_type=CASE WHEN $1=FALSE THEN NULL WHEN $2::varchar IS NULL THEN mark_type ELSE $2 END,
+        updated_at=NOW()
+    WHERE owner_username=$3 AND (ml_order_id=$4 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$4)`,
+    [marked,markType,req.authUser.username,String(req.params.orderId)]);
   if (!rowCount) return res.status(404).json({ code: 404, message: '订单不存在或无权操作' });
-  res.json({ code: 0, data: { marked } });
+  res.json({ code: 0, data: { marked, markType } });
 });
 
 app.delete('/api/admin/orders/:orderId', requireOrderAccess, async (req, res) => {
