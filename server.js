@@ -3956,6 +3956,8 @@ app.get('/api/marketing/accounts', requireAuth, async (req, res) => {
 
 const marketingCache = new Map();
 const marketingItemCache = new Map();
+const marketingItemDetailInflight = new Map();
+const marketingItemDetailRetryAfter = new Map();
 const promotionNameTranslationCache = new Map();
 const productAdsCache = new Map();
 const productAdsAnalyticsCache = new Map();
@@ -4003,6 +4005,36 @@ function writeTimedCache(cache, key, data, maxEntries) {
   cache.set(key, { data, time: Date.now() });
   while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
   return data;
+}
+
+async function loadMarketingItemDetail(token, itemId) {
+  const normalizedItemId = String(itemId || '').trim().toUpperCase();
+  if (!normalizedItemId) return {};
+  const cacheKey = `item:${normalizedItemId}`;
+  const cached = readTimedCache(marketingItemCache, cacheKey, MARKETING_ITEM_CACHE_TTL);
+  if (hasMarketingItemPresentation(cached)) return cached;
+  if ((marketingItemDetailRetryAfter.get(normalizedItemId) || 0) > Date.now()) return cached || {};
+  if (marketingItemDetailInflight.has(normalizedItemId)) return marketingItemDetailInflight.get(normalizedItemId);
+
+  const request = axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(normalizedItemId)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 15000
+  }).then(response => {
+    const detail = response.data || {};
+    writeTimedCache(marketingItemCache, cacheKey, detail, 500);
+    if (hasMarketingItemPresentation(detail)) marketingItemDetailRetryAfter.delete(normalizedItemId);
+    else marketingItemDetailRetryAfter.set(normalizedItemId, Date.now() + 60 * 1000);
+    return detail;
+  }).catch(error => {
+    marketingItemDetailRetryAfter.set(normalizedItemId, Date.now() + 30 * 1000);
+    throw error;
+  }).finally(() => {
+    marketingItemDetailInflight.delete(normalizedItemId);
+    while (marketingItemDetailRetryAfter.size > 500) marketingItemDetailRetryAfter.delete(marketingItemDetailRetryAfter.keys().next().value);
+  });
+
+  marketingItemDetailInflight.set(normalizedItemId, request);
+  return request;
 }
 
 async function mapWithConcurrency(items, limit, worker) {
@@ -4156,10 +4188,9 @@ async function loadPromotionSites(auth, token, force = false) {
     const cached = readTimedCache(marketingCache, cacheKey, 5 * 60 * 1000);
     if (cached) return cached;
   }
-  const supportedSiteIds = new Set(['MLM', 'MLB', 'MLC', 'MCO', 'MLA']);
   const discovered = [];
   const directSiteId = String(auth.site_id || '').toUpperCase();
-  if (directSiteId && directSiteId !== 'CBT') {
+  if (/^ML[A-Z]$/.test(directSiteId)) {
     discovered.push({ siteId: directSiteId, userId: String(auth.ml_user_id), source: 'authorization', logisticType: '', pricingModel: '' });
   }
   if (directSiteId === 'CBT') {
@@ -4169,7 +4200,7 @@ async function loadPromotionSites(auth, token, force = false) {
     for (const marketplace of Array.isArray(response.data?.marketplaces) ? response.data.marketplaces : []) {
       const siteId = String(marketplace.site_id || '').toUpperCase();
       const userId = String(marketplace.user_id || '');
-      if (!supportedSiteIds.has(siteId) || !/^\d+$/.test(userId)) continue;
+      if (!/^ML[A-Z]$/.test(siteId) || !/^\d+$/.test(userId)) continue;
       discovered.push({
         siteId,
         userId,
@@ -4183,7 +4214,11 @@ async function loadPromotionSites(auth, token, force = false) {
   const unique = [...new Map(discovered.map(site => [`${site.siteId}:${site.userId}`, site])).values()]
     .sort((a, b) => {
       const order = ['MLM', 'MLB', 'MLC', 'MCO', 'MLA'];
-      const siteOrder = order.indexOf(a.siteId) - order.indexOf(b.siteId);
+      const siteRank = siteId => {
+        const index = order.indexOf(siteId);
+        return index === -1 ? order.length : index;
+      };
+      const siteOrder = siteRank(a.siteId) - siteRank(b.siteId) || a.siteId.localeCompare(b.siteId);
       if (siteOrder) return siteOrder;
       if (a.logisticType === b.logisticType) return 0;
       return a.logisticType === 'remote' ? -1 : 1;
@@ -4203,7 +4238,7 @@ async function loadSitePromotions(token, site, force = false) {
   });
   let promotions = Array.isArray(response.data?.results) ? response.data.results : [];
   promotions = promotions.filter(promotion => {
-    const promotionSite = String(promotion.id || '').toUpperCase().match(/(?:^|-)(MLM|MLB|MLC|MCO|MLA)(?:\d|$)/)?.[1];
+    const promotionSite = String(promotion.id || '').toUpperCase().match(/(?:^|-)(ML[A-Z])(?:\d|$)/)?.[1];
     if (promotionSite) return promotionSite === site.siteId;
     return true;
   });
@@ -4411,7 +4446,9 @@ app.get('/api/marketing/product-ads/analytics', requireAuth, async (req, res) =>
   }
 });
 
-app.get('/api/marketing/products', requireAuth, async (req, res) => {
+app.get('/api/marketing/legacy-products-disabled', requireAuth, async (req, res) => {
+  return res.status(410).json({ code: 410, message: '该旧版营销商品接口已停用，请使用活动商品或商品广告接口。' });
+  /* istanbul ignore next -- retained temporarily for rollback reference */
   try {
     const siteId = String(req.query.siteId || '').trim().toUpperCase();
     const page = Math.max(1, Number(req.query.page) || 1);
@@ -4533,7 +4570,6 @@ app.put('/api/marketing/product-ads/ad-groups/:adGroupId', requireAuth, async (r
       status, campaign_id: Number(campaignId)
     }, { headers: { ...getProductAdsHeaders(token), 'Content-Type': 'application/json' }, timeout: 25000 });
     for (const key of productAdsCache.keys()) if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
-    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${auth.ml_user_id}:${siteId}:`)) marketingProductsCache.delete(key);
     res.json({ code: 0, message: '商品广告已由美客多确认更新', data: { adGroupId, status: response.data?.status || status, campaignId: response.data?.campaign_id || Number(campaignId) } });
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
@@ -4739,19 +4775,19 @@ app.delete('/api/marketing/product-ads/campaigns/:campaignId/ad-groups/:adGroupI
     const site = sites.find(item => item.siteId === siteId);
     if (!site) return res.status(403).json({ code: 403, message: '该国家广告账户不属于当前授权店铺' });
     const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/ad_groups/${encodeURIComponent(adGroupId)}`, {
-      headers: { Authorization: `Bearer ${token}` }, timeout: 20000
+      headers: getProductAdsHeaders(token), timeout: 20000
     });
     const actualCampaignId = String(detailResponse.data?.campaign_id || '').trim();
     if (!actualCampaignId) return res.status(409).json({ code: 409, message: '该广告组当前未加入任何广告活动，无需移除' });
     await axios.delete(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/campaigns/${encodeURIComponent(actualCampaignId)}/ad_groups/${encodeURIComponent(adGroupId)}`, {
-      headers: { Authorization: `Bearer ${token}` }, timeout: 25000
+      headers: getProductAdsHeaders(token), timeout: 25000
     });
     let confirmedCampaignId = actualCampaignId;
     for (let attempt = 0; attempt < 3 && confirmedCampaignId === actualCampaignId; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 500));
       try {
         const confirmation = await axios.get(`https://api.mercadolibre.com/marketplace/advertising/${encodeURIComponent(siteId)}/product_ads/ad_groups/${encodeURIComponent(adGroupId)}`, {
-          headers: { Authorization: `Bearer ${token}` }, timeout: 15000
+          headers: getProductAdsHeaders(token), timeout: 15000
         });
         confirmedCampaignId = String(confirmation.data?.campaign_id || '').trim();
       } catch (confirmationError) {
@@ -4763,7 +4799,6 @@ app.delete('/api/marketing/product-ads/campaigns/:campaignId/ad-groups/:adGroupI
       return res.status(409).json({ code: 409, message: '美客多已接收移除请求，但该广告组仍在原活动中，可能是平台锁定或受保护的主活动，当前不能移除' });
     }
     for (const key of productAdsCache.keys()) if (key.startsWith(`product-ads-overview:${auth.ml_user_id}:`)) productAdsCache.delete(key);
-    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${auth.ml_user_id}:${siteId}:`)) marketingProductsCache.delete(key);
     res.json({ code: 0, message: confirmedCampaignId ? '广告组已移出当前活动，并由美客多转入其他活动' : '广告组已从当前广告活动移除，店铺商品不会被删除', data: { previousCampaignId: actualCampaignId, currentCampaignId: confirmedCampaignId || null } });
   } catch (error) {
     const status = error.statusCode || error.response?.status || 500;
@@ -4771,7 +4806,9 @@ app.delete('/api/marketing/product-ads/campaigns/:campaignId/ad-groups/:adGroupI
   }
 });
 
-app.post('/api/marketing/promotion-items/match-selected', requireAuth, async (req, res) => {
+app.post('/api/marketing/legacy-promotion-items-match-selected-disabled', requireAuth, async (req, res) => {
+  return res.status(410).json({ code: 410, message: '该旧版活动匹配接口已停用，请直接使用活动候选商品接口。' });
+  /* istanbul ignore next -- retained temporarily for rollback reference */
   try {
     const promotionId = String(req.body?.promotionId || '').trim();
     const promotionType = String(req.body?.promotionType || '').trim().toUpperCase();
@@ -4910,31 +4947,20 @@ app.get('/api/marketing/promotion-items', requireAuth, async (req, res) => {
       return true;
     });
     const missingDetailIds = rawItems.map(item => String(item.id || '')).filter(itemId => itemId && !hasMarketingItemPresentation(readTimedCache(marketingItemCache, `item:${itemId}`, MARKETING_ITEM_CACHE_TTL)));
-    if (missingDetailIds.length) {
+    await mapWithConcurrency(missingDetailIds, 3, async itemId => {
       try {
-        const detailResponse = await axios.get('https://api.mercadolibre.com/items', {
-          params: { ids: missingDetailIds.join(',') }, headers: { Authorization: `Bearer ${token}` }, timeout: 20000
-        });
-        for (const entry of Array.isArray(detailResponse.data) ? detailResponse.data : []) {
-          const detail = entry?.body || entry;
-          const itemId = String(detail?.id || '');
-          if (itemId && hasMarketingItemPresentation(detail)) writeTimedCache(marketingItemCache, `item:${itemId}`, detail, 500);
-        }
+        await loadMarketingItemDetail(token, itemId);
       } catch (error) {
-        console.warn('[Marketing] 商品详情批量预取失败，改用逐件读取:', error.message);
+        console.warn('[Marketing] 商品详情预取失败:', itemId, error.message);
       }
-    }
-    const items = await mapWithConcurrency(rawItems, 4, async item => {
+    });
+    const items = await mapWithConcurrency(rawItems, 3, async item => {
       const offer = Array.isArray(item.offers) ? (item.offers.find(entry => entry?.status === 'candidate') || item.offers[0] || {}) : {};
       const cacheKey = `item:${item.id}`;
       let detail = readTimedCache(marketingItemCache, cacheKey, MARKETING_ITEM_CACHE_TTL);
       if (!hasMarketingItemPresentation(detail)) {
         try {
-          const detailResponse = await axios.get(`https://api.mercadolibre.com/marketplace/items/${encodeURIComponent(item.id)}`, {
-            headers: { Authorization: `Bearer ${token}` },
-            timeout: 15000
-          });
-          detail = writeTimedCache(marketingItemCache, cacheKey, detailResponse.data || {}, 500);
+          detail = await loadMarketingItemDetail(token, item.id);
         } catch (error) {
           detail = {};
         }
@@ -4980,6 +5006,9 @@ function buildPromotionEnrollmentBody(promotionType, promotionId, item) {
   const dealPrice = Number(item.dealPrice);
   const originalPrice = Number(item.originalPrice);
   const offerId = String(item.offerId || '').trim();
+  if (promotionType === 'CLEARANCE') {
+    throw new Error('清仓活动由美客多自动管理，官方接口不允许通过 API 报名、改价或退出；系统仅提供活动和商品查询。');
+  }
   if (['DEAL', 'SELLER_CAMPAIGN'].includes(promotionType)) {
     if (!(dealPrice > 0)) throw new Error('请填写有效活动价');
     const body = { promotion_id: promotionId, promotion_type: promotionType, deal_price: dealPrice };
@@ -5010,6 +5039,9 @@ async function validatePromotionRequest(authUser, body) {
   const promotionId = String(body.promotionId || '').trim();
   const promotionType = String(body.promotionType || '').trim().toUpperCase();
   const siteId = String(body.siteId || '').trim().toUpperCase();
+  if (promotionType === 'CLEARANCE') {
+    throw Object.assign(new Error('清仓活动由美客多自动管理，官方接口不允许通过 API 报名、改价或退出；系统仅提供活动和商品查询。'), { statusCode: 400 });
+  }
   const { auth, token } = await resolveMarketingAuthorization(authUser, body.storeId);
   const sites = await loadPromotionSites(auth, token);
   const resolved = await resolvePromotionSite(sites, token, siteId, promotionId, promotionType);
@@ -5044,7 +5076,6 @@ app.post('/api/marketing/promotions/enroll-batch', requireAuth, async (req, res)
     marketingCache.delete(`promotions:${context.site.siteId}:${context.site.userId}`);
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
-    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${context.auth.ml_user_id}:${context.site.siteId}:`)) marketingProductsCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
@@ -5085,7 +5116,6 @@ app.post('/api/marketing/promotions/exit-batch', requireAuth, async (req, res) =
     marketingCache.delete(`promotions:${context.site.siteId}:${context.site.userId}`);
     for (const key of promotionPageCursorCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionPageCursorCache.delete(key);
     for (const key of promotionItemsPageCache.keys()) if (key.includes(`:${context.site.siteId}:${context.promotionId}:`)) promotionItemsPageCache.delete(key);
-    for (const key of marketingProductsCache.keys()) if (key.startsWith(`marketing-products:${context.auth.ml_user_id}:${context.site.siteId}:`)) marketingProductsCache.delete(key);
     res.json({ code: 0, data: {
       successCount: results.filter(item => item.success).length,
       failedCount: results.filter(item => !item.success).length,
