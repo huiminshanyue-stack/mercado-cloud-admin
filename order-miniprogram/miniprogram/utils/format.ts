@@ -84,24 +84,13 @@ export function cancellationText(value?:string): string {
 export function deadlineText(order:any): string {
   const state=orderState(order);
   if (state!=='待发货') return state;
-  if (!order.handlingDeadline) return '待发货时间：同步后计算';
+  if (!order.handlingDeadline) return '官方待发货截止：官方暂未返回';
   const deadline=parseTimestamp(order.handlingDeadline);
-  if (!Number.isFinite(deadline)) return '待发货时间：同步后计算';
-  const prefix=order.deadlineIsEstimated ? '预计' : '官方';
+  if (!Number.isFinite(deadline)) return '官方待发货截止：官方暂未返回';
   const remaining=deadline-Date.now();
-  if (remaining<=0) return `已超过${prefix}发货时间`;
+  if (remaining<=0) return '已超过官方待发货时间';
   const hours=Math.ceil(remaining/3600000);
-  return hours<=24 ? `${prefix}剩余 ${hours} 小时，可能延误` : `${prefix}待发货截止：${formatDate(order.handlingDeadline)}`;
-}
-
-export function onlineDeadlineText(order:any): string {
-  if (orderState(order)!=='待发货') return '已结束计时';
-  if (!order.handlingDeadline) return '待获取基础时效';
-  const base=parseTimestamp(order.handlingDeadline);
-  if (!Number.isFinite(base)) return '待获取基础时效';
-  if (Date.now()<base) return `基础时效结束后开始（${formatDate(order.handlingDeadline)}）`;
-  const remaining=base+24*3600000-Date.now();
-  return remaining<=0 ? '已超过上网时限' : `剩余 ${Math.ceil(remaining/3600000)} 小时`;
+  return hours<=24 ? `官方剩余 ${hours} 小时，可能延误` : `官方待发货截止：${formatDate(order.handlingDeadline)}`;
 }
 
 function compact(value:unknown): string {

@@ -423,18 +423,13 @@ async function initOrderManagementTables() {
     WHERE o.store_user_id=a.ml_user_id AND o.owner_username IS NULL`);
   await pool.query(`UPDATE order_alerts a SET owner_username=o.owner_username FROM ml_orders o
     WHERE a.order_id=o.ml_order_id AND a.owner_username IS NULL`);
-  // 预计发货时效统一为：周一至周四 72 小时；周五、周六 120 小时；周日 96 小时。
-  // 迁移只执行一次且仅调整系统估算值，不覆盖 Mercado Libre 官方返回的 handling deadline。
-  const deadlineRuleVersion = '2026-07-24-72h-v1';
+  // 发货截止时间只采用 Mercado Libre shipment lead_time 官方返回值。
+  // 一次性清理历史系统估算值，禁止再根据下单日期或星期规则生成截止时间。
+  const deadlineRuleVersion = '2026-07-29-official-lead-time-v1';
   const deadlineRuleSetting = await pool.query("SELECT value FROM settings WHERE key='order_deadline_rule_version'");
   if (deadlineRuleSetting.rows[0]?.value !== deadlineRuleVersion) {
-    await pool.query(`UPDATE ml_orders SET handling_deadline=date_created + CASE EXTRACT(DOW FROM
-      COALESCE(NULLIF(LEFT(raw_data->>'date_created',10),'')::date,(date_created AT TIME ZONE 'Asia/Shanghai')::date))
-      WHEN 5 THEN INTERVAL '120 hours'
-      WHEN 6 THEN INTERVAL '120 hours'
-      WHEN 0 THEN INTERVAL '96 hours'
-      ELSE INTERVAL '72 hours' END,updated_at=NOW()
-      WHERE deadline_is_estimated=TRUE AND date_created IS NOT NULL`);
+    await pool.query(`UPDATE ml_orders SET handling_deadline=NULL,deadline_is_estimated=FALSE,updated_at=NOW()
+      WHERE deadline_is_estimated=TRUE`);
     await pool.query(`UPDATE order_alerts SET is_read=TRUE
       WHERE alert_type='deadline' AND event_key LIKE 'deadline:%'`);
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_deadline_rule_version',$1,NOW())
@@ -587,7 +582,7 @@ async function initOrderManagementTables() {
               OR COALESCE(o.refund_amount,0)>0
             )
           )
-          OR COALESCE(o.handling_deadline,o.date_created)+INTERVAL '24 hours'<NOW()
+          OR (o.handling_deadline IS NOT NULL AND o.handling_deadline<NOW())
           OR LOWER(COALESCE(o.shipment_status,'')) IN ('shipped','delivered')
         )`);
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_terminal_alert_cleanup_version',$1,NOW())
@@ -3440,6 +3435,37 @@ async function syncOrdersForUser(authUser, body = {}) {
         }));
       }
     }
+    // 待发货截止时间只采用 Mercado Libre 官方 shipment lead_time。
+    // 同一运单只请求一次，并限制并发，避免全量同步时放大外部接口压力。
+    const ordersByShipmentId = new Map();
+    for (const order of sourceOrders) {
+      const shipmentId = String(order.shipping?.id || '').trim();
+      if (!shipmentId) continue;
+      if (!ordersByShipmentId.has(shipmentId)) ordersByShipmentId.set(shipmentId, []);
+      ordersByShipmentId.get(shipmentId).push(order);
+    }
+    const shipmentLeadTimeEntries = [...ordersByShipmentId.entries()];
+    for (let i = 0; i < shipmentLeadTimeEntries.length; i += 5) {
+      await Promise.all(shipmentLeadTimeEntries.slice(i, i + 5).map(async ([shipmentId, orders]) => {
+        try {
+          const leadTimeResponse = await axios.get(
+            `https://api.mercadolibre.com/marketplace/shipments/${encodeURIComponent(shipmentId)}/lead_time`,
+            { headers: { Authorization: `Bearer ${accessToken}`, 'x-format-new': 'true' }, timeout: 15000 }
+          );
+          const fetchedAt = new Date().toISOString();
+          for (const order of orders) {
+            order._shipment_lead_time = leadTimeResponse.data || {};
+            order._shipment_lead_time_fetch_succeeded = true;
+            order._shipment_lead_time_fetched_at = fetchedAt;
+          }
+        } catch (error) {
+          for (const order of orders) order._shipment_lead_time_fetch_succeeded = false;
+          if (![403, 404].includes(error.response?.status)) {
+            console.warn('[Orders] 官方待发货截止时间读取失败:', shipmentId, error.response?.status || error.message);
+          }
+        }
+      }));
+    }
     const itemIds = [...new Set(sourceOrders.flatMap(order =>
       (order.order_items || []).map(entry => entry.item?.id).filter(Boolean)
     ))];
@@ -3539,20 +3565,8 @@ async function syncOrdersForUser(authUser, body = {}) {
       const itemId = order.order_items?.[0]?.item?.id || '';
       const siteId = shipment.source?.site_id || shipment.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '';
       const country = ({ MLM:'MX', MLB:'BR', MLC:'CL', MCO:'CO', MLA:'AR' })[siteId] || siteId;
-      const officialHandlingDeadline = shipment.shipping_option?.estimated_handling_limit?.date ||
-        shipment.lead_time?.estimated_handling_limit?.date || shipment.estimated_handling_limit?.date || null;
+      const officialHandlingDeadline = order._shipment_lead_time?.estimated_schedule_limit?.date || null;
       let handlingDeadline = officialHandlingDeadline;
-      if (!handlingDeadline && order.date_created) {
-        const created = new Date(order.date_created);
-        const sourceCalendarDate = String(order.date_created).match(/^\d{4}-\d{2}-\d{2}/)?.[0];
-        const createdWeekday = sourceCalendarDate
-          ? new Date(`${sourceCalendarDate}T12:00:00Z`).getUTCDay()
-          : created.getUTCDay();
-        const dispatchHours = createdWeekday === 5 || createdWeekday === 6
-          ? 120
-          : (createdWeekday === 0 ? 96 : 72);
-        handlingDeadline = new Date(created.getTime() + dispatchHours * 3600000).toISOString();
-      }
       const cancelActor = order.cancel_detail?.group || order.cancel_detail?.initiated_by ||
         order.cancel_detail?.responsible || order.cancellation?.initiated_by ||
         order.cancellation?.cancelled_by || order.cancelled_by || '';
@@ -3606,7 +3620,22 @@ async function syncOrdersForUser(authUser, body = {}) {
       const grossAmountUsd = usdRate === null ? null : Number((grossAmount * usdRate).toFixed(2));
       const refundAmountUsd = usdRate === null ? null : Number((Number(refundAmount || 0) * usdRate).toFixed(2));
       const finalNetAmountUsd = finalNetAmount === null || usdRate === null ? null : Number((Number(finalNetAmount) * usdRate).toFixed(2));
-      const previous = await pool.query('SELECT status,shipment_status,refund_amount,tracking_number,tracking_method FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
+      const previous = await pool.query('SELECT status,shipment_status,refund_amount,tracking_number,tracking_method,handling_deadline,deadline_is_estimated,shipment_data FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
+      // 官方接口临时失败时保留上一次成功缓存的官方值；官方成功但没有返回日期时清空。
+      if (!order._shipment_lead_time_fetch_succeeded && !handlingDeadline &&
+          previous.rows[0]?.handling_deadline && previous.rows[0]?.deadline_is_estimated !== true) {
+        handlingDeadline = previous.rows[0].handling_deadline;
+      }
+      const previousShipmentData = previous.rows[0]?.shipment_data && typeof previous.rows[0].shipment_data === 'object'
+        ? previous.rows[0].shipment_data : {};
+      const shipmentAudit = {
+        ...previousShipmentData,
+        ...shipment,
+        ...(order._shipment_lead_time_fetch_succeeded ? {
+          _official_lead_time: order._shipment_lead_time || {},
+          _official_lead_time_fetched_at: order._shipment_lead_time_fetched_at
+        } : {})
+      };
       const resolvedTrackingNumber = chooseOfficialTrackingNumber(
         shipment.tracking_method || previous.rows[0]?.tracking_method || '',
         [previous.rows[0]?.tracking_number,order.shipping?.tracking_number,shipment.tracking_number,
@@ -3653,8 +3682,8 @@ async function syncOrdersForUser(authUser, body = {}) {
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
           JSON.stringify(orderItems), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
           resolvedTrackingNumber, shipment.tracking_method || previous.rows[0]?.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
-          order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, !officialHandlingDeadline,
-          String(cancellationReason).slice(0, 500), JSON.stringify(shipment), String(me.id || sellerId),
+          order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, false,
+          String(cancellationReason).slice(0, 500), JSON.stringify(shipmentAudit), String(me.id || sellerId),
           finalSaleFee, finalShippingFee, finalNetAmount, refundAmount, otherFee, JSON.stringify(billingDetail || {}), Boolean(billingDetail),
           req.authUser.username, grossAmountUsd, finalNetAmountUsd, refundAmountUsd]
       );
@@ -3679,6 +3708,13 @@ async function syncOrdersForUser(authUser, body = {}) {
       }
       if (billingDetail) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'billing',String(order.id),billingDetail);
       if (Object.keys(shipment).length) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'shipment',String(order.shipping?.id || order.id),shipment);
+      if (order._shipment_lead_time_fetch_succeeded) await saveOrderApiAudit(
+        req.authUser.username,String(me.id || sellerId),String(order.id),'shipment_lead_time',String(order.shipping?.id || order.id),{
+          shipment_id: String(order.shipping?.id || ''),
+          response: order._shipment_lead_time || {},
+          fetched_at: order._shipment_lead_time_fetched_at
+        }
+      );
       if (order._official_reputation) await saveOrderApiAudit(req.authUser.username,String(me.id || sellerId),String(order.id),'reputation',String(order.id),order._official_reputation);
       const old = previous.rows[0];
       const fulfillmentFinished = isFulfillmentFinished({
@@ -3722,7 +3758,7 @@ async function syncOrdersForUser(authUser, body = {}) {
       if (deadlineFinished) await pool.query(`UPDATE order_alerts SET is_read=TRUE
         WHERE owner_username=$1 AND order_id=$2 AND alert_type IN ('new_order','deadline')`, [req.authUser.username,String(order.id)]);
       if (handlingDeadline && !deadlineFinished && new Date(handlingDeadline).getTime() > Date.now() && new Date(handlingDeadline).getTime() - Date.now() <= 86400000) {
-        await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'deadline','订单即将延误',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `${officialHandlingDeadline ? '官方' : '预计'}待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
+        await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key) VALUES($1,$2,'deadline','订单即将延误',$3,$4) ON CONFLICT(event_key) DO NOTHING`, [req.authUser.username,String(order.id), `官方待发货截止时间：${handlingDeadline}`, `deadline:${order.id}:${handlingDeadline}`]);
       }
       imported++;
     }

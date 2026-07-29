@@ -44,8 +44,8 @@ function normalize(order:any) {
     countryName:country.name,countryFlag:country.flag,dateText:formatDate(order.dateCreated),
     dispatchDeadlineText:stateKey === 'pending'
       ? (order.handlingDeadline
-        ? `${order.deadlineIsEstimated ? '预计' : '官方'}待发货截止：${formatDate(order.handlingDeadline)}`
-        : '预计待发货截止：同步后计算')
+        ? `官方待发货截止：${formatDate(order.handlingDeadline)}`
+        : '官方待发货截止：官方暂未返回')
       : '',
     products,productCount:products.reduce((total:number,product:any)=>total+product.quantity,0),
     grossText:money(order.grossAmountUsd ?? order.paidAmount,'USD'),

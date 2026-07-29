@@ -62,7 +62,6 @@
       <view class="row"><text>物流方式</text><text>{{order.trackingMethod || '-'}}</text></view>
       <view class="row"><text>国际运单号</text><text user-select="true">{{order.trackingNumber || '-'}}</text></view>
       <view class="row"><text>Shipment ID</text><text user-select="true">{{order.shippingId || '-'}}</text></view>
-      <view class="row"><text>24小时上网</text><text>{{order.onlineText}}</text></view>
     </view>
     <view class="readonly">成本保存、售前咨询和售后回复已与服务器同步；代贴单等高风险操作仍未在小程序开放。</view>
   </block>

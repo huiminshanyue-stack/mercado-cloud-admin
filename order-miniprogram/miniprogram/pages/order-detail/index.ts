@@ -1,5 +1,5 @@
 import { request,showError } from '../../utils/request';
-import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWeightState,formatDate,money,onlineDeadlineText,orderState,platformDimensionSourceNote,reputationReasonText } from '../../utils/format';
+import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWeightState,formatDate,money,orderState,platformDimensionSourceNote,reputationReasonText } from '../../utils/format';
 
 Page({
   data:{ loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false },
@@ -40,7 +40,7 @@ Page({
           ? 'muted'
           : Number(raw.profitCny) < 0 ? 'danger' : 'success',
         payoutHint:raw.payoutIsOfficial ? '官方实际净回款' : '官方净回款待获取',
-        deadlineText:deadlineText(raw),onlineText:onlineDeadlineText(raw),
+        deadlineText:deadlineText(raw),
         cancellationText:cancellationText(raw.cancellationReason),
         sellerDimensionText:dimensionSummary(dimensionSnapshot,'seller'),
         platformDimensionText:dimensionSummary(dimensionSnapshot,'platform'),
