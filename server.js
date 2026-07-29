@@ -14,6 +14,7 @@ const { dimensionSnapshotsDiffer,normalizeBillableWeight,
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert,
   shouldCreateShippedAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision } = require('./order-sync-policy');
+const { resolveOfficialHandlingDeadline } = require('./order-deadline-policy');
 const { normalizeOrderItems } = require('./order-items');
 const { normalizeSummaryPeriod,buildOrderWorkbenchSummary } = require('./order-workbench-summary');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
@@ -3045,8 +3046,11 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-29.01',
-    dispatchDeadlineSource: 'marketplace-shipment-lead-time-estimated-schedule-limit',
+    version: '2026-07-29.02',
+    dispatchDeadlineSource: 'marketplace-shipment-lead-time',
+    dispatchDeadlineExactField: 'estimated_schedule_limit.date',
+    dispatchDeadlineFallbackField: 'estimated_delivery_time.handling',
+    customWeekdayDeadlineRules: false,
     officialPayoutFromLedger: true,
     shippingActionsHorizontal: true,
     officialClaimReputation: true,
@@ -3564,8 +3568,12 @@ async function syncOrdersForUser(authUser, body = {}) {
       const itemId = order.order_items?.[0]?.item?.id || '';
       const siteId = shipment.source?.site_id || shipment.site_id || itemId.match(/^(MLM|MLB|MLC|MCO|MLA)/)?.[1] || '';
       const country = ({ MLM:'MX', MLB:'BR', MLC:'CL', MCO:'CO', MLA:'AR' })[siteId] || siteId;
-      const officialHandlingDeadline = order._shipment_lead_time?.estimated_schedule_limit?.date || null;
-      let handlingDeadline = officialHandlingDeadline;
+      const deadlineResolution = resolveOfficialHandlingDeadline({
+        dateCreated: order.date_created,
+        leadTime: order._shipment_lead_time
+      });
+      let handlingDeadline = deadlineResolution.deadline;
+      let deadlineIsEstimated = deadlineResolution.isEstimated;
       const cancelActor = order.cancel_detail?.group || order.cancel_detail?.initiated_by ||
         order.cancel_detail?.responsible || order.cancellation?.initiated_by ||
         order.cancellation?.cancelled_by || order.cancelled_by || '';
@@ -3622,8 +3630,9 @@ async function syncOrdersForUser(authUser, body = {}) {
       const previous = await pool.query('SELECT status,shipment_status,refund_amount,tracking_number,tracking_method,handling_deadline,deadline_is_estimated,shipment_data FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
       // 官方接口临时失败时保留上一次成功缓存的官方值；官方成功但没有返回日期时清空。
       if (!order._shipment_lead_time_fetch_succeeded && !handlingDeadline &&
-          previous.rows[0]?.handling_deadline && previous.rows[0]?.deadline_is_estimated !== true) {
+          previous.rows[0]?.handling_deadline) {
         handlingDeadline = previous.rows[0].handling_deadline;
+        deadlineIsEstimated = previous.rows[0].deadline_is_estimated === true;
       }
       const previousShipmentData = previous.rows[0]?.shipment_data && typeof previous.rows[0].shipment_data === 'object'
         ? previous.rows[0].shipment_data : {};
@@ -3632,7 +3641,13 @@ async function syncOrdersForUser(authUser, body = {}) {
         ...shipment,
         ...(order._shipment_lead_time_fetch_succeeded ? {
           _official_lead_time: order._shipment_lead_time || {},
-          _official_lead_time_fetched_at: order._shipment_lead_time_fetched_at
+          _official_lead_time_fetched_at: order._shipment_lead_time_fetched_at,
+          _official_handling_deadline_resolution: {
+            source: deadlineResolution.source,
+            handling_hours: deadlineResolution.handlingHours,
+            deadline: handlingDeadline,
+            is_estimated: deadlineIsEstimated
+          }
         } : {})
       };
       const resolvedTrackingNumber = chooseOfficialTrackingNumber(
@@ -3681,7 +3696,7 @@ async function syncOrdersForUser(authUser, body = {}) {
           order.total_amount || 0, order.paid_amount || 0, order.shipping?.id ? String(order.shipping.id) : null,
           JSON.stringify(orderItems), JSON.stringify(order), siteId, country, shipment.status || '', shipment.substatus || '',
           resolvedTrackingNumber, shipment.tracking_method || previous.rows[0]?.tracking_method || '', shipment.logistic?.type || shipment.logistic_type || '',
-          order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, false,
+          order.pack_id ? String(order.pack_id) : String(order.id), handlingDeadline, deadlineIsEstimated,
           String(cancellationReason).slice(0, 500), JSON.stringify(shipmentAudit), String(me.id || sellerId),
           finalSaleFee, finalShippingFee, finalNetAmount, refundAmount, otherFee, JSON.stringify(billingDetail || {}), Boolean(billingDetail),
           req.authUser.username, grossAmountUsd, finalNetAmountUsd, refundAmountUsd]

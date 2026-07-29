@@ -10,6 +10,7 @@
     "test:order-payout-backfill": "node scripts/test-order-payout-backfill.js",
     "test:order-alerts": "node scripts/test-order-alert-policy.js",
     "test:order-sync": "node scripts/test-order-sync-policy.js",
+    "test:order-deadline": "node scripts/test-order-deadline-policy.js",
     "test:order-logistics": "node scripts/test-order-logistics.js",
     "test:order-dimensions": "node scripts/test-order-dimensions.js",
     "test:order-items": "node scripts/test-order-items.js",
