@@ -3045,9 +3045,8 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-28.01',
-    dispatchDeadlineRule: 'mon-thu-72h_fri-sat-120h_sun-96h',
-    onlineDeadlineRule: 'handling-deadline-plus-24h',
+    version: '2026-07-29.01',
+    dispatchDeadlineSource: 'marketplace-shipment-lead-time-estimated-schedule-limit',
     officialPayoutFromLedger: true,
     shippingActionsHorizontal: true,
     officialClaimReputation: true,
@@ -3122,7 +3121,7 @@ app.get('/api/health/order-management', (req, res) => {
     singlePlayVoiceAlerts: true,
     fullDateRangeOrderPagination: true,
     syncInsertedAndUpdatedCounts: true,
-    fulfillmentAlertWindow: 'order-created-through-handling-deadline-plus-24h',
+    fulfillmentAlertWindow: 'through-official-handling-deadline',
     historicalCancellationAlertSuppression: true,
     officialAlertEventTime: true,
     wechatMiniProgramApiV1: true,
