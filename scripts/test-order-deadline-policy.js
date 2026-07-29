@@ -25,10 +25,10 @@ const duration = resolveOfficialHandlingDeadline({
   }
 });
 assert.deepStrictEqual(duration, {
-  deadline: '2026-07-31T04:02:56.000Z',
-  isEstimated: true,
-  source: 'estimated_delivery_time.handling',
-  handlingHours: 72
+  deadline: null,
+  isEstimated: false,
+  source: '',
+  handlingHours: null
 });
 
 const zeroDuration = resolveOfficialHandlingDeadline({
@@ -36,10 +36,10 @@ const zeroDuration = resolveOfficialHandlingDeadline({
   leadTime: { estimated_delivery_time: { handling: 0 } }
 });
 assert.deepStrictEqual(zeroDuration, {
-  deadline: '2026-07-28T04:02:56.000Z',
-  isEstimated: true,
-  source: 'estimated_delivery_time.handling',
-  handlingHours: 0
+  deadline: null,
+  isEstimated: false,
+  source: '',
+  handlingHours: null
 });
 
 assert.strictEqual(resolveOfficialHandlingDeadline({

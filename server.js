@@ -426,7 +426,7 @@ async function initOrderManagementTables() {
     WHERE a.order_id=o.ml_order_id AND a.owner_username IS NULL`);
   // 发货截止时间只采用 Mercado Libre shipment lead_time 官方返回值。
   // 一次性清理历史系统估算值，禁止再根据下单日期或星期规则生成截止时间。
-  const deadlineRuleVersion = '2026-07-29-official-lead-time-v1';
+  const deadlineRuleVersion = '2026-07-29-official-exact-deadline-v2';
   const deadlineRuleSetting = await pool.query("SELECT value FROM settings WHERE key='order_deadline_rule_version'");
   if (deadlineRuleSetting.rows[0]?.value !== deadlineRuleVersion) {
     await pool.query(`UPDATE ml_orders SET handling_deadline=NULL,deadline_is_estimated=FALSE,updated_at=NOW()
@@ -3046,10 +3046,11 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-29.02',
+    version: '2026-07-29.03',
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
-    dispatchDeadlineFallbackField: 'estimated_delivery_time.handling',
+    dispatchDeadlineFallbackField: null,
+    dispatchDeadlineDurationFallback: false,
     customWeekdayDeadlineRules: false,
     officialPayoutFromLedger: true,
     shippingActionsHorizontal: true,
