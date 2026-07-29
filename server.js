@@ -424,15 +424,11 @@ async function initOrderManagementTables() {
     WHERE o.store_user_id=a.ml_user_id AND o.owner_username IS NULL`);
   await pool.query(`UPDATE order_alerts a SET owner_username=o.owner_username FROM ml_orders o
     WHERE a.order_id=o.ml_order_id AND a.owner_username IS NULL`);
-  // 发货截止时间只采用 Mercado Libre shipment lead_time 官方返回值。
-  // 一次性清理历史系统估算值，禁止再根据下单日期或星期规则生成截止时间。
-  const deadlineRuleVersion = '2026-07-29-official-exact-deadline-v3';
+  // 发货截止时间优先采用 Mercado Libre shipment lead_time 官方返回值；
+  // 官方未返回精确时间时保留可审计的处理时长/既定周规则兜底值。
+  const deadlineRuleVersion = '2026-07-30-official-first-with-weekday-fallback-v4';
   const deadlineRuleSetting = await pool.query("SELECT value FROM settings WHERE key='order_deadline_rule_version'");
   if (deadlineRuleSetting.rows[0]?.value !== deadlineRuleVersion) {
-    await pool.query(`UPDATE ml_orders SET handling_deadline=NULL,deadline_is_estimated=FALSE,updated_at=NOW()
-      WHERE deadline_is_estimated=TRUE`);
-    await pool.query(`UPDATE order_alerts SET is_read=TRUE
-      WHERE alert_type='deadline' AND event_key LIKE 'deadline:%'`);
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_deadline_rule_version',$1,NOW())
       ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [deadlineRuleVersion]);
   }
@@ -3326,6 +3322,7 @@ async function syncOrdersForUser(authUser, body = {}) {
   try {
     const requestedStoreId = String(req.body?.storeId || '').trim();
     const requestedOrderId = String(req.body?.orderId || '').trim();
+    const strictSingle = Boolean(req.body?.strictSingle && requestedOrderId);
     const authorizations = await listOrderStoreAuthorizations(req.authUser, requestedStoreId);
     if (!authorizations.length) { const error=new Error('当前账号尚未授权可同步的美客多店铺'); error.status=401; throw error; }
     const selectedAuthorization = authorizations[0];
@@ -3439,7 +3436,17 @@ async function syncOrdersForUser(authUser, body = {}) {
         }));
       }
     }
-    // 待发货截止时间只采用 Mercado Libre 官方 shipment lead_time。
+    // 单笔同步必须只处理该订单，不能因 pack/search 回退混入其他订单。
+    if (strictSingle) {
+      const allowedOrderIds = new Set(directOrderIds.map(String));
+      sourceOrders = (sourceOrders || []).filter(order => allowedOrderIds.has(String(order?.id || '')));
+      if (!sourceOrders.length) {
+        const error = new Error('未找到指定订单或订单不属于当前店铺');
+        error.status = 404;
+        throw error;
+      }
+    }
+    // 待发货截止时间优先采用 Mercado Libre 官方 shipment lead_time。
     // 同一运单只请求一次，并限制并发，避免全量同步时放大外部接口压力。
     const ordersByShipmentId = new Map();
     for (const order of sourceOrders) {
@@ -3630,8 +3637,9 @@ async function syncOrdersForUser(authUser, body = {}) {
       const finalNetAmountUsd = finalNetAmount === null || usdRate === null ? null : Number((Number(finalNetAmount) * usdRate).toFixed(2));
       const previous = await pool.query('SELECT status,shipment_status,refund_amount,tracking_number,tracking_method,handling_deadline,deadline_is_estimated,shipment_data FROM ml_orders WHERE ml_order_id=$1 AND (owner_username=$2 OR owner_username IS NULL)', [String(order.id),req.authUser.username]);
       // 官方接口临时失败时保留上一次成功缓存的官方值；官方成功但没有返回日期时清空。
-      if (!order._shipment_lead_time_fetch_succeeded && !handlingDeadline &&
-          previous.rows[0]?.handling_deadline && previous.rows[0]?.deadline_is_estimated !== true) {
+      if (!order._shipment_lead_time_fetch_succeeded &&
+          previous.rows[0]?.handling_deadline && previous.rows[0]?.deadline_is_estimated !== true &&
+          (deadlineIsEstimated || !handlingDeadline)) {
         handlingDeadline = previous.rows[0].handling_deadline;
         deadlineIsEstimated = false;
       }
@@ -3801,6 +3809,21 @@ app.post('/api/admin/orders/sync', requireOrderAccess, async (req, res) => {
   }
 });
 
+app.post('/api/admin/orders/:orderId/sync', requireOrderAccess, async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  const storeId = String(req.body?.storeId || '').trim();
+  if (!orderId || !storeId) {
+    return res.status(400).json({ code: 400, message: 'orderId and storeId are required' });
+  }
+  try {
+    const data = await syncOrdersForUser(req.authUser,{ storeId,orderId,limit:1,strictSingle:true });
+    res.json({ code: 0, data });
+  } catch (e) {
+    const status = Number(e.status) || 502;
+    res.status(status).json({ code: status, message: e.response?.data?.message || e.message });
+  }
+});
+
 async function getOrderListData(authUser,query = {}) {
   const req = { authUser,query };
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
@@ -3824,7 +3847,7 @@ async function getOrderListData(authUser,query = {}) {
     SELECT COALESCE(NULLIF(o.pack_id,''),o.ml_order_id) AS display_id,MAX(o.date_created) AS group_date
     FROM ml_orders o ${clause} GROUP BY COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)
     ORDER BY group_date DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}
-  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",CASE WHEN o.deadline_is_estimated THEN NULL ELSE o.handling_deadline END AS "handlingDeadline",FALSE AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",o.is_marked AS "isMarked",o.mark_type AS "markType",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.shipping_dimensions_original AS "dimensionsOriginal",o.shipping_dimensions_latest AS "dimensionsLatest",o.shipping_dimensions_updated_at AS "dimensionsUpdatedAt"
+  ) SELECT o.ml_order_id AS "orderId",o.status,o.date_created AS "dateCreated",o.buyer_nickname AS buyer,o.currency,o.total_amount AS "totalAmount",o.paid_amount AS "paidAmount",o.gross_amount_usd AS "grossAmountUsd",o.net_amount_usd AS "netAmountUsd",o.refund_amount_usd AS "refundAmountUsd",o.shipping_id AS "shippingId",o.items,o.push_status AS "pushStatus",o.last_pushed_at AS "lastPushedAt",o.site_id AS "siteId",o.country,o.shipment_status AS "shipmentStatus",o.shipment_substatus AS "shipmentSubstatus",o.tracking_number AS "trackingNumber",o.tracking_method AS "trackingMethod",o.logistic_type AS "logisticType",o.pack_id AS "packId",o.handling_deadline AS "handlingDeadline",o.deadline_is_estimated AS "deadlineIsEstimated",o.cancellation_reason AS "cancellationReason",o.shipment_data AS "shipmentData",o.raw_data AS "rawData",o.store_user_id AS "storeId",o.is_marked AS "isMarked",o.mark_type AS "markType",COALESCE(NULLIF(s.remark,''),NULLIF(s.nickname,''),o.store_user_id,'未标记店铺') AS "storeName",s.nickname AS "storeNickname",s.remark AS "storeRemark",o.sale_fee AS "saleFee",o.shipping_fee AS "shippingFee",o.net_amount AS "netAmount",o.refund_amount AS "refundAmount",o.other_fee AS "otherFee",o.finance_is_official AS "financeIsOfficial",o.product_cost AS "productCost",o.cost_note AS "costNote",o.shipping_dimensions_original AS "dimensionsOriginal",o.shipping_dimensions_latest AS "dimensionsLatest",o.shipping_dimensions_updated_at AS "dimensionsUpdatedAt"
     FROM page_groups pg JOIN ml_orders o ON COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)=pg.display_id AND o.owner_username=$1
     LEFT JOIN ml_stores s ON s.ml_user_id=o.store_user_id ORDER BY pg.group_date DESC NULLS LAST,o.date_created`, params);
   const financeRows = rows.rows.length ? await pool.query('SELECT ml_order_id,billing_data FROM ml_orders WHERE owner_username=$2 AND ml_order_id=ANY($1::varchar[])', [rows.rows.map(row => row.orderId),req.authUser.username]) : { rows: [] };
