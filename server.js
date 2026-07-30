@@ -1,4 +1,5 @@
 const express = require('express');
+const { canAccessOrderManagement } = require('./order-warehouse-policy');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -637,6 +638,23 @@ async function initOrderManagementTables() {
   await pool.query(`UPDATE fulfillment_services SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
   await pool.query(`UPDATE fulfillment_submissions SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
   await pool.query(`UPDATE erp_push_logs SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at LIMIT 1) WHERE owner_username IS NULL`);
+  // Warehouse configuration is a global administrator-owned catalog. Preserve
+  // connectors created under the former per-user policy by adopting them into
+  // the first administrator account; order/submission ownership stays untouched.
+  await pool.query(`UPDATE erp_connectors c SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1)
+    WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.username=c.owner_username AND u.role='admin')`);
+  await pool.query(`UPDATE fulfillment_services fs SET owner_username=(SELECT username FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1)
+    WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.username=fs.owner_username AND u.role='admin')`);
+  await pool.query(`INSERT INTO logistics_companies(owner_username,name,code,enabled)
+    SELECT DISTINCT ON (lc.name) a.username,lc.name,lc.code,lc.enabled
+    FROM logistics_companies lc
+    CROSS JOIN LATERAL (SELECT username FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1) a
+    WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.username=lc.owner_username AND u.role='admin')
+    ORDER BY lc.name,lc.id DESC
+    ON CONFLICT(owner_username,name) DO UPDATE SET
+      code=COALESCE(NULLIF(EXCLUDED.code,''),logistics_companies.code),enabled=EXCLUDED.enabled`);
+  await pool.query(`DELETE FROM logistics_companies lc
+    WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.username=lc.owner_username AND u.role='admin')`);
 }
 
 async function seedDashboardData() {
@@ -946,21 +964,20 @@ function requireAdmin(req, res, next) {
   });
 }
 
-const ORDER_TEST_USERNAMES = new Set(['CNTORO']);
 function requireOrderAccess(req, res, next) {
   requireAuth(req, res, () => {
-    const username = String(req.authUser.username || '').trim().toUpperCase();
-    if (req.authUser.role !== 'admin' && !ORDER_TEST_USERNAMES.has(username)) {
-      return res.status(403).json({ code: 403, message: '订单管理目前仅向管理员及指定内测账号开放' });
+    if (!canAccessOrderManagement(req.authUser)) {
+      return res.status(403).json({ code: 403, message: '当前账号无订单管理权限' });
     }
     next();
   });
 }
 
+const MARKETING_TEST_USERNAMES = new Set(['CNTORO']);
 function requireMarketingAccess(req, res, next) {
   requireAuth(req, res, () => {
     const username = String(req.authUser.username || '').trim().toUpperCase();
-    if (req.authUser.role !== 'admin' && !ORDER_TEST_USERNAMES.has(username)) {
+    if (req.authUser.role !== 'admin' && !MARKETING_TEST_USERNAMES.has(username)) {
       return res.status(403).json({ code: 403, message: '营销中心目前仅向管理员及指定内测账号开放' });
     }
     next();
@@ -3079,7 +3096,10 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.11',
+    version: '2026-07-30.12',
+    sharedAdminWarehouseCatalog: true,
+    warehouseConfigurationWriteRole: 'admin',
+    orderManagementRoles: ['admin','agent','user'],
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
     yeekeErpOrderNumberFormat: 'SY00000',
@@ -6714,32 +6734,36 @@ app.post('/api/admin/orders/:orderId/messages', requireOrderAccess, async (req, 
 });
 
 app.get('/api/admin/fulfillment-services', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query(`SELECT id,name,code,description,source,external_price AS "externalPrice",connector_id AS "connectorId",enabled
-    FROM fulfillment_services WHERE owner_username=$1 ORDER BY source DESC,id DESC`,[req.authUser.username]);
+  const { rows } = await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.external_price AS "externalPrice",fs.connector_id AS "connectorId",fs.enabled
+    FROM fulfillment_services fs JOIN users u ON u.username=fs.owner_username AND u.role='admin'
+    ORDER BY fs.source DESC,fs.id DESC`);
   res.json({ code: 0, data: rows });
 });
 
-app.post('/api/admin/fulfillment-services', requireOrderAccess, async (req, res) => {
+app.post('/api/admin/fulfillment-services', requireAdmin, async (req, res) => {
   const name = String(req.body?.name || '').trim();
   if (!name) return res.status(400).json({ code: 400, message: '增值服务名称不能为空' });
   const { rows } = await pool.query('INSERT INTO fulfillment_services(owner_username,name,code,description) VALUES($1,$2,$3,$4) RETURNING id', [req.authUser.username,name.slice(0,120), String(req.body?.code || '').trim().slice(0,100), String(req.body?.description || '').trim().slice(0,500)]);
   res.json({ code: 0, data: rows[0] });
 });
 
-app.delete('/api/admin/fulfillment-services/:id', requireOrderAccess, async (req, res) => {
+app.delete('/api/admin/fulfillment-services/:id', requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM fulfillment_services WHERE id=$1 AND owner_username=$2', [req.params.id,req.authUser.username]);
   res.json({ code: 0 });
 });
 
 app.get('/api/admin/logistics-companies', requireOrderAccess, async (req, res) => {
   const defaults = ['顺丰速运','中通快递','圆通速递','申通快递','韵达快递','极兔速递','邮政EMS','京东物流','菜鸟物流'];
-  const existing = await pool.query('SELECT COUNT(*)::int AS count FROM logistics_companies WHERE owner_username=$1',[req.authUser.username]);
-  if (!existing.rows[0].count) for (const name of defaults) await pool.query('INSERT INTO logistics_companies(owner_username,name) VALUES($1,$2) ON CONFLICT(owner_username,name) DO NOTHING',[req.authUser.username,name]);
-  const { rows } = await pool.query('SELECT id,name,code,enabled FROM logistics_companies WHERE owner_username=$1 ORDER BY name',[req.authUser.username]);
+  const adminOwner = await pool.query("SELECT username FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1");
+  const existing = await pool.query(`SELECT COUNT(*)::int AS count FROM logistics_companies lc
+    JOIN users u ON u.username=lc.owner_username AND u.role='admin'`);
+  if (!existing.rows[0].count && adminOwner.rows[0]) for (const name of defaults) await pool.query('INSERT INTO logistics_companies(owner_username,name) VALUES($1,$2) ON CONFLICT(owner_username,name) DO NOTHING',[adminOwner.rows[0].username,name]);
+  const { rows } = await pool.query(`SELECT lc.id,lc.name,lc.code,lc.enabled FROM logistics_companies lc
+    JOIN users u ON u.username=lc.owner_username AND u.role='admin' ORDER BY lc.name`);
   res.json({ code: 0, data: rows });
 });
 
-app.post('/api/admin/logistics-companies', requireOrderAccess, async (req, res) => {
+app.post('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
   const name = String(req.body?.name || '').trim(), code = String(req.body?.code || '').trim();
   if (!name) return res.status(400).json({ code: 400, message: '物流公司名称不能为空' });
   const { rows } = await pool.query(`INSERT INTO logistics_companies(owner_username,name,code) VALUES($1,$2,$3)
@@ -6747,7 +6771,7 @@ app.post('/api/admin/logistics-companies', requireOrderAccess, async (req, res) 
   res.json({ code: 0, data: rows[0] });
 });
 
-app.delete('/api/admin/logistics-companies/:id', requireOrderAccess, async (req, res) => {
+app.delete('/api/admin/logistics-companies/:id', requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM logistics_companies WHERE id=$1 AND owner_username=$2',[req.params.id,req.authUser.username]);
   res.json({ code: 0 });
 });
@@ -6865,12 +6889,17 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
   const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
   const trackingByOrder = req.body?.trackingByOrder || {}, serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
   if (!orderIds.length || !warehouseId || !carrier) return res.status(400).json({ code: 400, message: '请选择订单、仓库和物流公司' });
-  const connectorResult = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND owner_username=$2 AND enabled=TRUE', [warehouseId,req.authUser.username]);
+  const connectorResult = await pool.query(`SELECT c.* FROM erp_connectors c
+    JOIN users u ON u.username=c.owner_username AND u.role='admin'
+    WHERE c.id=$1 AND c.enabled=TRUE`, [warehouseId]);
   if (!connectorResult.rows[0]) return res.status(404).json({ code: 404, message: '仓库不存在或已停用' });
-  const carrierResult = await pool.query('SELECT id FROM logistics_companies WHERE owner_username=$1 AND name=$2 AND enabled=TRUE',[req.authUser.username,carrier]);
+  const carrierResult = await pool.query(`SELECT lc.id FROM logistics_companies lc
+    JOIN users u ON u.username=lc.owner_username AND u.role='admin'
+    WHERE lc.name=$1 AND lc.enabled=TRUE`,[carrier]);
   if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
-  const serviceResult = serviceIds.length ? await pool.query(`SELECT id,name,code,description,source,connector_id FROM fulfillment_services
-    WHERE owner_username=$2 AND enabled=TRUE AND id=ANY($1::bigint[]) AND (source<>'yeeke' OR connector_id=$3)`, [serviceIds,req.authUser.username,warehouseId]) : { rows: [] };
+  const serviceResult = serviceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.connector_id FROM fulfillment_services fs
+    JOIN users u ON u.username=fs.owner_username AND u.role='admin'
+    WHERE fs.enabled=TRUE AND fs.id=ANY($1::bigint[]) AND (fs.source<>'yeeke' OR fs.connector_id=$2)`, [serviceIds,warehouseId]) : { rows: [] };
   const warehouse = connectorResult.rows[0];
   const serviceCodes = String(warehouse.provider || 'generic') === 'yeeke'
     ? serviceResult.rows.filter(service => service.source === 'yeeke').map(service => String(service.code || '')).filter(Boolean) : [];
@@ -6919,7 +6948,7 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
   const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.carrier,f.tracking_number AS "trackingNumber",f.status,
     f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.created_at AS "createdAt",f.updated_at AS "updatedAt",
     c.name AS "warehouseName",c.provider,c.provider_config
-    FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id AND c.owner_username=f.owner_username
+    FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
     WHERE ${where.join(' AND ')} ORDER BY f.updated_at DESC LIMIT 500`, params);
   const data = rows.map(({ provider_config: providerConfig, ...row }) => {
     let warehouseCode = '';
@@ -6933,7 +6962,8 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
 
 app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, async (req, res) => {
   const { rows } = await pool.query(`SELECT f.*,c.endpoint,c.auth_header,c.auth_value,c.provider,c.provider_config FROM fulfillment_submissions f
-    JOIN erp_connectors c ON c.id=f.warehouse_id AND c.owner_username=f.owner_username
+    JOIN erp_connectors c ON c.id=f.warehouse_id
+    JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE f.id=$1 AND f.owner_username=$2`, [req.params.id,req.authUser.username]);
   const submission = rows[0];
   if (!submission) return res.status(404).json({ code: 404, message: '代贴单提交记录不存在' });
@@ -6945,8 +6975,9 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       const externalUserId = await getOrderExternalUserId(req.authUser.username);
       const pdfString = (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64');
       const retryServiceIds = (Array.isArray(submission.service_ids) ? submission.service_ids : []).map(Number).filter(Number.isFinite);
-      const retryServices = retryServiceIds.length ? await pool.query(`SELECT code FROM fulfillment_services
-        WHERE owner_username=$2 AND connector_id=$3 AND source='yeeke' AND enabled=TRUE AND id=ANY($1::bigint[])`,[retryServiceIds,req.authUser.username,submission.warehouse_id]) : { rows:[] };
+      const retryServices = retryServiceIds.length ? await pool.query(`SELECT fs.code FROM fulfillment_services fs
+        JOIN users u ON u.username=fs.owner_username AND u.role='admin'
+        WHERE fs.connector_id=$2 AND fs.source='yeeke' AND fs.enabled=TRUE AND fs.id=ANY($1::bigint[])`,[retryServiceIds,submission.warehouse_id]) : { rows:[] };
       const serviceCodes = retryServices.rows.map(service => String(service.code || '')).filter(Boolean);
       responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString, serviceCodes });
     } else {
@@ -6965,7 +6996,9 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
 });
 
 app.get('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,name,endpoint,provider,provider_config,auth_header AS "authHeader",enabled,created_at AS "createdAt" FROM erp_connectors WHERE owner_username=$1 ORDER BY id DESC',[req.authUser.username]);
+  const { rows } = await pool.query(`SELECT c.id,c.name,c.endpoint,c.provider,c.provider_config,c.auth_header AS "authHeader",c.enabled,c.created_at AS "createdAt"
+    FROM erp_connectors c JOIN users u ON u.username=c.owner_username AND u.role='admin'
+    WHERE c.enabled=TRUE ORDER BY c.id DESC`);
   const data = rows.map(({ provider_config: providerConfig, ...row }) => {
     let warehouseCode = '';
     if (row.provider === 'yeeke' && providerConfig) {
@@ -6976,7 +7009,7 @@ app.get('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
   res.json({ code: 0, data });
 });
 
-app.post('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
+app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
   const { name, endpoint, authHeader, authValue } = req.body || {};
   const provider = String(req.body?.provider || 'generic').trim().toLowerCase() === 'yeeke' ? 'yeeke' : 'generic';
   if (!name) return res.status(400).json({ code: 400, message: '缺少连接名称' });
@@ -7015,7 +7048,7 @@ app.post('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
   res.json({ code: 0, data: { id: rows[0].id } });
 });
 
-app.post('/api/admin/erp-connectors/:id/sync-services', requireOrderAccess, async (req, res) => {
+app.post('/api/admin/erp-connectors/:id/sync-services', requireAdmin, async (req, res) => {
   const { rows } = await pool.query(`SELECT * FROM erp_connectors
     WHERE id=$1 AND owner_username=$2 AND enabled=TRUE`,[req.params.id,req.authUser.username]);
   const connector = rows[0];
@@ -7029,14 +7062,16 @@ app.post('/api/admin/erp-connectors/:id/sync-services', requireOrderAccess, asyn
   }
 });
 
-app.delete('/api/admin/erp-connectors/:id', requireOrderAccess, async (req, res) => {
+app.delete('/api/admin/erp-connectors/:id', requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM erp_connectors WHERE id=$1 AND owner_username=$2', [req.params.id,req.authUser.username]);
   res.json({ code: 0 });
 });
 
 app.post('/api/admin/orders/:orderId/push', requireOrderAccess, async (req, res) => {
   const order = await pool.query('SELECT * FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [req.params.orderId,req.authUser.username]);
-  const connector = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND owner_username=$2 AND enabled=TRUE', [req.body?.connectorId,req.authUser.username]);
+  const connector = await pool.query(`SELECT c.* FROM erp_connectors c
+    JOIN users u ON u.username=c.owner_username AND u.role='admin'
+    WHERE c.id=$1 AND c.enabled=TRUE`, [req.body?.connectorId]);
   if (!order.rows[0] || !connector.rows[0]) return res.status(404).json({ code: 404, message: '订单或ERP连接不存在' });
   const c = connector.rows[0];
   try {
