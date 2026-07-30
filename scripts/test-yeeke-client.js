@@ -1,5 +1,13 @@
 const assert = require('assert');
-const { buildYeekeEnvelope, createYeekeClient, buildYeekeErpOrderNumber, buildYeekeOrderPayload } = require('../yeeke-client');
+const {
+  buildYeekeEnvelope,
+  createYeekeClient,
+  buildYeekeErpOrderNumber,
+  buildYeekeOrderPayload,
+  extractYeekeOrderRecords,
+  isYeekeOrderReturned,
+  yeekeOrderReturnReason
+} = require('../yeeke-client');
 
 async function run() {
   const signed = buildYeekeEnvelope(
@@ -18,6 +26,7 @@ async function run() {
       if (url.endsWith('/ware/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ wareHouse: 'th', wareName: '东莞仓' }] } };
       if (url.endsWith('/otherService/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ id: 'service-1', name: '打包', price: 1 }] } };
       if (url.endsWith('/order/create/v2')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'Y1' } } };
+      if (url.endsWith('/order/list')) return { status: 200, data: { code: '0', message: '成功', data: { records: [{ ordersn: '200001', dgStatus: '3' }] } } };
       if (url.endsWith('/airwaybill/change')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       if (url.endsWith('/order/status')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       throw new Error(`unexpected URL ${url}`);
@@ -31,12 +40,16 @@ async function run() {
   assert.strictEqual(calls.length, 3);
   assert.strictEqual(calls[2].body.accessToken, 'token');
   assert.strictEqual(calls[2].body.ordersn, '200001');
+  const listedOrders = await client.listOrders({ ordersn: '200001' });
+  assert.strictEqual(listedOrders.records[0].ordersn, '200001');
+  assert.strictEqual(calls[3].body.pageNo, 1);
+  assert.strictEqual(calls[3].body.pageSize, 20);
   await client.changeAirwaybill({ ordersn: '200001', pdfString: 'JVBERi0=' });
-  assert.strictEqual(calls[3].body.pdfString, 'JVBERi0=');
+  assert.strictEqual(calls[4].body.pdfString, 'JVBERi0=');
   const remoteServices = await client.listServices();
   assert.strictEqual(remoteServices[0].id, 'service-1');
   await client.updateOrderStatus({ ordersn: '200001', status: '7' });
-  assert.strictEqual(calls[5].body.status, '7');
+  assert.strictEqual(calls[6].body.status, '7');
 
   const payload = buildYeekeOrderPayload({
     row: {
@@ -62,6 +75,7 @@ async function run() {
   assert.strictEqual(payload.receiverInfo.zipcode, '123');
   assert.strictEqual(payload.receiverInfo.fullAddress, 'Street 1');
   assert.strictEqual(payload.erpOrdersn, 'SY12345');
+  assert.strictEqual(payload.note, '山月ERP SY12345');
   assert.strictEqual(payload.pdfString, 'JVBERi0xLjQ=');
   assert.strictEqual(payload.trackingNo, 'YT123');
   assert.deepStrictEqual(payload.selectProList, ['1933035392616419330','1933035698318266370']);
@@ -88,6 +102,11 @@ async function run() {
   assert.strictEqual(packPayload.country, 'MX');
   assert.strictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), 'SY12345');
   assert.notStrictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), buildYeekeErpOrderNumber('SY54321', '2000014266367529'));
+  assert.deepStrictEqual(extractYeekeOrderRecords({ records: [{ ordersn: 'A' }] }), [{ ordersn: 'A' }]);
+  assert.strictEqual(isYeekeOrderReturned({ dgStatus: '7' }), true);
+  assert.strictEqual(isYeekeOrderReturned({ dgStatus: '3', returnFlag: '1' }), true);
+  assert.strictEqual(isYeekeOrderReturned({ dgStatus: '8', returnFlag: '0' }), false);
+  assert.strictEqual(yeekeOrderReturnReason({ messageToUser: '地址异常，仓库退回' }), '地址异常，仓库退回');
   console.log('Yeeke client tests passed');
 }
 

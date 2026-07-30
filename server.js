@@ -18,7 +18,14 @@ const { orderSyncPageDecision,resolveRequestedOrderScope } = require('./order-sy
 const { resolveOfficialHandlingDeadline } = require('./order-deadline-policy');
 const { normalizeOrderItems } = require('./order-items');
 const { normalizeSummaryPeriod,buildOrderWorkbenchSummary } = require('./order-workbench-summary');
-const { DEFAULT_YEEKE_BASE_URL, createYeekeClient, buildYeekeOrderPayload } = require('./yeeke-client');
+const {
+  DEFAULT_YEEKE_BASE_URL,
+  createYeekeClient,
+  buildYeekeOrderPayload,
+  extractYeekeOrderRecords,
+  isYeekeOrderReturned,
+  yeekeOrderReturnReason
+} = require('./yeeke-client');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
@@ -436,10 +443,22 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS failure_reason TEXT');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS provider_order_number VARCHAR(120)');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS remote_status VARCHAR(30)');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS remote_returned BOOLEAN NOT NULL DEFAULT FALSE');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS remote_message TEXT');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS remote_checked_at TIMESTAMPTZ');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS returned_at TIMESTAMPTZ');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS warehouse_fee NUMERIC(12,2) NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS service_fee NUMERIC(12,2) NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS charge_amount NUMERIC(12,2) NOT NULL DEFAULT 0');
+  await pool.query("ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS billing_status VARCHAR(30) NOT NULL DEFAULT 'reserved'");
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS billing_key VARCHAR(240)');
   await pool.query(`UPDATE fulfillment_submissions SET provider_order_number=order_id
     WHERE provider_order_number IS NULL OR provider_order_number=''`);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_order ON fulfillment_submissions(owner_username,order_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_warehouse ON fulfillment_submissions(owner_username,warehouse_id)');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_submissions_billing_key ON fulfillment_submissions(owner_username,billing_key) WHERE billing_key IS NOT NULL');
+  await pool.query('ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS unit_price NUMERIC(12,2) NOT NULL DEFAULT 0');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_message_reads (
     owner_username VARCHAR(120) NOT NULL, thread_type VARCHAR(30) NOT NULL,
     thread_id VARCHAR(120) NOT NULL, last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1028,6 +1047,11 @@ function jsonOk(data, msg = 'ok') {
 }
 function jsonFail(msg = 'error') {
   return { code: 1, message: msg };
+}
+
+function feeAmount(value) {
+  const amount = Number(value || 0);
+  return Number.isFinite(amount) && amount > 0 ? Number(amount.toFixed(2)) : 0;
 }
 
 async function bumpVersion() {
@@ -3100,14 +3124,21 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.14',
+    version: '2026-07-30.15',
     compactOrderTiming: '12px',
+    yeekeOrderNoteFormat: '山月ERP SY00000',
+    yeekeReturnStatusPolling: true,
+    returnedFulfillmentRestoresWorkbench: true,
+    fulfillmentBillingIntegration: 'reserved-for-www.shanyue.site',
+    fulfillmentBillingMutatesLocalBalance: false,
+    fulfillmentBillingIdempotency: 'username+display-order-id',
+    fulfillmentChargeIncludes: ['warehouse_unit_price','value_added_services'],
     sharedAdminWarehouseCatalog: true,
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
     submittedFulfillmentFullOrderCards: true,
     submittedFulfillmentHiddenActions: ['apply_label','delete_order','submit_fulfillment'],
-    fulfillmentWarehouseChange: 'yeeke-repush-and-cancel-old',
+    fulfillmentWarehouseChange: 'blocked-until-yeeke-original-order-api',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
     yeekeErpOrderNumberFormat: 'SY00000',
@@ -3937,7 +3968,8 @@ async function getOrderListData(authUser,query = {}) {
   const submittedFulfillmentView = String(req.query.fulfillmentView || '') === 'submitted';
   if (submittedFulfillmentView) {
     let submissionScope = `EXISTS (SELECT 1 FROM fulfillment_submissions fs
-      WHERE fs.owner_username=o.owner_username AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)`;
+      WHERE fs.owner_username=o.owner_username AND fs.status<>'returned'
+        AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)`;
     const warehouseId = Number(req.query.warehouseId);
     if (Number.isFinite(warehouseId) && warehouseId > 0) {
       params.push(warehouseId);
@@ -3946,7 +3978,8 @@ async function getOrderListData(authUser,query = {}) {
     where.push(`${submissionScope})`);
   } else {
     where.push(`NOT EXISTS (SELECT 1 FROM fulfillment_submissions fs
-      WHERE fs.owner_username=o.owner_username AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))`);
+      WHERE fs.owner_username=o.owner_username AND fs.status<>'returned'
+        AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))`);
   }
   if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
   if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`o.push_status = $${params.length}`); }
@@ -3997,7 +4030,8 @@ async function getOrderListData(authUser,query = {}) {
   if (submittedFulfillmentView && packedRows.length) {
     const displayIds = packedRows.map(order => String(order.displayOrderId || order.packId || order.orderId));
     const submissionRows = await pool.query(`SELECT f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.status,
-      f.failure_reason,f.retry_count,f.provider_order_number,f.created_at,f.updated_at,
+      f.failure_reason,f.retry_count,f.provider_order_number,f.warehouse_fee,f.service_fee,f.charge_amount,f.billing_status,f.billing_key,
+      f.remote_status,f.remote_message,f.remote_checked_at,f.created_at,f.updated_at,
       c.name AS warehouse_name,c.provider,c.provider_config
       FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
       WHERE f.owner_username=$2 AND f.order_id=ANY($1::varchar[])`,[displayIds,req.authUser.username]);
@@ -4010,6 +4044,8 @@ async function getOrderListData(authUser,query = {}) {
         id:row.id,warehouseId:row.warehouse_id,warehouseName:row.warehouse_name || '',warehouseCode,
         provider:row.provider || '',carrier:row.carrier,trackingNumber:row.tracking_number,status:row.status,
         failureReason:row.failure_reason || '',retryCount:row.retry_count || 0,providerOrderNumber:row.provider_order_number || row.order_id,
+        warehouseFee:Number(row.warehouse_fee || 0),serviceFee:Number(row.service_fee || 0),chargeAmount:Number(row.charge_amount || 0),
+        billingStatus:row.billing_status || 'reserved',billingKey:row.billing_key || '',remoteStatus:row.remote_status || '',remoteMessage:row.remote_message || '',remoteCheckedAt:row.remote_checked_at,
         createdAt:row.created_at,updatedAt:row.updated_at
       }];
     }));
@@ -6784,7 +6820,8 @@ app.get('/api/admin/fulfillment-services', requireOrderAccess, async (req, res) 
 app.post('/api/admin/fulfillment-services', requireAdmin, async (req, res) => {
   const name = String(req.body?.name || '').trim();
   if (!name) return res.status(400).json({ code: 400, message: '增值服务名称不能为空' });
-  const { rows } = await pool.query('INSERT INTO fulfillment_services(owner_username,name,code,description) VALUES($1,$2,$3,$4) RETURNING id', [req.authUser.username,name.slice(0,120), String(req.body?.code || '').trim().slice(0,100), String(req.body?.description || '').trim().slice(0,500)]);
+  const externalPrice = feeAmount(req.body?.externalPrice);
+  const { rows } = await pool.query('INSERT INTO fulfillment_services(owner_username,name,code,description,external_price) VALUES($1,$2,$3,$4,$5) RETURNING id', [req.authUser.username,name.slice(0,120), String(req.body?.code || '').trim().slice(0,100), String(req.body?.description || '').trim().slice(0,500),externalPrice]);
   res.json({ code: 0, data: rows[0] });
 });
 
@@ -6926,6 +6963,100 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
   return response.data;
 }
 
+let yeekeSubmissionStatusSyncTimer = null;
+let yeekeSubmissionStatusSyncRunning = false;
+let yeekeSubmissionStatusSyncState = { lastRunAt:null,checked:0,returned:0,lastError:null };
+
+async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,force = false } = {}) {
+  if (yeekeSubmissionStatusSyncRunning && !ownerUsername) return { ...yeekeSubmissionStatusSyncState,running:true };
+  if (!ownerUsername) yeekeSubmissionStatusSyncRunning = true;
+  let checked = 0,returned = 0,lastError = null;
+  try {
+    const params = [];
+    let ownerFilter = '';
+    if (ownerUsername) {
+      params.push(ownerUsername);
+      ownerFilter = ` AND f.owner_username=$${params.length}`;
+    }
+    params.push(Math.min(100,Math.max(1,Number(limit) || 50)));
+    const staleFilter = force ? '' : " AND (f.remote_checked_at IS NULL OR f.remote_checked_at<NOW()-INTERVAL '2 minutes')";
+    const { rows } = await pool.query(`SELECT f.id,f.owner_username,f.order_id,f.provider_order_number,f.warehouse_id,
+      c.provider_config FROM fulfillment_submissions f
+      JOIN erp_connectors c ON c.id=f.warehouse_id
+      JOIN users administrator ON administrator.username=c.owner_username AND administrator.role='admin'
+      WHERE f.status='success' AND c.provider='yeeke'${ownerFilter}${staleFilter}
+      ORDER BY f.remote_checked_at ASC NULLS FIRST,f.updated_at DESC LIMIT $${params.length}`,params);
+    const clients = new Map();
+    for (const submission of rows) {
+      try {
+        const connectorKey = String(submission.warehouse_id);
+        let entry = clients.get(connectorKey);
+        if (!entry) {
+          const config = getYeekeConnectorConfig({ provider_config:submission.provider_config });
+          const client = createYeekeClient(config);
+          await client.authorize(config.userName,config.password);
+          entry = { client,config };
+          clients.set(connectorKey,entry);
+        }
+        const providerOrderNumber = String(submission.provider_order_number || submission.order_id);
+        const remoteData = await entry.client.listOrders({
+          ordersn:providerOrderNumber,
+          wareHouse:entry.config.warehouseCode,
+          pageNo:1,
+          pageSize:20
+        });
+        const record = extractYeekeOrderRecords(remoteData).find(item => String(item?.ordersn || '') === providerOrderNumber);
+        checked++;
+        if (!record) {
+          await pool.query('UPDATE fulfillment_submissions SET remote_checked_at=NOW() WHERE id=$1 AND owner_username=$2',
+          [submission.id,submission.owner_username]);
+          continue;
+        }
+        const remoteStatus = String(record.dgStatus ?? '').trim();
+        const remoteMessage = String(record.messageToUser || '').trim().slice(0,2000);
+        if (isYeekeOrderReturned(record)) {
+          const reason = yeekeOrderReturnReason(record);
+          const updateResult = await pool.query(`UPDATE fulfillment_submissions SET status='returned',remote_returned=TRUE,
+            remote_status=$1,remote_message=$2,remote_checked_at=NOW(),returned_at=COALESCE(returned_at,NOW()),
+            failure_reason=$2,updated_at=NOW() WHERE id=$3 AND owner_username=$4 AND status<>'returned'`,
+          [remoteStatus || '7',reason,submission.id,submission.owner_username]);
+          if (updateResult.rowCount) {
+            returned++;
+            await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
+              VALUES($1,$2,'fulfillment_return','代贴单已被仓库退回',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
+            [submission.owner_username,submission.order_id,reason,
+              `fulfillment-return:${submission.id}:${String(record.updateTime || remoteStatus || 'returned')}`]);
+          }
+        } else {
+          await pool.query(`UPDATE fulfillment_submissions SET remote_status=$1,remote_message=$2,
+            remote_checked_at=NOW(),updated_at=NOW() WHERE id=$3 AND owner_username=$4`,
+          [remoteStatus || null,remoteMessage || null,submission.id,submission.owner_username]);
+        }
+      } catch (error) {
+        lastError = String(error.response?.data?.message || error.message || error).slice(0,500);
+        await pool.query('UPDATE fulfillment_submissions SET remote_checked_at=NOW() WHERE id=$1 AND owner_username=$2',
+        [submission.id,submission.owner_username]).catch(() => {});
+      }
+    }
+    const result = { lastRunAt:new Date().toISOString(),checked,returned,lastError };
+    if (!ownerUsername) yeekeSubmissionStatusSyncState = result;
+    return result;
+  } finally {
+    if (!ownerUsername) yeekeSubmissionStatusSyncRunning = false;
+  }
+}
+
+function startYeekeSubmissionStatusSync() {
+  if (yeekeSubmissionStatusSyncTimer) return;
+  const tick = () => syncYeekeSubmissionStatuses(null,{ limit:50 }).catch(error => {
+    yeekeSubmissionStatusSyncState = { ...yeekeSubmissionStatusSyncState,lastRunAt:new Date().toISOString(),lastError:String(error.message || error).slice(0,500) };
+    console.error('[Yeeke] fulfillment status sync failed:',error.message);
+  });
+  setTimeout(tick,20000).unref?.();
+  yeekeSubmissionStatusSyncTimer = setInterval(tick,2*60*1000);
+  yeekeSubmissionStatusSyncTimer.unref?.();
+}
+
 app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) => {
   const orderIds = [...new Set((Array.isArray(req.body?.orderIds) ? req.body.orderIds : []).map(String).filter(Boolean))];
   const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
@@ -6939,10 +7070,13 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     JOIN users u ON u.username=lc.owner_username AND u.role='admin'
     WHERE lc.name=$1 AND lc.enabled=TRUE`,[carrier]);
   if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
-  const serviceResult = serviceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.connector_id FROM fulfillment_services fs
+  const serviceResult = serviceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.external_price,fs.connector_id FROM fulfillment_services fs
     JOIN users u ON u.username=fs.owner_username AND u.role='admin'
     WHERE fs.enabled=TRUE AND fs.id=ANY($1::bigint[]) AND (fs.source<>'yeeke' OR fs.connector_id=$2)`, [serviceIds,warehouseId]) : { rows: [] };
   const warehouse = connectorResult.rows[0];
+  const warehouseFee = feeAmount(warehouse.unit_price);
+  const serviceFee = Number(serviceResult.rows.reduce((sum,service) => sum + feeAmount(service.external_price),0).toFixed(2));
+  const chargeAmount = Number((warehouseFee + serviceFee).toFixed(2));
   const serviceCodes = String(warehouse.provider || 'generic') === 'yeeke'
     ? serviceResult.rows.filter(service => service.source === 'yeeke').map(service => String(service.code || '')).filter(Boolean) : [];
   const externalUserId = await getOrderExternalUserId(req.authUser.username);
@@ -6967,8 +7101,9 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
       const pdfString = String(warehouse.provider || 'generic') === 'yeeke'
         ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
       const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, externalUserId, carrier, trackingNumber, pdfString, serviceCodes, payload }, yeekeClient);
-      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,provider_order_number,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,$2,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,provider_order_number=EXCLUDED.provider_order_number,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000)]);
-      results.push({ orderId: displayOrderId, success: true });
+      const billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`;
+      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$2,'success',$7::jsonb,$8,NULL,$9,$10,$11,'reserved',$12,FALSE,NULL,NULL,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,provider_order_number=EXCLUDED.provider_order_number,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,warehouse_fee=EXCLUDED.warehouse_fee,service_fee=EXCLUDED.service_fee,charge_amount=EXCLUDED.charge_amount,billing_status=CASE WHEN fulfillment_submissions.billing_status='charged' THEN 'charged' ELSE 'reserved' END,billing_key=COALESCE(fulfillment_submissions.billing_key,EXCLUDED.billing_key),remote_returned=FALSE,remote_status=NULL,remote_message=NULL,returned_at=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey]);
+      results.push({ orderId: displayOrderId, success: true, billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
     } catch (error) {
       const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
       await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,provider_order_number,status,request_data,response_text,failure_reason,retry_count) VALUES($1,$2,$3,$4,$5,$6::jsonb,$2,'failed',$7::jsonb,$8,$9,1) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,status='failed',response_text=EXCLUDED.response_text,failure_reason=EXCLUDED.failure_reason,retry_count=fulfillment_submissions.retry_count+1,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason]);
@@ -6981,14 +7116,17 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
 });
 
 app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, res) => {
-  const params = [req.authUser.username], where = ['f.owner_username=$1'];
+  const params = [req.authUser.username], where = ['f.owner_username=$1',"f.status<>'returned'"];
   const warehouseId = Number(req.query?.warehouseId);
   if (Number.isFinite(warehouseId) && warehouseId > 0) {
     params.push(warehouseId);
     where.push(`f.warehouse_id=$${params.length}`);
   }
   const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.provider_order_number AS "providerOrderNumber",f.carrier,f.tracking_number AS "trackingNumber",f.status,
-    f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.created_at AS "createdAt",f.updated_at AS "updatedAt",
+    f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.warehouse_fee AS "warehouseFee",
+    f.service_fee AS "serviceFee",f.charge_amount AS "chargeAmount",f.billing_status AS "billingStatus",f.billing_key AS "billingKey",
+    f.remote_status AS "remoteStatus",f.remote_message AS "remoteMessage",f.remote_checked_at AS "remoteCheckedAt",
+    f.created_at AS "createdAt",f.updated_at AS "updatedAt",
     c.name AS "warehouseName",c.provider,c.provider_config
     FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
     WHERE ${where.join(' AND ')} ORDER BY f.updated_at DESC LIMIT 500`, params);
@@ -7002,13 +7140,25 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
   res.json({ code: 0, data });
 });
 
+app.post('/api/admin/fulfillment/submissions/sync-status', requireOrderAccess, async (req, res) => {
+  try {
+    const result = await syncYeekeSubmissionStatuses(req.authUser.username,{ limit:100,force:true });
+    res.json({ code:0,data:result,message:result.returned
+      ? `已同步仓库状态，${result.returned} 个退回订单已恢复到订单工作台`
+      : `已核对 ${result.checked} 个代贴单，暂未发现新的退回订单` });
+  } catch (error) {
+    res.status(502).json({ code:502,message:`同步仓库状态失败：${error.response?.data?.message || error.message}` });
+  }
+});
+
 app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query(`SELECT f.*,c.endpoint,c.auth_header,c.auth_value,c.provider,c.provider_config FROM fulfillment_submissions f
+  const { rows } = await pool.query(`SELECT f.*,c.endpoint,c.auth_header,c.auth_value,c.provider,c.provider_config,c.unit_price FROM fulfillment_submissions f
     JOIN erp_connectors c ON c.id=f.warehouse_id
     JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE f.id=$1 AND f.owner_username=$2`, [req.params.id,req.authUser.username]);
   const submission = rows[0];
   if (!submission) return res.status(404).json({ code: 404, message: '代贴单提交记录不存在' });
+  let retryWarehouseFee = null,retryServiceFee = null,retryChargeAmount = null;
   try {
     let responseData;
     if (String(submission.provider || 'generic') === 'yeeke') {
@@ -7017,10 +7167,13 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       const externalUserId = await getOrderExternalUserId(req.authUser.username);
       const pdfString = (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64');
       const retryServiceIds = (Array.isArray(submission.service_ids) ? submission.service_ids : []).map(Number).filter(Number.isFinite);
-      const retryServices = retryServiceIds.length ? await pool.query(`SELECT fs.code FROM fulfillment_services fs
+      const retryServices = retryServiceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.external_price FROM fulfillment_services fs
         JOIN users u ON u.username=fs.owner_username AND u.role='admin'
         WHERE fs.connector_id=$2 AND fs.source='yeeke' AND fs.enabled=TRUE AND fs.id=ANY($1::bigint[])`,[retryServiceIds,submission.warehouse_id]) : { rows:[] };
       const serviceCodes = retryServices.rows.map(service => String(service.code || '')).filter(Boolean);
+      retryWarehouseFee = feeAmount(submission.unit_price);
+      retryServiceFee = Number(retryServices.rows.reduce((sum,service) => sum + feeAmount(service.external_price),0).toFixed(2));
+      retryChargeAmount = Number((retryWarehouseFee + retryServiceFee).toFixed(2));
       responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, providerOrderNumber: submission.provider_order_number || submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString, serviceCodes });
     } else {
       const headers = { 'Content-Type': 'application/json' };
@@ -7028,7 +7181,16 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       const response = await axios.post(submission.endpoint, submission.request_data, { headers, timeout: 30000, maxRedirects: 0 });
       responseData = response.data;
     }
-    await pool.query(`UPDATE fulfillment_submissions SET status='success',response_text=$1,failure_reason=NULL,retry_count=retry_count+1,updated_at=NOW() WHERE id=$2 AND owner_username=$3`, [JSON.stringify(responseData).slice(0,5000),submission.id,req.authUser.username]);
+    await pool.query(`UPDATE fulfillment_submissions SET status='success',response_text=$1,failure_reason=NULL,
+      charge_amount=CASE WHEN $2::numeric IS NULL THEN charge_amount ELSE $2 END,
+      warehouse_fee=CASE WHEN $3::numeric IS NULL THEN warehouse_fee ELSE $3 END,
+      service_fee=CASE WHEN $4::numeric IS NULL THEN service_fee ELSE $4 END,
+      billing_status=CASE WHEN billing_status='charged' THEN 'charged' ELSE 'reserved' END,
+      billing_key=COALESCE(billing_key,$5),
+      remote_returned=FALSE,remote_status=NULL,remote_message=NULL,returned_at=NULL,
+      retry_count=retry_count+1,updated_at=NOW() WHERE id=$6 AND owner_username=$7`,
+    [JSON.stringify(responseData).slice(0,5000),retryChargeAmount,retryWarehouseFee,retryServiceFee,
+      `fulfillment:${req.authUser.username}:${submission.order_id}`,submission.id,req.authUser.username]);
     res.json({ code: 0, message: '重试成功' });
   } catch (error) {
     const reason = String(error.response?.data?.message || error.message || '重试失败').slice(0,2000);
@@ -7037,16 +7199,10 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
   }
 });
 
-function replacementProviderOrderNumber(orderId) {
-  const base = String(orderId || '').replace(/[^A-Za-z0-9_-]/g,'').slice(0,32) || 'ORDER';
-  const suffix = `R${Date.now().toString(36).toUpperCase().slice(-7)}`;
-  return `${base}-${suffix}`.slice(0,48);
-}
-
 app.post('/api/admin/fulfillment/submissions/:id/change-warehouse', requireOrderAccess, async (req, res) => {
   const newWarehouseId = Number(req.body?.warehouseId);
   if (!Number.isFinite(newWarehouseId) || newWarehouseId <= 0) return res.status(400).json({ code:400,message:'请选择新的仓库' });
-  const currentResult = await pool.query(`SELECT f.*,c.provider AS old_provider,c.provider_config AS old_provider_config
+  const currentResult = await pool.query(`SELECT f.*,c.provider AS old_provider
     FROM fulfillment_submissions f
     JOIN erp_connectors c ON c.id=f.warehouse_id
     JOIN users u ON u.username=c.owner_username AND u.role='admin'
@@ -7062,49 +7218,15 @@ app.post('/api/admin/fulfillment/submissions/:id/change-warehouse', requireOrder
   if (String(submission.old_provider) !== 'yeeke' || String(target.provider) !== 'yeeke') {
     return res.status(400).json({ code:400,message:'修改仓库目前只支持 Yeeke 仓库之间转移' });
   }
-  const orderResult = await pool.query(`SELECT * FROM ml_orders
-    WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created`,[submission.order_id,req.authUser.username]);
-  if (!orderResult.rows.length) return res.status(404).json({ code:404,message:'原订单不存在' });
-  const previousNumber = String(submission.provider_order_number || submission.order_id);
-  const replacementNumber = replacementProviderOrderNumber(submission.order_id);
-  let replacementCreated = false;
-  try {
-    const oldConfig = getYeekeConnectorConfig({ provider_config:submission.old_provider_config });
-    const targetConfig = getYeekeConnectorConfig(target);
-    const [oldClient,targetClient] = [createYeekeClient(oldConfig),createYeekeClient(targetConfig)];
-    await Promise.all([
-      oldClient.authorize(oldConfig.userName,oldConfig.password),
-      targetClient.authorize(targetConfig.userName,targetConfig.password)
-    ]);
-    const [externalUserId,pdfBuffer] = await Promise.all([
-      getOrderExternalUserId(req.authUser.username),
-      resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)
-    ]);
-    const pushed = await sendOrderToConnector(target,orderResult.rows,{
-      displayOrderId:submission.order_id,providerOrderNumber:replacementNumber,externalUserId,
-      carrier:submission.carrier,trackingNumber:submission.tracking_number,pdfString:pdfBuffer.toString('base64'),serviceCodes:[]
-    },targetClient);
-    replacementCreated = true;
-    try {
-      await oldClient.updateOrderStatus({ ordersn:previousNumber,status:'7' });
-    } catch (cancelError) {
-      let rollbackMessage = '新仓库订单已自动取消';
-      try { await targetClient.updateOrderStatus({ ordersn:replacementNumber,status:'7' }); }
-      catch (_) { rollbackMessage = '新仓库订单回滚失败，请立即联系仓库人工处理'; }
-      throw new Error(`旧仓库订单无法取消，未修改本地仓库；${rollbackMessage}：${cancelError.response?.data?.message || cancelError.message}`);
-    }
-    await pool.query(`UPDATE fulfillment_submissions SET warehouse_id=$1,provider_order_number=$2,service_ids='[]'::jsonb,
-      status='success',response_text=$3,failure_reason=NULL,updated_at=NOW() WHERE id=$4 AND owner_username=$5`,
-    [newWarehouseId,replacementNumber,JSON.stringify({ moved:true,previousNumber,replacementNumber,pushed }).slice(0,5000),submission.id,req.authUser.username]);
-    res.json({ code:0,data:{ orderId:submission.order_id,warehouseId:newWarehouseId,providerOrderNumber:replacementNumber },message:'仓库修改成功，旧仓订单已取消并重新推送到新仓库' });
-  } catch (error) {
-    const prefix = replacementCreated ? '仓库转移未完成' : '新仓库推单失败';
-    res.status(502).json({ code:502,message:`${prefix}：${error.response?.data?.message || error.message}` });
-  }
+  return res.status(409).json({
+    code:409,
+    data:{ orderId:submission.order_id,providerOrderNumber:submission.provider_order_number || submission.order_id },
+    message:'Yeeke 当前公开 API 未提供原订单修改仓库接口。系统已停止“取消旧单并生成新单”的错误方案，不会再创建 -R 新订单；请先在 Yeeke 后台修改，或让 Yeeke 提供原单改仓 API 后再对接。'
+  });
 });
 
 app.get('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query(`SELECT c.id,c.name,c.endpoint,c.provider,c.provider_config,c.auth_header AS "authHeader",c.enabled,c.created_at AS "createdAt"
+  const { rows } = await pool.query(`SELECT c.id,c.name,c.endpoint,c.provider,c.provider_config,c.auth_header AS "authHeader",c.unit_price AS "unitPrice",c.enabled,c.created_at AS "createdAt"
     FROM erp_connectors c JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE c.enabled=TRUE ORDER BY c.id DESC`);
   const data = rows.map(({ provider_config: providerConfig, ...row }) => {
@@ -7119,6 +7241,7 @@ app.get('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
 
 app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
   const { name, endpoint, authHeader, authValue } = req.body || {};
+  const unitPrice = feeAmount(req.body?.unitPrice);
   const provider = String(req.body?.provider || 'generic').trim().toLowerCase() === 'yeeke' ? 'yeeke' : 'generic';
   if (!name) return res.status(400).json({ code: 400, message: '缺少连接名称' });
   let target;
@@ -7152,8 +7275,16 @@ app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
   let encryptedAuth;
   try { encryptedAuth = provider === 'yeeke' ? '' : encryptErpCredential(String(authValue || '').slice(0,2000)); }
   catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
-  const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value,provider,provider_config) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, provider === 'yeeke' ? 'yeeke' : String(authHeader || '').slice(0,120), encryptedAuth, provider, providerConfig]);
+  const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value,provider,provider_config,unit_price) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, provider === 'yeeke' ? 'yeeke' : String(authHeader || '').slice(0,120), encryptedAuth, provider, providerConfig,unitPrice]);
   res.json({ code: 0, data: { id: rows[0].id } });
+});
+
+app.put('/api/admin/erp-connectors/:id/price', requireAdmin, async (req, res) => {
+  const unitPrice = feeAmount(req.body?.unitPrice);
+  const { rowCount } = await pool.query('UPDATE erp_connectors SET unit_price=$1,updated_at=NOW() WHERE id=$2 AND owner_username=$3',
+  [unitPrice,req.params.id,req.authUser.username]);
+  if (!rowCount) return res.status(404).json({ code:404,message:'仓库不存在' });
+  res.json({ code:0,data:{ id:Number(req.params.id),unitPrice },message:`仓库每单费用已设置为 CNY ${unitPrice.toFixed(2)}` });
 });
 
 app.post('/api/admin/erp-connectors/:id/sync-services', requireAdmin, async (req, res) => {
@@ -7649,6 +7780,11 @@ app.get('/api/health/order-realtime',(req,res) => res.json({ code:0,data:{
   intervalSeconds:60,latestIdsPerStore:10,...realtimeOrderDiscoveryState
 } }));
 
+app.get('/api/health/yeeke-submission-status',(req,res) => res.json({ code:0,data:{
+  enabled:Boolean(yeekeSubmissionStatusSyncTimer),running:yeekeSubmissionStatusSyncRunning,
+  intervalSeconds:120,...yeekeSubmissionStatusSyncState
+} }));
+
 function nextBeijingOrderSyncAt(nowMs = Date.now()) {
   const beijingNow = new Date(nowMs + 8 * 3600000);
   const year = beijingNow.getUTCFullYear(), month = beijingNow.getUTCMonth(), day = beijingNow.getUTCDate();
@@ -7735,6 +7871,7 @@ async function start() {
   startMercadoLibreMissedFeedRecovery();
   officialAccountService.start();
   startRealtimeOrderDiscovery();
+  startYeekeSubmissionStatusSync();
   scheduleMelPublicTrackingBackfill(3000);
   scheduleNextOrderSync();
   const shutdown = signal => {
@@ -7742,6 +7879,7 @@ async function start() {
     if (scheduledOrderSyncTimer) clearTimeout(scheduledOrderSyncTimer);
     if (realtimeOrderDiscoveryTimer) clearInterval(realtimeOrderDiscoveryTimer);
     if (mercadoLibreMissedFeedTimer) clearInterval(mercadoLibreMissedFeedTimer);
+    if (yeekeSubmissionStatusSyncTimer) clearInterval(yeekeSubmissionStatusSyncTimer);
     if (melTrackingBackfillTimer) clearTimeout(melTrackingBackfillTimer);
     mercadoLibreWebhookService?.stop();
     officialAccountService?.stop();

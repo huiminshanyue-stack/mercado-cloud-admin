@@ -53,6 +53,16 @@ function createYeekeClient(config, request = axios) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/order/create/v2', { ...order, accessToken, timestamp: Date.now() });
     },
+    async listOrders(filters = {}) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/order/list', {
+        pageNo: 1,
+        pageSize: 20,
+        ...filters,
+        accessToken,
+        timestamp: Date.now()
+      });
+    },
     async changeAirwaybill(order) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/airwaybill/change', { ...order, accessToken, timestamp: Date.now() });
@@ -81,6 +91,24 @@ function buildYeekeErpOrderNumber(externalUserId, orderId) {
   const sourceOrderId = String(orderId || '').replace(/[^A-Za-z0-9_-]/g, '');
   if (!identity) return sourceOrderId.slice(0, 32);
   return identity;
+}
+
+function extractYeekeOrderRecords(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.records)) return data.records;
+  if (Array.isArray(data?.list)) return data.list;
+  return [];
+}
+
+function isYeekeOrderReturned(order) {
+  const returnFlag = String(order?.returnFlag ?? '').trim().toLowerCase();
+  return String(order?.dgStatus ?? '').trim() === '7'
+    || returnFlag === '1'
+    || returnFlag === 'true';
+}
+
+function yeekeOrderReturnReason(order) {
+  return String(order?.messageToUser || order?.returnReason || order?.refundReason || '仓库已退回订单').trim().slice(0, 2000);
 }
 
 function yeekeExpressCode(carrier) {
@@ -139,6 +167,7 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   const payload = {
     ordersn: orderId,
     erpOrdersn: buildYeekeErpOrderNumber(externalUserId, sourceOrderId),
+    note: externalUserId ? `山月ERP ${buildYeekeErpOrderNumber(externalUserId, sourceOrderId)}` : '山月ERP',
     pdfString: pdfString || undefined,
     trackingNo: trackingNumber ? String(trackingNumber) : undefined,
     selectProList: [...new Set((Array.isArray(serviceCodes) ? serviceCodes : []).map(String).filter(Boolean))],
@@ -160,4 +189,14 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined && value !== ''));
 }
 
-module.exports = { DEFAULT_YEEKE_BASE_URL, YEEKE_API_PREFIX, buildYeekeEnvelope, createYeekeClient, buildYeekeErpOrderNumber, buildYeekeOrderPayload };
+module.exports = {
+  DEFAULT_YEEKE_BASE_URL,
+  YEEKE_API_PREFIX,
+  buildYeekeEnvelope,
+  createYeekeClient,
+  buildYeekeErpOrderNumber,
+  buildYeekeOrderPayload,
+  extractYeekeOrderRecords,
+  isYeekeOrderReturned,
+  yeekeOrderReturnReason
+};
