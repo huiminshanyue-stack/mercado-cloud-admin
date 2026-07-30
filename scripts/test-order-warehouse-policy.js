@@ -51,11 +51,14 @@ const orderStyleName = rootAssetSource.match(/(OrderManagement-[A-Za-z0-9_-]+\.c
 assert.ok(orderStyleName, 'the production bundle must reference the order-management stylesheet');
 const orderStyleSource = fs.readFileSync(path.join(__dirname, '..', 'public', 'assets', orderStyleName), 'utf8');
 for (const route of [
+  "app.get('/api/admin/erp-connectors', requireAdmin",
   "app.post('/api/admin/erp-connectors', requireAdmin",
   "app.post('/api/admin/erp-connectors/:id/sync-services', requireAdmin",
   "app.delete('/api/admin/erp-connectors/:id', requireAdmin",
+  "app.get('/api/admin/fulfillment-services', requireAdmin",
   "app.post('/api/admin/fulfillment-services', requireAdmin",
   "app.delete('/api/admin/fulfillment-services/:id', requireAdmin",
+  "app.get('/api/admin/logistics-companies', requireAdmin",
   "app.post('/api/admin/logistics-companies', requireAdmin",
   "app.delete('/api/admin/logistics-companies/:id', requireAdmin",
   "app.post('/api/admin/warehouse-addresses', requireAdmin",
@@ -63,6 +66,7 @@ for (const route of [
   "app.delete('/api/admin/warehouse-addresses/:id', requireAdmin"
 ]) assert.ok(serverSource.includes(route), `${route} must stay admin-only`);
 assert.ok(serverSource.includes("app.get('/api/admin/warehouse-addresses', requireOrderAccess"), 'all order-management users must be able to read the shared address catalog');
+assert.ok(serverSource.includes("app.get('/api/admin/fulfillment-options', requireOrderAccess"), 'order users must receive safe fulfillment choices without configuration access');
 assert.ok(serverSource.includes("JOIN users u ON u.username=wa.owner_username AND u.role='admin'"), 'only administrator-owned addresses may enter the shared catalog');
 assert.ok(serverSource.includes("JOIN users u ON u.username=c.owner_username AND u.role='admin'"), 'warehouse reads must use the shared admin catalog');
 assert.ok(serverSource.includes("WHERE c.id=$1 AND c.enabled=TRUE"), 'order submission must accept an enabled shared admin warehouse');
@@ -114,9 +118,11 @@ assert.ok(orderFrontendSource.includes('www.kuaidi100.com/chaxun'), 'domestic tr
 assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.includes('shunfeng') && orderFrontendSource.includes('jtexpress'), 'common domestic carriers must be mapped for automatic query filling');
 assert.ok(orderFrontendSource.includes('仓库收货地址') && orderFrontendSource.includes('recipientDisplay') && orderFrontendSource.includes('addressDisplay'), 'the workbench must render user-specific shared warehouse addresses');
 assert.ok(orderFrontendSource.includes('/api/admin/warehouse-addresses'), 'the workbench must load and manage warehouse addresses through the protected API');
+assert.ok(orderFrontendSource.includes('/api/admin/fulfillment-options'), 'non-admin users must load only safe fulfillment choices');
 assert.ok(orderFrontendSource.includes('仓库地址') && orderFrontendSource.includes('warehouse-addresses'), 'warehouse addresses must have a standalone tab visible to order users');
 assert.ok(serverSource.includes("warehouseAddressTabRoles: ['admin','agent','user']"), 'warehouse address tab metadata must allow all order roles');
 assert.ok(serverSource.includes("warehouseConfigurationTabRole: 'admin'"), 'warehouse configuration tab metadata must stay administrator-only');
+assert.ok(serverSource.includes("warehouseConfigurationReadRole: 'admin'") && serverSource.includes('fulfillmentOptionsExcludeCredentials: true'), 'configuration reads must stay admin-only while safe options exclude credentials');
 assert.ok(orderFrontendSource.includes('二次推单会在新仓库创建新订单'), 'the UI must explain the second-push and previous-order cancellation flow');
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');

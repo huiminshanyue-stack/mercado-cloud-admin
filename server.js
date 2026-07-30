@@ -3142,7 +3142,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.22',
+    version: '2026-07-31.23',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3173,6 +3173,8 @@ app.get('/api/health/order-management', (req, res) => {
     warehouseAddressUserIdentitySuffix: 'SY00000',
     warehouseAddressTabRoles: ['admin','agent','user'],
     warehouseConfigurationTabRole: 'admin',
+    warehouseConfigurationReadRole: 'admin',
+    fulfillmentOptionsExcludeCredentials: true,
     fulfillmentWarehouseCorrection: 'second-push-and-cancel-previous',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
@@ -6831,7 +6833,7 @@ app.post('/api/admin/orders/:orderId/messages', requireOrderAccess, async (req, 
   }
 });
 
-app.get('/api/admin/fulfillment-services', requireOrderAccess, async (req, res) => {
+app.get('/api/admin/fulfillment-services', requireAdmin, async (req, res) => {
   const { rows } = await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.external_price AS "externalPrice",fs.connector_id AS "connectorId",fs.enabled
     FROM fulfillment_services fs JOIN users u ON u.username=fs.owner_username AND u.role='admin'
     ORDER BY fs.source DESC,fs.id DESC`);
@@ -6851,12 +6853,16 @@ app.delete('/api/admin/fulfillment-services/:id', requireAdmin, async (req, res)
   res.json({ code: 0 });
 });
 
-app.get('/api/admin/logistics-companies', requireOrderAccess, async (req, res) => {
+async function ensureDefaultLogisticsCompanies() {
   const defaults = ['顺丰速运','中通快递','圆通速递','申通快递','韵达快递','极兔速递','邮政EMS','京东物流','菜鸟物流'];
   const adminOwner = await pool.query("SELECT username FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1");
   const existing = await pool.query(`SELECT COUNT(*)::int AS count FROM logistics_companies lc
     JOIN users u ON u.username=lc.owner_username AND u.role='admin'`);
   if (!existing.rows[0].count && adminOwner.rows[0]) for (const name of defaults) await pool.query('INSERT INTO logistics_companies(owner_username,name) VALUES($1,$2) ON CONFLICT(owner_username,name) DO NOTHING',[adminOwner.rows[0].username,name]);
+}
+
+app.get('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
+  await ensureDefaultLogisticsCompanies();
   const { rows } = await pool.query(`SELECT lc.id,lc.name,lc.code,lc.enabled FROM logistics_companies lc
     JOIN users u ON u.username=lc.owner_username AND u.role='admin' ORDER BY lc.name`);
   res.json({ code: 0, data: rows });
@@ -6950,6 +6956,33 @@ app.delete('/api/admin/warehouse-addresses/:id', requireAdmin, async (req, res) 
   } catch (error) {
     console.error('[Orders] warehouse address delete failed:',error.message);
     res.status(500).json({ code:500,message:'仓库地址删除失败' });
+  }
+});
+
+app.get('/api/admin/fulfillment-options', requireOrderAccess, async (req, res) => {
+  try {
+    await ensureDefaultLogisticsCompanies();
+    const [connectorResult,serviceResult,carrierResult] = await Promise.all([
+      pool.query(`SELECT c.id,c.name,c.provider,c.provider_config,c.unit_price AS "unitPrice"
+        FROM erp_connectors c JOIN users u ON u.username=c.owner_username AND u.role='admin'
+        WHERE c.enabled=TRUE ORDER BY c.id DESC`),
+      pool.query(`SELECT fs.id,fs.name,fs.description,fs.source,fs.external_price AS "externalPrice",
+        fs.connector_id AS "connectorId",fs.enabled FROM fulfillment_services fs
+        JOIN users u ON u.username=fs.owner_username AND u.role='admin' ORDER BY fs.source DESC,fs.id DESC`),
+      pool.query(`SELECT lc.id,lc.name,lc.code,lc.enabled FROM logistics_companies lc
+        JOIN users u ON u.username=lc.owner_username AND u.role='admin' ORDER BY lc.name`)
+    ]);
+    const connectors = connectorResult.rows.map(({ provider_config:providerConfig, ...row }) => {
+      let warehouseCode = '';
+      if (row.provider === 'yeeke' && providerConfig) {
+        try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不暴露损坏的配置 */ }
+      }
+      return { ...row,warehouseCode };
+    });
+    res.json({ code:0,data:{ connectors,services:serviceResult.rows,carriers:carrierResult.rows } });
+  } catch (error) {
+    console.error('[Orders] fulfillment options failed:',error.message);
+    res.status(500).json({ code:500,message:'代贴单可选项读取失败' });
   }
 });
 
@@ -7363,7 +7396,7 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
   }
 });
 
-app.get('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
+app.get('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
   const { rows } = await pool.query(`SELECT c.id,c.name,c.endpoint,c.provider,c.provider_config,c.auth_header AS "authHeader",c.unit_price AS "unitPrice",c.enabled,c.created_at AS "createdAt"
     FROM erp_connectors c JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE c.enabled=TRUE ORDER BY c.id DESC`);
