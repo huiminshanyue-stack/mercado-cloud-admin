@@ -68,7 +68,26 @@ function marketplaceCountry(value) {
   return ({ MLM: 'MX', MLB: 'BR', MLC: 'CL', MCO: 'CO', MLA: 'AR', MLU: 'UY' })[code] || code;
 }
 
-function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId }) {
+function buildYeekeErpOrderNumber(externalUserId, orderId) {
+  const identity = String(externalUserId || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 15);
+  const sourceOrderId = String(orderId || '').replace(/[^A-Za-z0-9_-]/g, '');
+  if (!identity) return sourceOrderId.slice(0, 32);
+  const availableOrderLength = Math.max(1, 32 - identity.length - 1);
+  return `${identity}-${sourceOrderId.slice(-availableOrderLength)}`;
+}
+
+function yeekeExpressCode(carrier) {
+  const name = String(carrier || '').trim();
+  const codes = {
+    '圆通快递': 'yt', '圆通速递': 'yt', '中通快递': 'zt', '申通快递': 'st',
+    '韵达快递': 'yds', '韵达速递': 'yds', '顺丰快递': 'sf', '顺丰速运': 'sf',
+    '京东快递': 'jd', '京东物流': 'jd', '邮政EMS': 'ems', 'EMS': 'ems',
+    '德邦快递': 'db', '德邦物流': 'db', '安能物流': 'aneng', '菜鸟物流': 'tmdn'
+  };
+  return codes[name] || (/^[a-z0-9-]+$/i.test(name) ? name : 'other');
+}
+
+function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, externalUserId }) {
   const sourceRows = (Array.isArray(rows) && rows.length ? rows : [row]).filter(Boolean);
   row = sourceRows[0] || {};
   const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
@@ -82,14 +101,15 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
     const item = entry?.item && typeof entry.item === 'object' ? entry.item : entry;
     const quantity = Math.max(1, Number(entry?.quantity || item?.quantity || 1));
     const sku = item?.seller_custom_field || item?.variation_sku || item?.seller_sku || item?.sku || '';
+    const imageUrl = item?.secure_thumbnail || item?.thumbnail || item?.picture_url || item?.pictures?.[0]?.secure_url || item?.pictures?.[0]?.url || '';
     return {
       itemName: String(item?.title || item?.itemName || item?.name || 'Mercado Libre 商品').slice(0, 500),
       itemNum: quantity,
-      url: item?.permalink || item?.url || undefined,
+      url: imageUrl ? String(imageUrl).replace(/^http:/i, 'https:') : undefined,
       variationSku: sku ? String(sku).slice(0, 200) : undefined,
       variationName: item?.variation_name ? String(item.variation_name).slice(0, 200) : undefined,
       productEnName: item?.title ? String(item.title).slice(0, 500) : undefined,
-      expressInfos: trackingNumber ? [{ trackingNo: String(trackingNumber), sendQuantity: quantity, expressCode: String(carrier || '').slice(0, 100) }] : [],
+      expressInfos: trackingNumber ? [{ trackingNo: String(trackingNumber), sendQuantity: quantity, expressCode: yeekeExpressCode(carrier) }] : [],
       stockInfos: [],
       distributionProducts: []
     };
@@ -97,19 +117,20 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   if (!orderItems.length) orderItems.push({ itemName: 'Mercado Libre 商品', itemNum: 1, expressInfos: [], stockInfos: [], distributionProducts: [] });
   const receiver = raw.shipping?.receiver_address || raw.shipping?.receiverInfo || raw.receiverInfo || {};
   const receiverInfo = Object.keys(receiver).length ? {
-    receiver: receiver.receiver_name || receiver.receiver || raw.buyer?.nickname || '',
-    mobile: receiver.receiver_phone || receiver.phone || '',
-    address: receiver.address_line || receiver.address || '',
+    name: receiver.receiver_name || receiver.name || receiver.receiver || raw.buyer?.nickname || '',
+    phone: receiver.receiver_phone || receiver.phone || receiver.mobile || '',
+    zipcode: receiver.zip_code || receiver.zipcode || receiver.zipCode || '',
+    fullAddress: receiver.address_line || receiver.fullAddress || receiver.address || '',
     city: receiver.city?.name || receiver.city || '',
     state: receiver.state?.name || receiver.state || '',
-    zipCode: receiver.zip_code || receiver.zipCode || '',
+    district: receiver.neighborhood?.name || receiver.neighborhood || receiver.district || '',
     country: receiver.country?.id || receiver.country || row.country || ''
   } : undefined;
   const orderId = String(displayOrderId || row.pack_id || row.ml_order_id || raw.pack_id || raw.id || raw.order_id || '');
   const totalAmount = sourceRows.reduce((total, sourceRow) => total + Number(sourceRow.total_amount || sourceRow.raw_data?.total_amount || 0), 0);
   const payload = {
     ordersn: orderId,
-    erpOrdersn: orderId,
+    erpOrdersn: buildYeekeErpOrderNumber(externalUserId, orderId),
     packageType: 1,
     wareHouse: String(warehouseCode),
     autoRelateStock: 0,
@@ -128,4 +149,4 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined && value !== ''));
 }
 
-module.exports = { DEFAULT_YEEKE_BASE_URL, YEEKE_API_PREFIX, buildYeekeEnvelope, createYeekeClient, buildYeekeOrderPayload };
+module.exports = { DEFAULT_YEEKE_BASE_URL, YEEKE_API_PREFIX, buildYeekeEnvelope, createYeekeClient, buildYeekeErpOrderNumber, buildYeekeOrderPayload };

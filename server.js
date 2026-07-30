@@ -84,6 +84,7 @@ async function initSchema() {
       role VARCHAR(20) DEFAULT 'user',
       validUntil TIMESTAMP DEFAULT NULL,
       created_by VARCHAR(100) DEFAULT NULL,
+      order_external_id VARCHAR(15) NOT NULL DEFAULT ('SY' || UPPER(SUBSTRING(MD5(RANDOM()::text || CLOCK_TIMESTAMP()::text) FROM 1 FOR 13))),
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -91,6 +92,11 @@ async function initSchema() {
   try {
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by VARCHAR(100) DEFAULT NULL");
   } catch (e) { console.log('[DB] created_by 列已存在'); }
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS order_external_id VARCHAR(15)');
+  await pool.query(`UPDATE users SET order_external_id='SY' || UPPER(SUBSTRING(MD5(id::text || ':' || username || ':' || COALESCE(created_at::text,'')) FROM 1 FOR 13)) WHERE order_external_id IS NULL OR order_external_id=''`);
+  await pool.query("ALTER TABLE users ALTER COLUMN order_external_id SET DEFAULT ('SY' || UPPER(SUBSTRING(MD5(RANDOM()::text || CLOCK_TIMESTAMP()::text) FROM 1 FOR 13)))");
+  await pool.query('ALTER TABLE users ALTER COLUMN order_external_id SET NOT NULL');
+  await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_order_external_id ON users(order_external_id)');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ads (
       id SERIAL PRIMARY KEY,
@@ -3047,7 +3053,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.07',
+    version: '2026-07-30.08',
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
     dispatchDeadlineFallbackField: 'system_three_business_days',
@@ -3164,6 +3170,8 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentAudit: true,
     yeekeOrderCreateV2: true,
     yeekeWarehouseCodes: ['th','ywc'],
+    yeekeProductImageMapping: 'orderItems.url=mercado-official-thumbnail',
+    yeekePerUserErpOrderNumber: true,
     orderColorDisplay: true,
     deployedOrderFrontend: true,
     platformWeightOnlyFallback: true,
@@ -6718,6 +6726,11 @@ function getYeekeConnectorConfig(connector) {
   return config;
 }
 
+async function getOrderExternalUserId(username) {
+  const { rows } = await pool.query('SELECT order_external_id FROM users WHERE username=$1 LIMIT 1', [username]);
+  return String(rows[0]?.order_external_id || '');
+}
+
 async function sendOrderToConnector(connector, row, options = {}, yeekeClient = null) {
   if (String(connector.provider || 'generic') === 'yeeke') {
     const config = getYeekeConnectorConfig(connector);
@@ -6727,6 +6740,7 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
       row: Array.isArray(row) ? row[0] : row,
       rows: Array.isArray(row) ? row : undefined,
       displayOrderId: options.displayOrderId,
+      externalUserId: options.externalUserId,
       warehouseCode: config.warehouseCode,
       carrier: options.carrier,
       trackingNumber: options.trackingNumber
@@ -6749,6 +6763,7 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
   if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
   const serviceResult = serviceIds.length ? await pool.query('SELECT id,name,code,description FROM fulfillment_services WHERE owner_username=$2 AND enabled=TRUE AND id=ANY($1::bigint[])', [serviceIds,req.authUser.username]) : { rows: [] };
   const warehouse = connectorResult.rows[0];
+  const externalUserId = await getOrderExternalUserId(req.authUser.username);
   let yeekeClient = null;
   if (String(warehouse.provider || 'generic') === 'yeeke') {
     try {
@@ -6767,7 +6782,7 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     if (!orderResult.rows.length) { results.push({ orderId: displayOrderId, success: false, message: '订单不存在' }); continue; }
     const payload = { source: 'shanyue-erp', action: 'fulfillment_label', order_id: displayOrderId, carrier, tracking_number: trackingNumber, value_added_services: serviceResult.rows, orders: orderResult.rows.map(row => row.raw_data) };
     try {
-      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, carrier, trackingNumber, payload }, yeekeClient);
+      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, externalUserId, carrier, trackingNumber, payload }, yeekeClient);
       await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000)]);
       results.push({ orderId: displayOrderId, success: true });
     } catch (error) {
@@ -6799,7 +6814,8 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
     if (String(submission.provider || 'generic') === 'yeeke') {
       const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [submission.order_id,req.authUser.username]);
       if (!orderResult.rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
-      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, carrier: submission.carrier, trackingNumber: submission.tracking_number });
+      const externalUserId = await getOrderExternalUserId(req.authUser.username);
+      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number });
     } else {
       const headers = { 'Content-Type': 'application/json' };
       if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
@@ -6877,7 +6893,8 @@ app.post('/api/admin/orders/:orderId/push', requireOrderAccess, async (req, res)
   if (!order.rows[0] || !connector.rows[0]) return res.status(404).json({ code: 404, message: '订单或ERP连接不存在' });
   const c = connector.rows[0];
   try {
-    const pushed = await sendOrderToConnector(c, order.rows[0]);
+    const externalUserId = await getOrderExternalUserId(req.authUser.username);
+    const pushed = await sendOrderToConnector(c, order.rows[0], { externalUserId });
     await pool.query("UPDATE ml_orders SET push_status='success',last_pushed_at=NOW() WHERE ml_order_id=$1 AND owner_username=$2", [req.params.orderId,req.authUser.username]);
     await pool.query('INSERT INTO erp_push_logs(owner_username,order_id,connector_id,success,http_status,response_text) VALUES($1,$2,$3,TRUE,$4,$5)', [req.authUser.username,req.params.orderId,c.id,200,JSON.stringify(pushed).slice(0,5000)]);
     res.json({ code: 0, data: { status: 200, result: pushed } });

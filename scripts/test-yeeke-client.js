@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { buildYeekeEnvelope, createYeekeClient, buildYeekeOrderPayload } = require('../yeeke-client');
+const { buildYeekeEnvelope, createYeekeClient, buildYeekeErpOrderNumber, buildYeekeOrderPayload } = require('../yeeke-client');
 
 async function run() {
   const signed = buildYeekeEnvelope(
@@ -35,20 +35,25 @@ async function run() {
       date_created: '2026-07-28T04:02:56.000Z',
       handling_deadline: '2026-08-03T15:59:59.000Z',
       country: 'CL', currency: 'USD', total_amount: 3.01,
-      items: [{ item: { title: 'Ventilation Clips', seller_custom_field: 'CBT-5024470568' }, quantity: 1 }],
+      items: [{ item: { title: 'Ventilation Clips', seller_custom_field: 'CBT-5024470568', thumbnail: 'http://http2.mlstatic.com/image.jpg', permalink: 'https://articulo.mercadolibre.com/item' }, quantity: 1 }],
       raw_data: { buyer: { nickname: 'buyer' }, shipping: { receiver_address: { receiver_name: 'A', address_line: 'Street 1', zip_code: '123' } } }
     },
-    warehouseCode: 'ywc', carrier: '中通快递', trackingNumber: 'YT123'
+    warehouseCode: 'ywc', carrier: '中通快递', trackingNumber: 'YT123', externalUserId: 'SYABC1234567890'
   });
   assert.strictEqual(payload.ordersn, '2000014231142463');
   assert.strictEqual(payload.wareHouse, 'ywc');
   assert.strictEqual(payload.shopType, 'mercado');
   assert.strictEqual(payload.packageType, 1);
   assert.strictEqual(payload.orderItems[0].variationSku, 'CBT-5024470568');
+  assert.strictEqual(payload.orderItems[0].url, 'https://http2.mlstatic.com/image.jpg');
   assert.deepStrictEqual(payload.orderItems[0].stockInfos, []);
   assert.deepStrictEqual(payload.orderItems[0].distributionProducts, []);
   assert.strictEqual(payload.orderItems[0].expressInfos[0].trackingNo, 'YT123');
-  assert.strictEqual(payload.receiverInfo.zipCode, '123');
+  assert.strictEqual(payload.orderItems[0].expressInfos[0].expressCode, 'zt');
+  assert.strictEqual(payload.receiverInfo.zipcode, '123');
+  assert.strictEqual(payload.receiverInfo.fullAddress, 'Street 1');
+  assert.strictEqual(payload.erpOrdersn, 'SYABC1234567890-2000014231142463');
+  assert.ok(payload.erpOrdersn.length <= 32);
   assert.ok(Number.isFinite(payload.shipByDate));
 
   const packPayload = buildYeekeOrderPayload({
@@ -62,6 +67,8 @@ async function run() {
   assert.strictEqual(packPayload.orderItems.length, 2);
   assert.strictEqual(packPayload.totalAmount, 30);
   assert.strictEqual(packPayload.country, 'MX');
+  assert.strictEqual(buildYeekeErpOrderNumber('SYUSER000000001', '2000014266367529'), 'SYUSER000000001-2000014266367529');
+  assert.notStrictEqual(buildYeekeErpOrderNumber('SYUSER000000001', '2000014266367529'), buildYeekeErpOrderNumber('SYUSER000000002', '2000014266367529'));
   console.log('Yeeke client tests passed');
 }
 
