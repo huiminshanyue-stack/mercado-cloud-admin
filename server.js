@@ -3047,7 +3047,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.06',
+    version: '2026-07-30.07',
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
     dispatchDeadlineFallbackField: 'system_three_business_days',
@@ -3162,6 +3162,8 @@ app.get('/api/health/order-management', (req, res) => {
     wechatOfficialAccountPersistentOutbox: true,
     multiStoreSync: true,
     fulfillmentAudit: true,
+    yeekeOrderCreateV2: true,
+    yeekeWarehouseCodes: ['th','ywc'],
     orderColorDisplay: true,
     deployedOrderFrontend: true,
     platformWeightOnlyFallback: true,
