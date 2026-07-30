@@ -3042,11 +3042,14 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.05',
+    version: '2026-07-30.06',
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
-    dispatchDeadlineFallbackField: 'estimated_delivery_time.handling',
-    dispatchDeadlineDurationFallback: true,
+    dispatchDeadlineFallbackField: 'system_three_business_days',
+    dispatchDeadlineDurationFallback: false,
+    dispatchDeadlineBusinessDays: 3,
+    dispatchDeadlineStartsNextDay: true,
+    dispatchDeadlineSkipsWeekendsAndChinaHolidays: true,
     customWeekdayDeadlineRules: true,
     chinaHolidayDeadlineCalendar: '2026',
     officialPayoutFromLedger: true,
