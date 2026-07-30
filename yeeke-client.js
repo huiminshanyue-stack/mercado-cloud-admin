@@ -69,7 +69,7 @@ function createYeekeClient(config, request = axios) {
     },
     async updateOrderStatus(order) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
-      return call('/order/status', { ...order, accessToken, timestamp: Date.now() });
+      return call('/status/update', { ...order, accessToken, timestamp: Date.now() });
     }
   };
 }
@@ -91,6 +91,13 @@ function buildYeekeErpOrderNumber(externalUserId, orderId) {
   const sourceOrderId = String(orderId || '').replace(/[^A-Za-z0-9_-]/g, '');
   if (!identity) return sourceOrderId.slice(0, 32);
   return identity;
+}
+
+function buildYeekeResubmitOrderNumber(orderId, timestamp = Date.now()) {
+  const source = String(orderId || '').replace(/[^A-Za-z0-9_-]/g, '') || 'ORDER';
+  const time = Number.isFinite(Number(timestamp)) ? Math.floor(Number(timestamp)) : Date.now();
+  const suffix = `-R${time.toString(36).toUpperCase()}`;
+  return `${source.slice(0, Math.max(1, 32 - suffix.length))}${suffix}`;
 }
 
 function extractYeekeOrderRecords(data) {
@@ -195,6 +202,7 @@ module.exports = {
   buildYeekeEnvelope,
   createYeekeClient,
   buildYeekeErpOrderNumber,
+  buildYeekeResubmitOrderNumber,
   buildYeekeOrderPayload,
   extractYeekeOrderRecords,
   isYeekeOrderReturned,

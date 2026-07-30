@@ -3,6 +3,7 @@ const {
   buildYeekeEnvelope,
   createYeekeClient,
   buildYeekeErpOrderNumber,
+  buildYeekeResubmitOrderNumber,
   buildYeekeOrderPayload,
   extractYeekeOrderRecords,
   isYeekeOrderReturned,
@@ -28,7 +29,7 @@ async function run() {
       if (url.endsWith('/order/create/v2')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'Y1' } } };
       if (url.endsWith('/order/list')) return { status: 200, data: { code: '0', message: '成功', data: { records: [{ ordersn: '200001', dgStatus: '3' }] } } };
       if (url.endsWith('/airwaybill/change')) return { status: 200, data: { code: '0', message: '成功', data: null } };
-      if (url.endsWith('/order/status')) return { status: 200, data: { code: '0', message: '成功', data: null } };
+      if (url.endsWith('/status/update')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       throw new Error(`unexpected URL ${url}`);
     }
   };
@@ -48,8 +49,9 @@ async function run() {
   assert.strictEqual(calls[4].body.pdfString, 'JVBERi0=');
   const remoteServices = await client.listServices();
   assert.strictEqual(remoteServices[0].id, 'service-1');
-  await client.updateOrderStatus({ ordersn: '200001', status: '7' });
-  assert.strictEqual(calls[6].body.status, '7');
+  await client.updateOrderStatus({ ordersn: '200001', status: 'cancelled' });
+  assert.strictEqual(calls[6].body.status, 'cancelled');
+  assert.ok(calls[6].url.endsWith('/status/update'));
 
   const payload = buildYeekeOrderPayload({
     row: {
@@ -102,6 +104,10 @@ async function run() {
   assert.strictEqual(packPayload.country, 'MX');
   assert.strictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), 'SY12345');
   assert.notStrictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), buildYeekeErpOrderNumber('SY54321', '2000014266367529'));
+  const resubmitOrderNumber = buildYeekeResubmitOrderNumber('2000014266367529', 1722337200000);
+  assert.ok(resubmitOrderNumber.startsWith('2000014266367529-R'));
+  assert.ok(resubmitOrderNumber.length <= 32);
+  assert.strictEqual(resubmitOrderNumber, buildYeekeResubmitOrderNumber('2000014266367529', 1722337200000));
   assert.deepStrictEqual(extractYeekeOrderRecords({ records: [{ ordersn: 'A' }] }), [{ ordersn: 'A' }]);
   assert.strictEqual(isYeekeOrderReturned({ dgStatus: '7' }), true);
   assert.strictEqual(isYeekeOrderReturned({ dgStatus: '3', returnFlag: '1' }), true);
