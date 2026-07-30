@@ -16,6 +16,7 @@ async function run() {
       calls.push({ url, body: JSON.parse(envelope.data), envelope });
       if (url.endsWith('/auth')) return { status: 200, data: { code: '0', message: '成功', data: { accessToken: 'token', userCode: 'u1' } } };
       if (url.endsWith('/ware/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ wareHouse: 'th', wareName: '东莞仓' }] } };
+      if (url.endsWith('/otherService/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ id: 'service-1', name: '打包', price: 1 }] } };
       if (url.endsWith('/order/create/v2')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'Y1' } } };
       if (url.endsWith('/airwaybill/change')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       throw new Error(`unexpected URL ${url}`);
@@ -31,6 +32,8 @@ async function run() {
   assert.strictEqual(calls[2].body.ordersn, '200001');
   await client.changeAirwaybill({ ordersn: '200001', pdfString: 'JVBERi0=' });
   assert.strictEqual(calls[3].body.pdfString, 'JVBERi0=');
+  const remoteServices = await client.listServices();
+  assert.strictEqual(remoteServices[0].id, 'service-1');
 
   const payload = buildYeekeOrderPayload({
     row: {
@@ -41,7 +44,7 @@ async function run() {
       items: [{ item: { title: 'Ventilation Clips', seller_custom_field: 'CBT-5024470568', thumbnail: 'http://http2.mlstatic.com/image.jpg', permalink: 'https://articulo.mercadolibre.com/item' }, quantity: 1 }],
       raw_data: { buyer: { nickname: 'buyer' }, shipping: { receiver_address: { receiver_name: 'A', address_line: 'Street 1', zip_code: '123' } } }
     },
-    warehouseCode: 'ywc', carrier: '中通快递', trackingNumber: 'YT123', externalUserId: 'SY12345', pdfString: 'JVBERi0xLjQ='
+    warehouseCode: 'ywc', carrier: '中通快递', trackingNumber: 'YT123', externalUserId: 'SY12345', pdfString: 'JVBERi0xLjQ=', serviceCodes: ['1933035392616419330','1933035392616419330','1933035698318266370']
   });
   assert.strictEqual(payload.ordersn, '2000014231142463');
   assert.strictEqual(payload.wareHouse, 'ywc');
@@ -57,6 +60,7 @@ async function run() {
   assert.strictEqual(payload.receiverInfo.fullAddress, 'Street 1');
   assert.strictEqual(payload.erpOrdersn, 'SY12345-2000014231142463');
   assert.strictEqual(payload.pdfString, 'JVBERi0xLjQ=');
+  assert.deepStrictEqual(payload.selectProList, ['1933035392616419330','1933035698318266370']);
   assert.ok(payload.erpOrdersn.length <= 32);
   assert.ok(Number.isFinite(payload.shipByDate));
 

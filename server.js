@@ -409,9 +409,15 @@ async function initOrderManagementTables() {
   `);
   await pool.query('ALTER TABLE erp_push_logs ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_services (
-    id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120), name VARCHAR(120) NOT NULL, code VARCHAR(100), description VARCHAR(500), enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120), name VARCHAR(120) NOT NULL, code VARCHAR(100), description VARCHAR(500),
+    source VARCHAR(40) NOT NULL DEFAULT 'manual', external_price NUMERIC(12,2), connector_id BIGINT REFERENCES erp_connectors(id) ON DELETE CASCADE,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await pool.query('ALTER TABLE fulfillment_services ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
+  await pool.query("ALTER TABLE fulfillment_services ADD COLUMN IF NOT EXISTS source VARCHAR(40) NOT NULL DEFAULT 'manual'");
+  await pool.query('ALTER TABLE fulfillment_services ADD COLUMN IF NOT EXISTS external_price NUMERIC(12,2)');
+  await pool.query('ALTER TABLE fulfillment_services ADD COLUMN IF NOT EXISTS connector_id BIGINT REFERENCES erp_connectors(id) ON DELETE CASCADE');
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_services_yeeke_code ON fulfillment_services(owner_username,connector_id,code) WHERE source='yeeke'");
   await pool.query(`CREATE TABLE IF NOT EXISTS logistics_companies (
     id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120) NOT NULL,
     name VARCHAR(120) NOT NULL, code VARCHAR(100), enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -3071,7 +3077,9 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.09',
+    version: '2026-07-30.10',
+    yeekeValueAddedServiceSync: true,
+    yeekeValueAddedServicePayloadField: 'selectProList',
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
     dispatchDeadlineFallbackField: 'system_three_business_days',
@@ -6698,7 +6706,8 @@ app.post('/api/admin/orders/:orderId/messages', requireOrderAccess, async (req, 
 });
 
 app.get('/api/admin/fulfillment-services', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,name,code,description,enabled FROM fulfillment_services WHERE owner_username=$1 ORDER BY id DESC',[req.authUser.username]);
+  const { rows } = await pool.query(`SELECT id,name,code,description,source,external_price AS "externalPrice",connector_id AS "connectorId",enabled
+    FROM fulfillment_services WHERE owner_username=$1 ORDER BY source DESC,id DESC`,[req.authUser.username]);
   res.json({ code: 0, data: rows });
 });
 
@@ -6751,6 +6760,33 @@ async function getOrderExternalUserId(username) {
   return String(rows[0]?.order_external_id || '');
 }
 
+async function syncYeekeServicesForConnector(ownerUsername, connector) {
+  const config = getYeekeConnectorConfig(connector);
+  const client = createYeekeClient(config);
+  await client.authorize(config.userName,config.password);
+  const remoteServices = await client.listServices();
+  if (!Array.isArray(remoteServices)) throw new Error('Yeeke 增值服务接口未返回列表');
+  const codes = [];
+  for (const service of remoteServices) {
+    const code = String(service?.id || '').trim();
+    const name = String(service?.name || '').trim();
+    if (!code || !name) continue;
+    const price = Number(service?.price);
+    codes.push(code);
+    await pool.query(`INSERT INTO fulfillment_services(owner_username,name,code,description,source,external_price,connector_id,enabled)
+      VALUES($1,$2,$3,$4,'yeeke',$5,$6,TRUE)
+      ON CONFLICT(owner_username,connector_id,code) WHERE source='yeeke'
+      DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,external_price=EXCLUDED.external_price,enabled=TRUE`,
+    [ownerUsername,name.slice(0,120),code.slice(0,100),`Yeeke 官方增值服务，价格 CNY ${Number.isFinite(price) ? price.toFixed(2) : '-'}`,Number.isFinite(price) ? price : null,connector.id]);
+  }
+  if (codes.length) {
+    await pool.query(`UPDATE fulfillment_services SET enabled=FALSE WHERE owner_username=$1 AND connector_id=$2 AND source='yeeke' AND NOT(code=ANY($3::varchar[]))`,[ownerUsername,connector.id,codes]);
+  } else {
+    await pool.query("UPDATE fulfillment_services SET enabled=FALSE WHERE owner_username=$1 AND connector_id=$2 AND source='yeeke'",[ownerUsername,connector.id]);
+  }
+  return remoteServices.filter(service => service?.id && service?.name);
+}
+
 async function resolveOfficialLabelPdfForPush(authUser, orderRows) {
   const rows = (Array.isArray(orderRows) ? orderRows : [orderRows]).filter(Boolean);
   const shipmentIds = [...new Set(rows.map(row => String(row.shipping_id || '')).filter(Boolean))];
@@ -6793,6 +6829,7 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
       displayOrderId: options.displayOrderId,
       externalUserId: options.externalUserId,
       pdfString: options.pdfString,
+      serviceCodes: options.serviceCodes,
       warehouseCode: config.warehouseCode,
       carrier: options.carrier,
       trackingNumber: options.trackingNumber
@@ -6824,8 +6861,11 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
   if (!connectorResult.rows[0]) return res.status(404).json({ code: 404, message: '仓库不存在或已停用' });
   const carrierResult = await pool.query('SELECT id FROM logistics_companies WHERE owner_username=$1 AND name=$2 AND enabled=TRUE',[req.authUser.username,carrier]);
   if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
-  const serviceResult = serviceIds.length ? await pool.query('SELECT id,name,code,description FROM fulfillment_services WHERE owner_username=$2 AND enabled=TRUE AND id=ANY($1::bigint[])', [serviceIds,req.authUser.username]) : { rows: [] };
+  const serviceResult = serviceIds.length ? await pool.query(`SELECT id,name,code,description,source,connector_id FROM fulfillment_services
+    WHERE owner_username=$2 AND enabled=TRUE AND id=ANY($1::bigint[]) AND (source<>'yeeke' OR connector_id=$3)`, [serviceIds,req.authUser.username,warehouseId]) : { rows: [] };
   const warehouse = connectorResult.rows[0];
+  const serviceCodes = String(warehouse.provider || 'generic') === 'yeeke'
+    ? serviceResult.rows.filter(service => service.source === 'yeeke').map(service => String(service.code || '')).filter(Boolean) : [];
   const externalUserId = await getOrderExternalUserId(req.authUser.username);
   let yeekeClient = null;
   if (String(warehouse.provider || 'generic') === 'yeeke') {
@@ -6847,7 +6887,7 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     try {
       const pdfString = String(warehouse.provider || 'generic') === 'yeeke'
         ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
-      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, externalUserId, carrier, trackingNumber, pdfString, payload }, yeekeClient);
+      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, externalUserId, carrier, trackingNumber, pdfString, serviceCodes, payload }, yeekeClient);
       await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000)]);
       results.push({ orderId: displayOrderId, success: true });
     } catch (error) {
@@ -6882,7 +6922,11 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       if (!orderResult.rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
       const externalUserId = await getOrderExternalUserId(req.authUser.username);
       const pdfString = (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64');
-      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString });
+      const retryServiceIds = (Array.isArray(submission.service_ids) ? submission.service_ids : []).map(Number).filter(Number.isFinite);
+      const retryServices = retryServiceIds.length ? await pool.query(`SELECT code FROM fulfillment_services
+        WHERE owner_username=$2 AND connector_id=$3 AND source='yeeke' AND enabled=TRUE AND id=ANY($1::bigint[])`,[retryServiceIds,req.authUser.username,submission.warehouse_id]) : { rows:[] };
+      const serviceCodes = retryServices.rows.map(service => String(service.code || '')).filter(Boolean);
+      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString, serviceCodes });
     } else {
       const headers = { 'Content-Type': 'application/json' };
       if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
@@ -6947,6 +6991,20 @@ app.post('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
   catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
   const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value,provider,provider_config) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, provider === 'yeeke' ? 'yeeke' : String(authHeader || '').slice(0,120), encryptedAuth, provider, providerConfig]);
   res.json({ code: 0, data: { id: rows[0].id } });
+});
+
+app.post('/api/admin/erp-connectors/:id/sync-services', requireOrderAccess, async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM erp_connectors
+    WHERE id=$1 AND owner_username=$2 AND enabled=TRUE`,[req.params.id,req.authUser.username]);
+  const connector = rows[0];
+  if (!connector) return res.status(404).json({ code:404,message:'仓库连接不存在或不属于当前用户' });
+  if (String(connector.provider || '') !== 'yeeke') return res.status(400).json({ code:400,message:'只有 Yeeke 连接支持同步官方增值服务' });
+  try {
+    const services = await syncYeekeServicesForConnector(req.authUser.username,connector);
+    res.json({ code:0,data:{ count:services.length,services },message:`已同步 ${services.length} 项 Yeeke 增值服务` });
+  } catch (error) {
+    res.status(502).json({ code:502,message:`Yeeke 增值服务同步失败：${error.response?.data?.message || error.message}` });
+  }
 });
 
 app.delete('/api/admin/erp-connectors/:id', requireOrderAccess, async (req, res) => {

@@ -91,7 +91,7 @@ function yeekeExpressCode(carrier) {
   return codes[name] || (/^[a-z0-9-]+$/i.test(name) ? name : 'other');
 }
 
-function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, externalUserId, pdfString }) {
+function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, externalUserId, pdfString, serviceCodes }) {
   const sourceRows = (Array.isArray(rows) && rows.length ? rows : [row]).filter(Boolean);
   row = sourceRows[0] || {};
   const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
@@ -136,6 +136,7 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
     ordersn: orderId,
     erpOrdersn: buildYeekeErpOrderNumber(externalUserId, orderId),
     pdfString: pdfString || undefined,
+    selectProList: [...new Set((Array.isArray(serviceCodes) ? serviceCodes : []).map(String).filter(Boolean))],
     packageType: 1,
     wareHouse: String(warehouseCode),
     autoRelateStock: 0,
