@@ -114,6 +114,16 @@ function marketplaceOrderUnreadParams(userId) {
   };
 }
 
+function mergeOrderMessageOrders(...groups) {
+  const byThread = new Map();
+  for (const order of groups.flat().filter(Boolean)) {
+    const key = String(order.packId || order.pack_id || order.orderId || order.ml_order_id || '').trim();
+    if (!key) continue;
+    byThread.set(key,{ ...order,inquiryType:'order_message' });
+  }
+  return [...byThread.values()];
+}
+
 function claimAvailableActionNames(claim) {
   const players = Array.isArray(claim?.players) ? claim.players : [];
   const respondent = players.find(player => String(player?.role || '').toLowerCase() === 'respondent');
@@ -174,6 +184,7 @@ module.exports = {
   orderPackMessagesParams,
   orderPackSendBody,
   marketplaceOrderUnreadParams,
+  mergeOrderMessageOrders,
   claimAvailableActionNames,
   claimReplyReceiverRole,
   officialCommunicationError

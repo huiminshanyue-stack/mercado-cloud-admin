@@ -21,6 +21,7 @@ const {
   orderPackMessagesParams,
   orderPackSendBody,
   marketplaceOrderUnreadParams,
+  mergeOrderMessageOrders,
   marketplaceClaimEndpoint,
   claimAvailableActionNames,
   claimReplyReceiverRole,
@@ -69,6 +70,16 @@ assert.deepEqual(orderPackSendBody({ site_id:'MLB' },{ sellerId:'123',buyerId:'4
 assert.deepEqual(marketplaceOrderUnreadParams('3361645256'),{
   user_id:'3361645256',role:'seller',tag:'post_sale'
 });
+assert.deepEqual(mergeOrderMessageOrders(
+  [],
+  [{ orderId:'order-1',packId:'pack-1',buyer:'cached pending buyer' }],
+  []
+),[{ orderId:'order-1',packId:'pack-1',buyer:'cached pending buyer',inquiryType:'order_message' }]);
+assert.deepEqual(mergeOrderMessageOrders(
+  [{ orderId:'order-1',packId:'pack-1',buyer:'official unread' }],
+  [{ orderId:'order-1',packId:'pack-1',buyer:'cached pending buyer' }],
+  [{ orderId:'order-2',packId:'pack-2' }]
+).map(order=>order.packId),['pack-1','pack-2']);
 assert.notEqual(marketplaceOrderUnreadEndpoint(),MARKETPLACE_QUESTION_SEARCH_ENDPOINT);
 assert.notEqual(marketplaceOrderPackMessagesEndpoint('1'),marketplaceClaimEndpoint('1','messages'));
 

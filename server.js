@@ -13,7 +13,7 @@ const { dimensionSnapshotsDiffer,normalizeBillableWeight,
   normalizeDimensionSnapshotWeights } = require('./order-dimensions');
 const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellationAlert,
   shouldCreateShippedAlert } = require('./order-alert-policy');
-const { orderSyncPageDecision } = require('./order-sync-policy');
+const { orderSyncPageDecision,resolveRequestedOrderScope } = require('./order-sync-policy');
 const { resolveOfficialHandlingDeadline } = require('./order-deadline-policy');
 const { normalizeOrderItems } = require('./order-items');
 const { normalizeSummaryPeriod,buildOrderWorkbenchSummary } = require('./order-workbench-summary');
@@ -25,7 +25,7 @@ const { isGlobalSellingAuthorization,productQuestionSearchEndpoint,
   marketplaceClaimEndpoint,claimReplyReceiverRole,
   marketplaceClaimSearchEndpoint,
   marketplaceOrderUnreadEndpoint,orderPackMessagesEndpoint,orderPackMessagesParams,orderPackSendBody,
-  marketplaceOrderUnreadParams,officialCommunicationError } = require('./mercadolibre-communications');
+  marketplaceOrderUnreadParams,mergeOrderMessageOrders,officialCommunicationError } = require('./mercadolibre-communications');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -3042,12 +3042,13 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-29.04',
+    version: '2026-07-30.05',
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
-    dispatchDeadlineFallbackField: null,
-    dispatchDeadlineDurationFallback: false,
-    customWeekdayDeadlineRules: false,
+    dispatchDeadlineFallbackField: 'estimated_delivery_time.handling',
+    dispatchDeadlineDurationFallback: true,
+    customWeekdayDeadlineRules: true,
+    chinaHolidayDeadlineCalendar: '2026',
     officialPayoutFromLedger: true,
     shippingActionsHorizontal: true,
     officialClaimReputation: true,
@@ -3092,6 +3093,8 @@ app.get('/api/health/order-management', (req, res) => {
     labelAuthorizationAutoMatch: true,
     lightweightManualOrderSync: true,
     singleOrderStatusSync: true,
+    singleOrderPackScope: true,
+    parallelSingleOrderStatusSync: true,
     scheduledOrderSyncBeijing: '12:00,00:00',
     localOrderMarkAndSoftDelete: true,
     dimensionDetailsOnDemand: true,
@@ -3136,6 +3139,7 @@ app.get('/api/health/order-management', (req, res) => {
     orderItemVariationsPreserved: true,
     orderItemColorTranslation: true,
     miniProgramInquiryReply: true,
+    miniProgramPendingInquiryFallback: true,
     miniProgramAfterSalesReply: true,
     officialClaimSearchUsesCurrentStoreIdentity: true,
     mercadoLibreWebhookTopics: ['orders_v2','marketplace_orders','marketplace_orders_on_site','shipments','marketplace_shipments','messages','marketplace_messages','questions','marketplace_questions','claims','marketplace_claims'],
@@ -3347,11 +3351,32 @@ async function syncOrdersForUser(authUser, body = {}) {
     };
     let directOrderIds = [];
     if (requestedOrderId) {
-      const directRows = await pool.query(`SELECT ml_order_id FROM ml_orders
+      const directRows = await pool.query(`SELECT ml_order_id,pack_id FROM ml_orders
         WHERE owner_username=$1 AND store_user_id=$2 AND (ml_order_id=$3 OR COALESCE(NULLIF(pack_id,''),ml_order_id)=$3)`,
         [req.authUser.username,String(me.id || sellerId),requestedOrderId]);
-      directOrderIds = [...new Set(directRows.rows.map(row => String(row.ml_order_id)).filter(Boolean))];
-      if (!directOrderIds.length) directOrderIds = [requestedOrderId];
+      if (strictSingle) {
+        const initialScope = resolveRequestedOrderScope({ requestedOrderId,matchedRows:directRows.rows });
+        if (!initialScope.packId) {
+          const error = new Error('未找到指定订单或订单不属于当前店铺');
+          error.status = 404;
+          throw error;
+        }
+        const siblingRows = await pool.query(`SELECT ml_order_id,pack_id FROM ml_orders
+          WHERE owner_username=$1 AND store_user_id=$2
+            AND COALESCE(NULLIF(pack_id,''),ml_order_id)=$3`,
+        [req.authUser.username,String(me.id || sellerId),initialScope.packId]);
+        directOrderIds = resolveRequestedOrderScope({
+          requestedOrderId,matchedRows:directRows.rows,siblingRows:siblingRows.rows
+        }).orderIds;
+        if (!directOrderIds.length) {
+          const error = new Error('指定订单所属包裹没有可同步的真实子订单');
+          error.status = 404;
+          throw error;
+        }
+      } else {
+        directOrderIds = [...new Set(directRows.rows.map(row => String(row.ml_order_id)).filter(Boolean))];
+        if (!directOrderIds.length) directOrderIds = [requestedOrderId];
+      }
     }
     const fullRangeSync = !requestedOrderId && Boolean(dateFrom || dateTo);
     const maxSearchOffset = 10000;
@@ -3654,6 +3679,7 @@ async function syncOrdersForUser(authUser, body = {}) {
           _official_handling_deadline_resolution: {
             source: deadlineResolution.source,
             handling_hours: deadlineResolution.handlingHours,
+            holiday_dates: deadlineResolution.holidayDates || [],
             deadline: handlingDeadline,
             is_estimated: deadlineIsEstimated
           }
@@ -5534,19 +5560,22 @@ async function getOrderInquiriesData(authUser,query = {}) {
       const timestamp = communicationMessageTimestamp(item);
       return !Number.isFinite(timestamp) || timestamp >= todayStart.getTime();
     });
-    const todayPackIds = new Set(todayItems.flatMap(messageOrderRefs));
-    const matchedUnreadOrders = todayPackIds.size ? unreadOrders.filter(order => todayPackIds.has(String(order.packId)) || todayPackIds.has(String(order.orderId))) : unreadOrders;
+    const matchedUnreadOrders = unreadOrders;
+
+    // 首页待回复数量来自未读提醒；即使官方 unread 接口暂时漏回或消息不是今天产生，
+    // 列表也必须保留同一未读提醒对应的订单，避免出现首页有数量、进入列表却为空。
+    const activeInquiryResult=await pool.query(`SELECT DISTINCT ON (o.ml_order_id)
+      o.ml_order_id AS "orderId",o.pack_id AS "packId",o.buyer_nickname AS buyer,
+      o.country,o.date_created AS "dateCreated",o.items,o.store_user_id AS "storeId"
+      FROM order_alerts a JOIN ml_orders o
+        ON o.owner_username=a.owner_username AND o.ml_order_id=a.order_id
+      WHERE a.owner_username=$1 AND o.store_user_id=$2 AND a.alert_type='buyer_inquiry'
+        AND a.is_read=FALSE
+      ORDER BY o.ml_order_id,a.created_at DESC LIMIT 100`,[req.authUser.username,sellerId]);
 
     // Cache complete active inquiry threads in the background, including seller replies made
-    // directly in Mercado Libre. Pending counters still come from the official unread response.
+    // directly in Mercado Libre. The same unread-alert fallback also feeds the mini-program list.
     if (req.query.background) {
-      const activeInquiryResult=await pool.query(`SELECT DISTINCT ON (o.ml_order_id)
-        o.ml_order_id AS "orderId",o.pack_id AS "packId",o.store_user_id AS "storeId"
-        FROM order_alerts a JOIN ml_orders o
-          ON o.owner_username=a.owner_username AND o.ml_order_id=a.order_id
-        WHERE a.owner_username=$1 AND o.store_user_id=$2 AND a.alert_type='buyer_inquiry'
-          AND a.is_read=FALSE AND a.created_at >= NOW() - INTERVAL '30 days'
-        ORDER BY o.ml_order_id,a.created_at DESC LIMIT 20`,[req.authUser.username,sellerId]);
       const threads=[...new Map([...matchedUnreadOrders,...activeInquiryResult.rows]
         .map(order=>[String(order.packId || order.orderId),order])).values()];
       for (let index=0;index<threads.length;index+=5) {
@@ -5602,11 +5631,8 @@ async function getOrderInquiriesData(authUser,query = {}) {
       questionError=String(error.response?.data?.message || error.message || error).slice(0,500);
       console.warn('[Orders] 售前问题读取失败:',req.authUser.username,sellerId,error.response?.data || error.message);
     }
-    const orderMessageMap = new Map();
-    for (const order of [...matchedUnreadOrders, ...conversationOrders]) {
-      orderMessageMap.set(String(order.packId || order.orderId),{ ...order,inquiryType:'order_message' });
-    }
-    const orderMessageOrders=[...orderMessageMap.values()];
+    const orderMessageOrders=mergeOrderMessageOrders(matchedUnreadOrders,activeInquiryResult.rows,conversationOrders);
+    const orderMessageMap=new Map(orderMessageOrders.map(order=>[String(order.packId || order.orderId),order]));
     const productQuestionOrderMap=new Map(productQuestions.orders.map(order=>[String(order.orderId),order]));
     const orderMap = new Map([...orderMessageMap,...productQuestionOrderMap]);
     const itemMap = new Map();

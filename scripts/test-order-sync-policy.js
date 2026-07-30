@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { orderSyncPageDecision } = require('../order-sync-policy');
+const { orderSyncPageDecision,resolveRequestedOrderScope } = require('../order-sync-policy');
 
 const decide = overrides => orderSyncPageDecision({
   fullRangeSync: true,
@@ -22,5 +22,27 @@ assert.deepEqual(decide({ nextOffset: 10000, officialTotal: 12000 }), {
   truncated: true,
   reason: 'offset_limit'
 });
+
+const localRows = [
+  { ml_order_id:'child-a',pack_id:'pack-1' },
+  { ml_order_id:'child-b',pack_id:'pack-1' },
+  { ml_order_id:'unrelated',pack_id:'pack-2' }
+];
+assert.deepEqual(resolveRequestedOrderScope({
+  requestedOrderId:'pack-1',
+  matchedRows:localRows.filter(row=>row.pack_id==='pack-1'),
+  siblingRows:localRows
+}),{ packId:'pack-1',orderIds:['child-a','child-b'] });
+assert.deepEqual(resolveRequestedOrderScope({
+  requestedOrderId:'child-a',
+  matchedRows:localRows.filter(row=>row.ml_order_id==='child-a'),
+  siblingRows:localRows
+}),{ packId:'pack-1',orderIds:['child-a','child-b'] });
+assert.equal(resolveRequestedOrderScope({
+  requestedOrderId:'child-a',matchedRows:[localRows[0]],siblingRows:localRows
+}).orderIds.includes('unrelated'),false);
+assert.deepEqual(resolveRequestedOrderScope({
+  requestedOrderId:'missing',matchedRows:[],siblingRows:localRows
+}),{ packId:'',orderIds:[] });
 
 console.log('order sync pagination regression tests passed');

@@ -14,6 +14,8 @@ const now = Date.parse('2026-07-25T10:00:00Z');
 assert.equal(isFulfillmentFinished({ orderStatus: 'paid', shipmentStatus: 'delivered' }), true);
 assert.equal(isFulfillmentFinished({ orderStatus: 'paid', shipmentStatus: 'shipped' }), true);
 assert.equal(isFulfillmentFinished({ orderStatus: 'cancelled', shipmentStatus: 'pending' }), true);
+assert.equal(isFulfillmentFinished({ orderStatus: 'refunded', shipmentStatus: 'pending' }), true);
+assert.equal(isFulfillmentFinished({ orderStatus: 'paid', shipmentStatus: 'pending',refundAmount:1 }), true);
 assert.equal(isFulfillmentFinished({ orderStatus: 'paid', shipmentStatus: 'ready_to_ship' }), false);
 
 assert.equal(shouldCreateNewOrderAlert({

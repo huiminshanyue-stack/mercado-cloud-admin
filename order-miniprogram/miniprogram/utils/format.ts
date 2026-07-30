@@ -88,9 +88,12 @@ export function deadlineText(order:any): string {
   const deadline=parseTimestamp(order.handlingDeadline);
   if (!Number.isFinite(deadline)) return '官方待发货截止：官方暂未返回';
   const remaining=deadline-Date.now();
-  if (remaining<=0) return '已超过官方待发货时间';
+  if (remaining<=0) return order.deadlineIsEstimated
+    ? `系统计算待发货截止：${formatDate(order.handlingDeadline)}（待官方确认）`
+    : '已超过官方待发货时间';
   const hours=Math.ceil(remaining/3600000);
-  return hours<=24 ? `官方剩余 ${hours} 小时，可能延误` : `官方待发货截止：${formatDate(order.handlingDeadline)}`;
+  const prefix=order.deadlineIsEstimated ? '系统计算' : '官方';
+  return hours<=24 ? `${prefix}剩余 ${hours} 小时，可能延误` : `${prefix}待发货截止：${formatDate(order.handlingDeadline)}`;
 }
 
 function compact(value:unknown): string {
