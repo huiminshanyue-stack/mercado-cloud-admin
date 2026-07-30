@@ -58,8 +58,9 @@ async function run() {
   assert.strictEqual(payload.orderItems[0].expressInfos[0].expressCode, 'zt');
   assert.strictEqual(payload.receiverInfo.zipcode, '123');
   assert.strictEqual(payload.receiverInfo.fullAddress, 'Street 1');
-  assert.strictEqual(payload.erpOrdersn, 'SY12345-2000014231142463');
+  assert.strictEqual(payload.erpOrdersn, 'SY12345');
   assert.strictEqual(payload.pdfString, 'JVBERi0xLjQ=');
+  assert.strictEqual(payload.trackingNo, 'YT123');
   assert.deepStrictEqual(payload.selectProList, ['1933035392616419330','1933035698318266370']);
   assert.ok(payload.erpOrdersn.length <= 32);
   assert.ok(Number.isFinite(payload.shipByDate));
@@ -75,7 +76,7 @@ async function run() {
   assert.strictEqual(packPayload.orderItems.length, 2);
   assert.strictEqual(packPayload.totalAmount, 30);
   assert.strictEqual(packPayload.country, 'MX');
-  assert.strictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), 'SY12345-2000014266367529');
+  assert.strictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), 'SY12345');
   assert.notStrictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), buildYeekeErpOrderNumber('SY54321', '2000014266367529'));
   console.log('Yeeke client tests passed');
 }

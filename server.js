@@ -433,6 +433,8 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS failure_reason TEXT');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_order ON fulfillment_submissions(owner_username,order_id)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_warehouse ON fulfillment_submissions(owner_username,warehouse_id)');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_message_reads (
     owner_username VARCHAR(120) NOT NULL, thread_type VARCHAR(30) NOT NULL,
     thread_id VARCHAR(120) NOT NULL, last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -3077,9 +3079,13 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.10',
+    version: '2026-07-30.11',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
+    yeekeErpOrderNumberFormat: 'SY00000',
+    yeekeTrackingNumberField: 'trackingNo',
+    fulfillmentSubmittedOrderGroup: true,
+    fulfillmentWarehouseFilter: true,
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
     dispatchDeadlineFallbackField: 'system_three_business_days',
@@ -3900,6 +3906,8 @@ async function getOrderListData(authUser,query = {}) {
   const req = { authUser,query };
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
   const params = [req.authUser.username], where = ['o.owner_username=$1','o.hidden_at IS NULL'];
+  where.push(`NOT EXISTS (SELECT 1 FROM fulfillment_submissions fs
+    WHERE fs.owner_username=o.owner_username AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))`);
   if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
   if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`o.push_status = $${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country = $${params.length}`); }
@@ -6902,11 +6910,25 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
 });
 
 app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.carrier,f.tracking_number AS "trackingNumber",f.status,
+  const params = [req.authUser.username], where = ['f.owner_username=$1'];
+  const warehouseId = Number(req.query?.warehouseId);
+  if (Number.isFinite(warehouseId) && warehouseId > 0) {
+    params.push(warehouseId);
+    where.push(`f.warehouse_id=$${params.length}`);
+  }
+  const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.carrier,f.tracking_number AS "trackingNumber",f.status,
     f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.created_at AS "createdAt",f.updated_at AS "updatedAt",
-    c.name AS "warehouseName" FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
-    WHERE f.owner_username=$1 ORDER BY f.updated_at DESC LIMIT 200`, [req.authUser.username]);
-  res.json({ code: 0, data: rows });
+    c.name AS "warehouseName",c.provider,c.provider_config
+    FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id AND c.owner_username=f.owner_username
+    WHERE ${where.join(' AND ')} ORDER BY f.updated_at DESC LIMIT 500`, params);
+  const data = rows.map(({ provider_config: providerConfig, ...row }) => {
+    let warehouseCode = '';
+    if (row.provider === 'yeeke' && providerConfig) {
+      try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不暴露损坏或不可解密的仓库配置 */ }
+    }
+    return { ...row, warehouseCode };
+  });
+  res.json({ code: 0, data });
 });
 
 app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, async (req, res) => {

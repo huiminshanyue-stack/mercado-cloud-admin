@@ -76,8 +76,7 @@ function buildYeekeErpOrderNumber(externalUserId, orderId) {
   const identity = String(externalUserId || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 15);
   const sourceOrderId = String(orderId || '').replace(/[^A-Za-z0-9_-]/g, '');
   if (!identity) return sourceOrderId.slice(0, 32);
-  const availableOrderLength = Math.max(1, 32 - identity.length - 1);
-  return `${identity}-${sourceOrderId.slice(-availableOrderLength)}`;
+  return identity;
 }
 
 function yeekeExpressCode(carrier) {
@@ -136,6 +135,7 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
     ordersn: orderId,
     erpOrdersn: buildYeekeErpOrderNumber(externalUserId, orderId),
     pdfString: pdfString || undefined,
+    trackingNo: trackingNumber ? String(trackingNumber) : undefined,
     selectProList: [...new Set((Array.isArray(serviceCodes) ? serviceCodes : []).map(String).filter(Boolean))],
     packageType: 1,
     wareHouse: String(warehouseCode),
