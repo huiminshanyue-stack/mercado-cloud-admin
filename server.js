@@ -425,8 +425,8 @@ async function initOrderManagementTables() {
   await pool.query(`UPDATE order_alerts a SET owner_username=o.owner_username FROM ml_orders o
     WHERE a.order_id=o.ml_order_id AND a.owner_username IS NULL`);
   // 发货截止时间优先采用 Mercado Libre shipment lead_time 官方返回值；
-  // 官方未返回精确时间时保留可审计的处理时长/既定周规则兜底值。
-  const deadlineRuleVersion = '2026-07-30-official-first-with-weekday-fallback-v4';
+  // 官方未返回精确时间时，从订单次日起计算三个中国工作日，订单当天、周末和节假日不计。
+  const deadlineRuleVersion = '2026-07-30-official-first-with-three-business-days-v5';
   const deadlineRuleSetting = await pool.query("SELECT value FROM settings WHERE key='order_deadline_rule_version'");
   if (deadlineRuleSetting.rows[0]?.value !== deadlineRuleVersion) {
     await pool.query(`INSERT INTO settings(key,value,updated_at) VALUES('order_deadline_rule_version',$1,NOW())

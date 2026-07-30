@@ -31,34 +31,30 @@ function chinaDateKey(timestamp) {
   return `${year}-${String(month + 1).padStart(2,'0')}-${String(date).padStart(2,'0')}`;
 }
 
-function chinaDayStart(timestamp) {
-  const { year,month,date } = chinaDateParts(timestamp);
-  return Date.UTC(year,month,date) - 8 * 3600000;
-}
-
 function resolveWeekdayHandlingHours(dateCreated) {
   const createdAt = validDate(dateCreated);
   if (!createdAt) return null;
-  const weekday = chinaDateParts(createdAt.getTime()).weekday;
-  if (weekday === 0 || weekday === 4) return 96;
-  if (weekday === 5 || weekday === 6) return 120;
-  return 72;
+  const fallback = addChinaBusinessDays(createdAt,3);
+  return (fallback.deadline.getTime() - createdAt.getTime()) / 3600000;
 }
 
-function addChinaHolidayExtension(createdAt, handlingHours) {
+function addChinaBusinessDays(createdAt, businessDays) {
   const createdMs = createdAt.getTime();
-  let deadlineMs = createdMs + handlingHours * 3600000;
-  let cursor = chinaDayStart(createdMs);
-  const counted = [];
-  while (cursor < deadlineMs) {
-    const key = chinaDateKey(cursor);
-    if (CHINA_HOLIDAY_DATES.has(key) && cursor + 86400000 > createdMs) {
-      deadlineMs += 86400000;
-      counted.push(key);
+  let deadlineMs = createdMs;
+  let countedBusinessDays = 0;
+  const holidayDates = [];
+  while (countedBusinessDays < businessDays) {
+    deadlineMs += 86400000;
+    const { weekday } = chinaDateParts(deadlineMs);
+    const key = chinaDateKey(deadlineMs);
+    if (CHINA_HOLIDAY_DATES.has(key)) {
+      holidayDates.push(key);
+      continue;
     }
-    cursor += 86400000;
+    if (weekday === 0 || weekday === 6) continue;
+    countedBusinessDays += 1;
   }
-  return { deadline:new Date(deadlineMs),holidayDates:counted };
+  return { deadline:new Date(deadlineMs),holidayDates };
 }
 
 function resolveOfficialHandlingDeadline({ dateCreated, leadTime } = {}) {
@@ -77,23 +73,13 @@ function resolveOfficialHandlingDeadline({ dateCreated, leadTime } = {}) {
     return { deadline: null, isEstimated: false, source: '', handlingHours: null };
   }
 
-  const officialHandlingHours = Number(leadTime?.estimated_delivery_time?.handling);
-  if (Number.isFinite(officialHandlingHours) && officialHandlingHours > 0) {
-    return {
-      deadline: new Date(createdAt.getTime() + officialHandlingHours * 3600000).toISOString(),
-      isEstimated: true,
-      source: 'estimated_delivery_time.handling',
-      handlingHours: officialHandlingHours
-    };
-  }
-
-  const fallbackHours = resolveWeekdayHandlingHours(dateCreated);
-  if (fallbackHours) {
-    const fallback = addChinaHolidayExtension(createdAt,fallbackHours);
+  const fallback = addChinaBusinessDays(createdAt,3);
+  if (fallback.deadline) {
+    const fallbackHours = (fallback.deadline.getTime() - createdAt.getTime()) / 3600000;
     return {
       deadline: fallback.deadline.toISOString(),
       isEstimated: true,
-      source: fallback.holidayDates.length ? 'fallback_weekday_rule_with_china_holidays' : 'fallback_weekday_rule',
+      source: fallback.holidayDates.length ? 'fallback_three_business_days_with_china_holidays' : 'fallback_three_business_days',
       handlingHours: fallbackHours,
       holidayDates: fallback.holidayDates
     };
