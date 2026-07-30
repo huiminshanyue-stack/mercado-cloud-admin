@@ -3100,7 +3100,8 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.13',
+    version: '2026-07-30.14',
+    compactOrderTiming: '12px',
     sharedAdminWarehouseCatalog: true,
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
