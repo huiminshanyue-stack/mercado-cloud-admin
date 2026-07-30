@@ -81,6 +81,9 @@ assert.ok(!serverSource.includes('replacementProviderOrderNumber'), 'legacy repl
 assert.ok(!serverSource.includes('wallet_transactions'), 'the test deployment must not create a local wallet ledger');
 assert.ok(!serverSource.includes("/recharge'"), 'the test deployment must not expose a recharge endpoint');
 assert.ok(serverSource.includes("billingIntegration: 'reserved-for-www.shanyue.site'") || serverSource.includes("fulfillmentBillingIntegration: 'reserved-for-www.shanyue.site'"), 'billing must remain an explicit shanyue.site integration reservation');
+assert.ok(serverSource.includes("domesticLogisticsMode: 'kuaidi100-prefilled-web-query'"), 'domestic logistics must use a prefilled public web query');
+assert.ok(serverSource.includes('domesticLogisticsApiQuotaRequired: false'), 'domestic logistics must not consume a metered server API quota');
+assert.ok(!serverSource.includes('KDNIAO_') && !serverSource.includes('/domestic-logistics'), 'the rejected quota-limited domestic logistics API must stay removed');
 assert.ok(!orderFrontendSource.includes('暂无已提交代贴单订单'), 'the standalone submitted-fulfillment empty state must be removed');
 assert.ok(!orderFrontendSource.includes('移入本分组'), 'the standalone submitted-fulfillment group notice must be removed');
 assert.ok(orderFrontendSource.includes('仓库：'), 'submitted warehouse data must render on the main order card');
@@ -94,6 +97,8 @@ assert.ok(orderFrontendSource.includes('尚未生成官方面单，请先同步�
 assert.ok(!orderFrontendSource.includes('修改仓库'), 'the unavailable warehouse-change button must be removed');
 assert.ok(orderFrontendSource.includes('重新提交代贴单'), 'successful submissions must expose the explicit second-push action');
 assert.ok(orderFrontendSource.includes('resubmitOrderIds'), 'the second-push action must identify resubmitted orders to the API');
+assert.ok(orderFrontendSource.includes('www.kuaidi100.com/chaxun'), 'domestic tracking must open a prefilled Kuaidi100 web query');
+assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.includes('shunfeng') && orderFrontendSource.includes('jtexpress'), 'common domestic carriers must be mapped for automatic query filling');
 assert.ok(orderFrontendSource.includes('二次推单会在新仓库创建新订单'), 'the UI must explain the second-push and previous-order cancellation flow');
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');
