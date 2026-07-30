@@ -3128,7 +3128,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.17',
+    version: '2026-07-31.18',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3144,6 +3144,9 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentResubmit: true,
     fulfillmentResubmitCancelsPrevious: true,
     orderCardFontSize: '12px',
+    batchLabelPrint: true,
+    batchLabelPrintScope: 'current-user-ready-to-ship-orders',
+    batchLabelPrintOutput: 'single-merged-pdf',
     fulfillmentWarehouseCorrection: 'second-push-and-cancel-previous',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',

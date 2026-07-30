@@ -17,6 +17,7 @@
     "test:order-communications": "node scripts/test-order-communications.js",
     "test:order-workbench-summary": "node scripts/test-order-workbench-summary.js",
     "test:order-warehouse": "node scripts/test-order-warehouse-policy.js",
+    "test:order-batch-label": "node scripts/test-order-batch-label-policy.js",
     "test:miniprogram": "node scripts/test-wechat-miniprogram.js",
     "test:webhook": "node scripts/test-mercadolibre-webhook.js",
     "test:wechat-official": "node scripts/test-wechat-official-account.js",
