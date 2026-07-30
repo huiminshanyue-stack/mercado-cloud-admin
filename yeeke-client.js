@@ -52,6 +52,10 @@ function createYeekeClient(config, request = axios) {
     async createOrderV2(order) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/order/create/v2', { ...order, accessToken, timestamp: Date.now() });
+    },
+    async changeAirwaybill(order) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/airwaybill/change', { ...order, accessToken, timestamp: Date.now() });
     }
   };
 }
@@ -87,7 +91,7 @@ function yeekeExpressCode(carrier) {
   return codes[name] || (/^[a-z0-9-]+$/i.test(name) ? name : 'other');
 }
 
-function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, externalUserId }) {
+function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, externalUserId, pdfString }) {
   const sourceRows = (Array.isArray(rows) && rows.length ? rows : [row]).filter(Boolean);
   row = sourceRows[0] || {};
   const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
@@ -131,6 +135,7 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   const payload = {
     ordersn: orderId,
     erpOrdersn: buildYeekeErpOrderNumber(externalUserId, orderId),
+    pdfString: pdfString || undefined,
     packageType: 1,
     wareHouse: String(warehouseCode),
     autoRelateStock: 0,

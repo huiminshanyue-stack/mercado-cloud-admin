@@ -17,6 +17,7 @@ async function run() {
       if (url.endsWith('/auth')) return { status: 200, data: { code: '0', message: '成功', data: { accessToken: 'token', userCode: 'u1' } } };
       if (url.endsWith('/ware/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ wareHouse: 'th', wareName: '东莞仓' }] } };
       if (url.endsWith('/order/create/v2')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'Y1' } } };
+      if (url.endsWith('/airwaybill/change')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       throw new Error(`unexpected URL ${url}`);
     }
   };
@@ -28,6 +29,8 @@ async function run() {
   assert.strictEqual(calls.length, 3);
   assert.strictEqual(calls[2].body.accessToken, 'token');
   assert.strictEqual(calls[2].body.ordersn, '200001');
+  await client.changeAirwaybill({ ordersn: '200001', pdfString: 'JVBERi0=' });
+  assert.strictEqual(calls[3].body.pdfString, 'JVBERi0=');
 
   const payload = buildYeekeOrderPayload({
     row: {
@@ -38,7 +41,7 @@ async function run() {
       items: [{ item: { title: 'Ventilation Clips', seller_custom_field: 'CBT-5024470568', thumbnail: 'http://http2.mlstatic.com/image.jpg', permalink: 'https://articulo.mercadolibre.com/item' }, quantity: 1 }],
       raw_data: { buyer: { nickname: 'buyer' }, shipping: { receiver_address: { receiver_name: 'A', address_line: 'Street 1', zip_code: '123' } } }
     },
-    warehouseCode: 'ywc', carrier: '中通快递', trackingNumber: 'YT123', externalUserId: 'SYABC1234567890'
+    warehouseCode: 'ywc', carrier: '中通快递', trackingNumber: 'YT123', externalUserId: 'SY12345', pdfString: 'JVBERi0xLjQ='
   });
   assert.strictEqual(payload.ordersn, '2000014231142463');
   assert.strictEqual(payload.wareHouse, 'ywc');
@@ -52,7 +55,8 @@ async function run() {
   assert.strictEqual(payload.orderItems[0].expressInfos[0].expressCode, 'zt');
   assert.strictEqual(payload.receiverInfo.zipcode, '123');
   assert.strictEqual(payload.receiverInfo.fullAddress, 'Street 1');
-  assert.strictEqual(payload.erpOrdersn, 'SYABC1234567890-2000014231142463');
+  assert.strictEqual(payload.erpOrdersn, 'SY12345-2000014231142463');
+  assert.strictEqual(payload.pdfString, 'JVBERi0xLjQ=');
   assert.ok(payload.erpOrdersn.length <= 32);
   assert.ok(Number.isFinite(payload.shipByDate));
 
@@ -67,8 +71,8 @@ async function run() {
   assert.strictEqual(packPayload.orderItems.length, 2);
   assert.strictEqual(packPayload.totalAmount, 30);
   assert.strictEqual(packPayload.country, 'MX');
-  assert.strictEqual(buildYeekeErpOrderNumber('SYUSER000000001', '2000014266367529'), 'SYUSER000000001-2000014266367529');
-  assert.notStrictEqual(buildYeekeErpOrderNumber('SYUSER000000001', '2000014266367529'), buildYeekeErpOrderNumber('SYUSER000000002', '2000014266367529'));
+  assert.strictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), 'SY12345-2000014266367529');
+  assert.notStrictEqual(buildYeekeErpOrderNumber('SY12345', '2000014266367529'), buildYeekeErpOrderNumber('SY54321', '2000014266367529'));
   console.log('Yeeke client tests passed');
 }
 

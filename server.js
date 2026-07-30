@@ -46,6 +46,37 @@ const PUBLIC_SETTING_KEYS = new Set([
 const DATABASE_URL = process.env.DATABASE_URL;
 let pool = null;
 
+function randomOrderExternalId() {
+  return `SY${String(crypto.randomInt(0,100000)).padStart(5,'0')}`;
+}
+
+async function migrateUserOrderExternalIds() {
+  const { rows } = await pool.query('SELECT id,order_external_id FROM users ORDER BY id');
+  const used = new Set(rows.map(row => String(row.order_external_id || '').toUpperCase()).filter(value => /^SY\d{5}$/.test(value)));
+  for (const row of rows) {
+    if (/^SY\d{5}$/.test(String(row.order_external_id || '').toUpperCase())) continue;
+    let identity = '';
+    for (let attempt = 0; attempt < 1000 && !identity; attempt += 1) {
+      const candidate = randomOrderExternalId();
+      if (!used.has(candidate)) identity = candidate;
+    }
+    if (!identity) throw new Error('可用的五位订单用户身份 ID 已耗尽');
+    await pool.query('UPDATE users SET order_external_id=$1 WHERE id=$2',[identity,row.id]);
+    used.add(identity);
+  }
+}
+
+async function createUserWithOrderIdentity({ username, passwordHash, nickname = '', role = 'user', validUntil = null, createdBy = null }) {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const identity = randomOrderExternalId();
+    const result = await pool.query(`INSERT INTO users(username,password,nickname,role,validUntil,created_by,order_external_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(order_external_id) DO NOTHING RETURNING id,order_external_id`,
+    [username,passwordHash,nickname,role,validUntil,createdBy,identity]);
+    if (result.rows[0]) return result.rows[0];
+  }
+  throw new Error('无法生成唯一的五位订单用户身份 ID');
+}
+
 async function connectDB() {
   if (!DATABASE_URL) {
     console.error('[DB] ❌ 未设置 DATABASE_URL 环境变量！');
@@ -84,7 +115,7 @@ async function initSchema() {
       role VARCHAR(20) DEFAULT 'user',
       validUntil TIMESTAMP DEFAULT NULL,
       created_by VARCHAR(100) DEFAULT NULL,
-      order_external_id VARCHAR(15) NOT NULL DEFAULT ('SY' || UPPER(SUBSTRING(MD5(RANDOM()::text || CLOCK_TIMESTAMP()::text) FROM 1 FOR 13))),
+      order_external_id VARCHAR(7) NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -93,8 +124,9 @@ async function initSchema() {
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by VARCHAR(100) DEFAULT NULL");
   } catch (e) { console.log('[DB] created_by 列已存在'); }
   await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS order_external_id VARCHAR(15)');
-  await pool.query(`UPDATE users SET order_external_id='SY' || UPPER(SUBSTRING(MD5(id::text || ':' || username || ':' || COALESCE(created_at::text,'')) FROM 1 FOR 13)) WHERE order_external_id IS NULL OR order_external_id=''`);
-  await pool.query("ALTER TABLE users ALTER COLUMN order_external_id SET DEFAULT ('SY' || UPPER(SUBSTRING(MD5(RANDOM()::text || CLOCK_TIMESTAMP()::text) FROM 1 FOR 13)))");
+  await pool.query('ALTER TABLE users ALTER COLUMN order_external_id DROP DEFAULT');
+  await migrateUserOrderExternalIds();
+  await pool.query('ALTER TABLE users ALTER COLUMN order_external_id TYPE VARCHAR(7)');
   await pool.query('ALTER TABLE users ALTER COLUMN order_external_id SET NOT NULL');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_order_external_id ON users(order_external_id)');
   await pool.query(`
@@ -198,10 +230,7 @@ async function seedAdmin() {
       throw new Error('ADMIN_INITIAL_PASSWORD must be configured before creating the first administrator');
     }
     const hash = bcrypt.hashSync(initialPassword, SALT_ROUNDS);
-    await pool.query(
-      'INSERT INTO users (username, password, nickname, role) VALUES ($1, $2, $3, $4)',
-      ['admin', hash, '管理员', 'admin']
-    );
+    await createUserWithOrderIdentity({ username: 'admin', passwordHash: hash, nickname: '管理员', role: 'admin' });
     console.log('[DB] ✅ 已创建初始管理员');
   }
 }
@@ -1003,11 +1032,8 @@ app.post('/api/users', requireAdmin, async (req, res) => {
     if (exist.rows.length > 0) return res.json(jsonFail('用户名已存在'));
 
     const hash = bcrypt.hashSync(password, SALT_ROUNDS);
-    const result = await pool.query(
-      'INSERT INTO users (username, password, nickname, role, validUntil) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-      [username, hash, nickname || '', role || 'user', validUntil ? new Date(validUntil) : null]
-    );
-    res.json(jsonOk({ id: result.rows[0].id }, '用户添加成功'));
+    const user = await createUserWithOrderIdentity({ username, passwordHash: hash, nickname: nickname || '', role: role || 'user', validUntil: validUntil ? new Date(validUntil) : null });
+    res.json(jsonOk({ id: user.id, orderExternalId: user.order_external_id }, '用户添加成功'));
   } catch (e) {
     console.error('[Users] 添加失败:', e.message);
     res.status(500).json(jsonFail('数据库错误'));
@@ -1252,11 +1278,8 @@ app.post('/api/admin/users', requireAdmin, async (req, res) => {
     const exist = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
     if (exist.rows.length > 0) return res.json(jsonFail('用户名已存在'));
     const hash = bcrypt.hashSync(password, SALT_ROUNDS);
-    const result = await pool.query(
-      'INSERT INTO users (username, password, nickname, role, validUntil) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-      [username, hash, nickname || '', role || 'user', validUntil ? new Date(validUntil) : null]
-    );
-    res.json(jsonOk({ id: result.rows[0].id }, '用户添加成功'));
+    const user = await createUserWithOrderIdentity({ username, passwordHash: hash, nickname: nickname || '', role: role || 'user', validUntil: validUntil ? new Date(validUntil) : null });
+    res.json(jsonOk({ id: user.id, orderExternalId: user.order_external_id }, '用户添加成功'));
   } catch (e) {
     console.error('[Admin] 添加用户失败:', e.message);
     res.status(500).json(jsonFail('数据库错误'));
@@ -1394,12 +1417,10 @@ app.post('/api/admin/agent/user', requireAuth, async (req, res) => {
       const exist = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
       if (exist.rows.length > 0) return res.json(jsonFail('用户名已存在'));
       const hash = bcrypt.hashSync(password, SALT_ROUNDS);
-      const result = await pool.query(
-        'INSERT INTO users (username, password, nickname, role, validUntil, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-        [username, hash, nickname || '', 'user', finalValidUntil, authUser.username]
-      );
+      const user = await createUserWithOrderIdentity({ username, passwordHash: hash, nickname: nickname || '', role: 'user', validUntil: finalValidUntil, createdBy: authUser.username });
       res.json(jsonOk({
-        id: result.rows[0].id,
+        id: user.id,
+        orderExternalId: user.order_external_id,
         validUntil: finalValidUntil.toISOString(),
         rule: limit.rule
       }, '开户成功'));
@@ -1413,11 +1434,8 @@ app.post('/api/admin/agent/user', requireAuth, async (req, res) => {
       const exist = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
       if (exist.rows.length > 0) return res.json(jsonFail('用户名已存在'));
       const hash = bcrypt.hashSync(password, SALT_ROUNDS);
-      const result = await pool.query(
-        'INSERT INTO users (username, password, nickname, role, validUntil, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-        [username, hash, nickname || '', 'user', validUntil ? new Date(validUntil) : null, authUser.username]
-      );
-      res.json(jsonOk({ id: result.rows[0].id }, '用户添加成功'));
+      const user = await createUserWithOrderIdentity({ username, passwordHash: hash, nickname: nickname || '', role: 'user', validUntil: validUntil ? new Date(validUntil) : null, createdBy: authUser.username });
+      res.json(jsonOk({ id: user.id, orderExternalId: user.order_external_id }, '用户添加成功'));
     } catch (e) {
       console.error('[Agent] 添加用户失败:', e.message);
       res.status(500).json(jsonFail('数据库错误'));
@@ -3053,7 +3071,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.08',
+    version: '2026-07-30.09',
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
     dispatchDeadlineExactField: 'estimated_schedule_limit.date',
     dispatchDeadlineFallbackField: 'system_three_business_days',
@@ -3172,6 +3190,8 @@ app.get('/api/health/order-management', (req, res) => {
     yeekeWarehouseCodes: ['th','ywc'],
     yeekeProductImageMapping: 'orderItems.url=mercado-official-thumbnail',
     yeekePerUserErpOrderNumber: true,
+    yeekeUserIdentityFormat: 'SY00000',
+    yeekeOfficialLabelPdfString: true,
     orderColorDisplay: true,
     deployedOrderFrontend: true,
     platformWeightOnlyFallback: true,
@@ -6731,20 +6751,63 @@ async function getOrderExternalUserId(username) {
   return String(rows[0]?.order_external_id || '');
 }
 
+async function resolveOfficialLabelPdfForPush(authUser, orderRows) {
+  const rows = (Array.isArray(orderRows) ? orderRows : [orderRows]).filter(Boolean);
+  const shipmentIds = [...new Set(rows.map(row => String(row.shipping_id || '')).filter(Boolean))];
+  if (!shipmentIds.length) throw new Error('该订单没有国际运单，无法向 Yeeke 推送打印面单');
+  const cached = await pool.query(`SELECT pdf_data FROM order_shipping_labels
+    WHERE owner_username=$1 AND shipment_id=ANY($2::varchar[]) ORDER BY fetched_at DESC LIMIT 1`,
+  [authUser.username,shipmentIds]);
+  if (cached.rows[0]?.pdf_data) return Buffer.from(cached.rows[0].pdf_data);
+
+  const authorizations = await listOrderStoreAuthorizations(authUser);
+  let lastError = null;
+  for (const shipmentId of shipmentIds) {
+    const order = rows.find(row => String(row.shipping_id || '') === shipmentId) || rows[0];
+    const orderedAuthorizations = [...authorizations].sort((left,right) => {
+      const expected = String(order.store_user_id || '');
+      return Number(String(right.ml_user_id) === expected) - Number(String(left.ml_user_id) === expected);
+    });
+    for (const authorization of orderedAuthorizations) {
+      try {
+        const token = await getStoreAuthorizationToken(authorization);
+        if (!token) continue;
+        const { pdf } = await fetchOfficialLabelPdf(token,shipmentId);
+        await saveOfficialShippingLabel(authUser.username,shipmentId,String(order.ml_order_id || ''),String(authorization.ml_user_id || ''),pdf);
+        return pdf;
+      } catch (error) { lastError = error; }
+    }
+  }
+  if (lastError) throw new Error(`美客多官方面单获取失败：${decodeOfficialLabelError(lastError).message}`);
+  throw new Error('当前用户没有可用的店铺授权，无法取得打印面单');
+}
+
 async function sendOrderToConnector(connector, row, options = {}, yeekeClient = null) {
   if (String(connector.provider || 'generic') === 'yeeke') {
     const config = getYeekeConnectorConfig(connector);
     const client = yeekeClient || createYeekeClient(config);
     if (!yeekeClient) await client.authorize(config.userName, config.password);
-    return client.createOrderV2(buildYeekeOrderPayload({
+    const payload = buildYeekeOrderPayload({
       row: Array.isArray(row) ? row[0] : row,
       rows: Array.isArray(row) ? row : undefined,
       displayOrderId: options.displayOrderId,
       externalUserId: options.externalUserId,
+      pdfString: options.pdfString,
       warehouseCode: config.warehouseCode,
       carrier: options.carrier,
       trackingNumber: options.trackingNumber
-    }));
+    });
+    try {
+      return await client.createOrderV2(payload);
+    } catch (createError) {
+      if (payload.pdfString) {
+        try {
+          await client.changeAirwaybill({ ordersn: payload.ordersn, pdfString: payload.pdfString });
+          return { ordersn: payload.ordersn, airwaybillUpdated: true };
+        } catch (_) { /* 不是已存在订单时保留原始创建错误 */ }
+      }
+      throw createError;
+    }
   }
   const headers = { 'Content-Type': 'application/json' };
   if (connector.auth_header && connector.auth_value) headers[connector.auth_header] = decryptErpCredential(connector.auth_value);
@@ -6782,7 +6845,9 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     if (!orderResult.rows.length) { results.push({ orderId: displayOrderId, success: false, message: '订单不存在' }); continue; }
     const payload = { source: 'shanyue-erp', action: 'fulfillment_label', order_id: displayOrderId, carrier, tracking_number: trackingNumber, value_added_services: serviceResult.rows, orders: orderResult.rows.map(row => row.raw_data) };
     try {
-      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, externalUserId, carrier, trackingNumber, payload }, yeekeClient);
+      const pdfString = String(warehouse.provider || 'generic') === 'yeeke'
+        ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
+      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, externalUserId, carrier, trackingNumber, pdfString, payload }, yeekeClient);
       await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000)]);
       results.push({ orderId: displayOrderId, success: true });
     } catch (error) {
@@ -6792,7 +6857,8 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     }
   }
   const success = results.filter(item => item.success).length;
-  res.status(success ? 200 : 502).json({ code: success ? 0 : 502, data: { success, failed: results.length - success, results }, message: success ? '代贴单已提交' : '代贴单提交失败' });
+  const firstFailure = results.find(item => !item.success)?.message || '';
+  res.status(success ? 200 : 502).json({ code: success ? 0 : 502, data: { success, failed: results.length - success, results }, message: success ? '代贴单已提交' : (firstFailure || '代贴单提交失败') });
 });
 
 app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, res) => {
@@ -6815,7 +6881,8 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [submission.order_id,req.authUser.username]);
       if (!orderResult.rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
       const externalUserId = await getOrderExternalUserId(req.authUser.username);
-      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number });
+      const pdfString = (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64');
+      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString });
     } else {
       const headers = { 'Content-Type': 'application/json' };
       if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
@@ -6894,7 +6961,9 @@ app.post('/api/admin/orders/:orderId/push', requireOrderAccess, async (req, res)
   const c = connector.rows[0];
   try {
     const externalUserId = await getOrderExternalUserId(req.authUser.username);
-    const pushed = await sendOrderToConnector(c, order.rows[0], { externalUserId });
+    const pdfString = String(c.provider || 'generic') === 'yeeke'
+      ? (await resolveOfficialLabelPdfForPush(req.authUser,order.rows[0])).toString('base64') : '';
+    const pushed = await sendOrderToConnector(c, order.rows[0], { externalUserId, pdfString });
     await pool.query("UPDATE ml_orders SET push_status='success',last_pushed_at=NOW() WHERE ml_order_id=$1 AND owner_username=$2", [req.params.orderId,req.authUser.username]);
     await pool.query('INSERT INTO erp_push_logs(owner_username,order_id,connector_id,success,http_status,response_text) VALUES($1,$2,$3,TRUE,$4,$5)', [req.authUser.username,req.params.orderId,c.id,200,JSON.stringify(pushed).slice(0,5000)]);
     res.json({ code: 0, data: { status: 200, result: pushed } });
