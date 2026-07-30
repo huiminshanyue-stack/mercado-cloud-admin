@@ -427,6 +427,7 @@ async function initOrderManagementTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_submissions (
     id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120), order_id VARCHAR(80) NOT NULL, warehouse_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
     carrier VARCHAR(200) NOT NULL, tracking_number VARCHAR(300) NOT NULL, service_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    provider_order_number VARCHAR(120),
     status VARCHAR(30) NOT NULL DEFAULT 'pending', request_data JSONB NOT NULL DEFAULT '{}'::jsonb, response_text TEXT,
     failure_reason TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(order_id)
@@ -434,6 +435,9 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS failure_reason TEXT');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS provider_order_number VARCHAR(120)');
+  await pool.query(`UPDATE fulfillment_submissions SET provider_order_number=order_id
+    WHERE provider_order_number IS NULL OR provider_order_number=''`);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_order ON fulfillment_submissions(owner_username,order_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_warehouse ON fulfillment_submissions(owner_username,warehouse_id)');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_message_reads (
@@ -3096,10 +3100,13 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.12',
+    version: '2026-07-30.13',
     sharedAdminWarehouseCatalog: true,
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
+    submittedFulfillmentFullOrderCards: true,
+    submittedFulfillmentHiddenActions: ['apply_label','delete_order','submit_fulfillment'],
+    fulfillmentWarehouseChange: 'yeeke-repush-and-cancel-old',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
     yeekeErpOrderNumberFormat: 'SY00000',
@@ -3926,8 +3933,20 @@ async function getOrderListData(authUser,query = {}) {
   const req = { authUser,query };
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
   const params = [req.authUser.username], where = ['o.owner_username=$1','o.hidden_at IS NULL'];
-  where.push(`NOT EXISTS (SELECT 1 FROM fulfillment_submissions fs
-    WHERE fs.owner_username=o.owner_username AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))`);
+  const submittedFulfillmentView = String(req.query.fulfillmentView || '') === 'submitted';
+  if (submittedFulfillmentView) {
+    let submissionScope = `EXISTS (SELECT 1 FROM fulfillment_submissions fs
+      WHERE fs.owner_username=o.owner_username AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)`;
+    const warehouseId = Number(req.query.warehouseId);
+    if (Number.isFinite(warehouseId) && warehouseId > 0) {
+      params.push(warehouseId);
+      submissionScope += ` AND fs.warehouse_id=$${params.length}`;
+    }
+    where.push(`${submissionScope})`);
+  } else {
+    where.push(`NOT EXISTS (SELECT 1 FROM fulfillment_submissions fs
+      WHERE fs.owner_username=o.owner_username AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))`);
+  }
   if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
   if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`o.push_status = $${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country = $${params.length}`); }
@@ -3973,6 +3992,27 @@ async function getOrderListData(authUser,query = {}) {
     order.profitCny = order.netAmountUsd === null || order.netAmountUsd === undefined
       ? null
       : Number((Number(order.netAmountUsd) * Number(exchangeRate) - Number(order.productCost || 0)).toFixed(2));
+  }
+  if (submittedFulfillmentView && packedRows.length) {
+    const displayIds = packedRows.map(order => String(order.displayOrderId || order.packId || order.orderId));
+    const submissionRows = await pool.query(`SELECT f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.status,
+      f.failure_reason,f.retry_count,f.provider_order_number,f.created_at,f.updated_at,
+      c.name AS warehouse_name,c.provider,c.provider_config
+      FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
+      WHERE f.owner_username=$2 AND f.order_id=ANY($1::varchar[])`,[displayIds,req.authUser.username]);
+    const submissionMap = new Map(submissionRows.rows.map(row => {
+      let warehouseCode = '';
+      if (row.provider === 'yeeke' && row.provider_config) {
+        try { warehouseCode = String(JSON.parse(decryptErpCredential(row.provider_config)).warehouseCode || ''); } catch (_) { /* 仅返回安全仓库代码 */ }
+      }
+      return [String(row.order_id),{
+        id:row.id,warehouseId:row.warehouse_id,warehouseName:row.warehouse_name || '',warehouseCode,
+        provider:row.provider || '',carrier:row.carrier,trackingNumber:row.tracking_number,status:row.status,
+        failureReason:row.failure_reason || '',retryCount:row.retry_count || 0,providerOrderNumber:row.provider_order_number || row.order_id,
+        createdAt:row.created_at,updatedAt:row.updated_at
+      }];
+    }));
+    for (const order of packedRows) order.fulfillmentSubmission = submissionMap.get(String(order.displayOrderId || order.packId || order.orderId)) || null;
   }
   return { items: packedRows, total: count.rows[0].total, page, size, exchangeRate:Number(exchangeRate) };
 }
@@ -6859,6 +6899,7 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
       row: Array.isArray(row) ? row[0] : row,
       rows: Array.isArray(row) ? row : undefined,
       displayOrderId: options.displayOrderId,
+      providerOrderNumber: options.providerOrderNumber,
       externalUserId: options.externalUserId,
       pdfString: options.pdfString,
       serviceCodes: options.serviceCodes,
@@ -6925,11 +6966,11 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
       const pdfString = String(warehouse.provider || 'generic') === 'yeeke'
         ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
       const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, externalUserId, carrier, trackingNumber, pdfString, serviceCodes, payload }, yeekeClient);
-      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000)]);
+      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,provider_order_number,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,$2,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,provider_order_number=EXCLUDED.provider_order_number,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000)]);
       results.push({ orderId: displayOrderId, success: true });
     } catch (error) {
       const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
-      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason,retry_count) VALUES($1,$2,$3,$4,$5,$6::jsonb,'failed',$7::jsonb,$8,$9,1) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,status='failed',response_text=EXCLUDED.response_text,failure_reason=EXCLUDED.failure_reason,retry_count=fulfillment_submissions.retry_count+1,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason]);
+      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,provider_order_number,status,request_data,response_text,failure_reason,retry_count) VALUES($1,$2,$3,$4,$5,$6::jsonb,$2,'failed',$7::jsonb,$8,$9,1) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,status='failed',response_text=EXCLUDED.response_text,failure_reason=EXCLUDED.failure_reason,retry_count=fulfillment_submissions.retry_count+1,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason]);
       results.push({ orderId: displayOrderId, success: false, message: error.response?.data?.message || error.message });
     }
   }
@@ -6945,7 +6986,7 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
     params.push(warehouseId);
     where.push(`f.warehouse_id=$${params.length}`);
   }
-  const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.carrier,f.tracking_number AS "trackingNumber",f.status,
+  const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.provider_order_number AS "providerOrderNumber",f.carrier,f.tracking_number AS "trackingNumber",f.status,
     f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.created_at AS "createdAt",f.updated_at AS "updatedAt",
     c.name AS "warehouseName",c.provider,c.provider_config
     FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
@@ -6979,7 +7020,7 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
         JOIN users u ON u.username=fs.owner_username AND u.role='admin'
         WHERE fs.connector_id=$2 AND fs.source='yeeke' AND fs.enabled=TRUE AND fs.id=ANY($1::bigint[])`,[retryServiceIds,submission.warehouse_id]) : { rows:[] };
       const serviceCodes = retryServices.rows.map(service => String(service.code || '')).filter(Boolean);
-      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString, serviceCodes });
+      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, providerOrderNumber: submission.provider_order_number || submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString, serviceCodes });
     } else {
       const headers = { 'Content-Type': 'application/json' };
       if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
@@ -6992,6 +7033,72 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
     const reason = String(error.response?.data?.message || error.message || '重试失败').slice(0,2000);
     await pool.query(`UPDATE fulfillment_submissions SET status='failed',response_text=$1,failure_reason=$2,retry_count=retry_count+1,updated_at=NOW() WHERE id=$3 AND owner_username=$4`, [JSON.stringify(error.response?.data || error.message).slice(0,5000),reason,submission.id,req.authUser.username]);
     res.status(502).json({ code: 502, message: reason });
+  }
+});
+
+function replacementProviderOrderNumber(orderId) {
+  const base = String(orderId || '').replace(/[^A-Za-z0-9_-]/g,'').slice(0,32) || 'ORDER';
+  const suffix = `R${Date.now().toString(36).toUpperCase().slice(-7)}`;
+  return `${base}-${suffix}`.slice(0,48);
+}
+
+app.post('/api/admin/fulfillment/submissions/:id/change-warehouse', requireOrderAccess, async (req, res) => {
+  const newWarehouseId = Number(req.body?.warehouseId);
+  if (!Number.isFinite(newWarehouseId) || newWarehouseId <= 0) return res.status(400).json({ code:400,message:'请选择新的仓库' });
+  const currentResult = await pool.query(`SELECT f.*,c.provider AS old_provider,c.provider_config AS old_provider_config
+    FROM fulfillment_submissions f
+    JOIN erp_connectors c ON c.id=f.warehouse_id
+    JOIN users u ON u.username=c.owner_username AND u.role='admin'
+    WHERE f.id=$1 AND f.owner_username=$2`,[req.params.id,req.authUser.username]);
+  const submission = currentResult.rows[0];
+  if (!submission) return res.status(404).json({ code:404,message:'代贴单提交记录不存在' });
+  if (Number(submission.warehouse_id) === newWarehouseId) return res.status(400).json({ code:400,message:'新仓库与当前仓库相同' });
+  const targetResult = await pool.query(`SELECT c.* FROM erp_connectors c
+    JOIN users u ON u.username=c.owner_username AND u.role='admin'
+    WHERE c.id=$1 AND c.enabled=TRUE`,[newWarehouseId]);
+  const target = targetResult.rows[0];
+  if (!target) return res.status(404).json({ code:404,message:'新仓库不存在或已停用' });
+  if (String(submission.old_provider) !== 'yeeke' || String(target.provider) !== 'yeeke') {
+    return res.status(400).json({ code:400,message:'修改仓库目前只支持 Yeeke 仓库之间转移' });
+  }
+  const orderResult = await pool.query(`SELECT * FROM ml_orders
+    WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created`,[submission.order_id,req.authUser.username]);
+  if (!orderResult.rows.length) return res.status(404).json({ code:404,message:'原订单不存在' });
+  const previousNumber = String(submission.provider_order_number || submission.order_id);
+  const replacementNumber = replacementProviderOrderNumber(submission.order_id);
+  let replacementCreated = false;
+  try {
+    const oldConfig = getYeekeConnectorConfig({ provider_config:submission.old_provider_config });
+    const targetConfig = getYeekeConnectorConfig(target);
+    const [oldClient,targetClient] = [createYeekeClient(oldConfig),createYeekeClient(targetConfig)];
+    await Promise.all([
+      oldClient.authorize(oldConfig.userName,oldConfig.password),
+      targetClient.authorize(targetConfig.userName,targetConfig.password)
+    ]);
+    const [externalUserId,pdfBuffer] = await Promise.all([
+      getOrderExternalUserId(req.authUser.username),
+      resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)
+    ]);
+    const pushed = await sendOrderToConnector(target,orderResult.rows,{
+      displayOrderId:submission.order_id,providerOrderNumber:replacementNumber,externalUserId,
+      carrier:submission.carrier,trackingNumber:submission.tracking_number,pdfString:pdfBuffer.toString('base64'),serviceCodes:[]
+    },targetClient);
+    replacementCreated = true;
+    try {
+      await oldClient.updateOrderStatus({ ordersn:previousNumber,status:'7' });
+    } catch (cancelError) {
+      let rollbackMessage = '新仓库订单已自动取消';
+      try { await targetClient.updateOrderStatus({ ordersn:replacementNumber,status:'7' }); }
+      catch (_) { rollbackMessage = '新仓库订单回滚失败，请立即联系仓库人工处理'; }
+      throw new Error(`旧仓库订单无法取消，未修改本地仓库；${rollbackMessage}：${cancelError.response?.data?.message || cancelError.message}`);
+    }
+    await pool.query(`UPDATE fulfillment_submissions SET warehouse_id=$1,provider_order_number=$2,service_ids='[]'::jsonb,
+      status='success',response_text=$3,failure_reason=NULL,updated_at=NOW() WHERE id=$4 AND owner_username=$5`,
+    [newWarehouseId,replacementNumber,JSON.stringify({ moved:true,previousNumber,replacementNumber,pushed }).slice(0,5000),submission.id,req.authUser.username]);
+    res.json({ code:0,data:{ orderId:submission.order_id,warehouseId:newWarehouseId,providerOrderNumber:replacementNumber },message:'仓库修改成功，旧仓订单已取消并重新推送到新仓库' });
+  } catch (error) {
+    const prefix = replacementCreated ? '仓库转移未完成' : '新仓库推单失败';
+    res.status(502).json({ code:502,message:`${prefix}：${error.response?.data?.message || error.message}` });
   }
 });
 

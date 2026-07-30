@@ -56,6 +56,10 @@ function createYeekeClient(config, request = axios) {
     async changeAirwaybill(order) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/airwaybill/change', { ...order, accessToken, timestamp: Date.now() });
+    },
+    async updateOrderStatus(order) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/order/status', { ...order, accessToken, timestamp: Date.now() });
     }
   };
 }
@@ -90,7 +94,7 @@ function yeekeExpressCode(carrier) {
   return codes[name] || (/^[a-z0-9-]+$/i.test(name) ? name : 'other');
 }
 
-function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, externalUserId, pdfString, serviceCodes }) {
+function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, providerOrderNumber, externalUserId, pdfString, serviceCodes }) {
   const sourceRows = (Array.isArray(rows) && rows.length ? rows : [row]).filter(Boolean);
   row = sourceRows[0] || {};
   const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
@@ -129,11 +133,12 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
     district: receiver.neighborhood?.name || receiver.neighborhood || receiver.district || '',
     country: receiver.country?.id || receiver.country || row.country || ''
   } : undefined;
-  const orderId = String(displayOrderId || row.pack_id || row.ml_order_id || raw.pack_id || raw.id || raw.order_id || '');
+  const sourceOrderId = String(displayOrderId || row.pack_id || row.ml_order_id || raw.pack_id || raw.id || raw.order_id || '');
+  const orderId = String(providerOrderNumber || sourceOrderId);
   const totalAmount = sourceRows.reduce((total, sourceRow) => total + Number(sourceRow.total_amount || sourceRow.raw_data?.total_amount || 0), 0);
   const payload = {
     ordersn: orderId,
-    erpOrdersn: buildYeekeErpOrderNumber(externalUserId, orderId),
+    erpOrdersn: buildYeekeErpOrderNumber(externalUserId, sourceOrderId),
     pdfString: pdfString || undefined,
     trackingNo: trackingNumber ? String(trackingNumber) : undefined,
     selectProList: [...new Set((Array.isArray(serviceCodes) ? serviceCodes : []).map(String).filter(Boolean))],

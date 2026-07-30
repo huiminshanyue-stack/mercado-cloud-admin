@@ -19,6 +19,7 @@ async function run() {
       if (url.endsWith('/otherService/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ id: 'service-1', name: '打包', price: 1 }] } };
       if (url.endsWith('/order/create/v2')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'Y1' } } };
       if (url.endsWith('/airwaybill/change')) return { status: 200, data: { code: '0', message: '成功', data: null } };
+      if (url.endsWith('/order/status')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       throw new Error(`unexpected URL ${url}`);
     }
   };
@@ -34,6 +35,8 @@ async function run() {
   assert.strictEqual(calls[3].body.pdfString, 'JVBERi0=');
   const remoteServices = await client.listServices();
   assert.strictEqual(remoteServices[0].id, 'service-1');
+  await client.updateOrderStatus({ ordersn: '200001', status: '7' });
+  assert.strictEqual(calls[5].body.status, '7');
 
   const payload = buildYeekeOrderPayload({
     row: {
@@ -64,6 +67,13 @@ async function run() {
   assert.deepStrictEqual(payload.selectProList, ['1933035392616419330','1933035698318266370']);
   assert.ok(payload.erpOrdersn.length <= 32);
   assert.ok(Number.isFinite(payload.shipByDate));
+
+  const replacementPayload = buildYeekeOrderPayload({
+    row: { ml_order_id: '200001', items: [{ item: { title: 'Item' }, quantity: 1 }] },
+    displayOrderId: '200001', providerOrderNumber: '200001-R123456', warehouseCode: 'th', externalUserId: 'SY12345'
+  });
+  assert.strictEqual(replacementPayload.ordersn, '200001-R123456');
+  assert.strictEqual(replacementPayload.erpOrdersn, 'SY12345');
 
   const packPayload = buildYeekeOrderPayload({
     rows: [

@@ -26,5 +26,7 @@ for (const route of [
 assert.ok(serverSource.includes("JOIN users u ON u.username=c.owner_username AND u.role='admin'"), 'warehouse reads must use the shared admin catalog');
 assert.ok(serverSource.includes("WHERE c.id=$1 AND c.enabled=TRUE"), 'order submission must accept an enabled shared admin warehouse');
 assert.ok(serverSource.includes('UPDATE erp_connectors c SET owner_username='), 'legacy user-owned warehouses must be adopted by an administrator');
+assert.ok(serverSource.includes("String(req.query.fulfillmentView || '') === 'submitted'"), 'submitted orders must support full order-list retrieval');
+assert.ok(serverSource.includes("app.post('/api/admin/fulfillment/submissions/:id/change-warehouse', requireOrderAccess"), 'order owners must be able to change a submitted Yeeke warehouse');
 
 console.log('order warehouse permission policy tests passed');
