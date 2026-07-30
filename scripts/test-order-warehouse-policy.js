@@ -14,6 +14,13 @@ assert.strictEqual(canManageWarehouses({ role: 'agent' }), false);
 assert.strictEqual(canManageWarehouses({ role: 'user' }), false);
 
 const serverSource = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+const publicIndex = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+const rootAssetName = publicIndex.match(/assets\/(index-[A-Za-z0-9_-]+\.js)/)?.[1];
+assert.ok(rootAssetName, 'the production index must reference its root JavaScript asset');
+const rootAssetSource = fs.readFileSync(path.join(__dirname, '..', 'public', 'assets', rootAssetName), 'utf8');
+const orderAssetName = rootAssetSource.match(/(OrderManagement-[A-Za-z0-9_-]+\.js)/)?.[1];
+assert.ok(orderAssetName, 'the production bundle must reference the order-management chunk');
+const orderFrontendSource = fs.readFileSync(path.join(__dirname, '..', 'public', 'assets', orderAssetName), 'utf8');
 for (const route of [
   "app.post('/api/admin/erp-connectors', requireAdmin",
   "app.post('/api/admin/erp-connectors/:id/sync-services', requireAdmin",
@@ -26,7 +33,12 @@ for (const route of [
 assert.ok(serverSource.includes("JOIN users u ON u.username=c.owner_username AND u.role='admin'"), 'warehouse reads must use the shared admin catalog');
 assert.ok(serverSource.includes("WHERE c.id=$1 AND c.enabled=TRUE"), 'order submission must accept an enabled shared admin warehouse');
 assert.ok(serverSource.includes('UPDATE erp_connectors c SET owner_username='), 'legacy user-owned warehouses must be adopted by an administrator');
-assert.ok(serverSource.includes("String(req.query.fulfillmentView || '') === 'submitted'"), 'submitted orders must support full order-list retrieval');
+assert.ok(!serverSource.includes("String(req.query.fulfillmentView || '') === 'submitted'"), 'submitted orders must not be split into a second workbench query');
+assert.ok(serverSource.includes('if (packedRows.length) {'), 'the main order workbench must hydrate fulfillment data');
+assert.ok(serverSource.includes("f.status<>'returned' AND f.order_id=ANY"), 'active fulfillment data must be attached directly to main order cards');
+assert.ok(serverSource.includes('fulfillmentMergedIntoWorkbench: true'), 'health metadata must expose the unified workbench');
+assert.ok(!serverSource.includes('submittedFulfillmentTab'), 'the separate submitted tab metadata must be removed');
+assert.ok(!serverSource.includes('submittedFulfillmentFullOrderCards'), 'legacy submitted-group metadata must be removed');
 const warehouseChangeRouteStart = serverSource.indexOf("app.post('/api/admin/fulfillment/submissions/:id/change-warehouse', requireOrderAccess");
 const warehouseChangeRouteEnd = serverSource.indexOf("app.get('/api/admin/erp-connectors'", warehouseChangeRouteStart);
 const warehouseChangeRoute = serverSource.slice(warehouseChangeRouteStart, warehouseChangeRouteEnd);
@@ -35,8 +47,7 @@ assert.ok(!warehouseChangeRoute.includes('sendOrderToConnector'), 'an unsupporte
 assert.ok(!warehouseChangeRoute.includes('updateOrderStatus'), 'an unsupported warehouse change must not cancel the original order');
 assert.ok(!warehouseChangeRoute.includes('UPDATE fulfillment_submissions'), 'an unsupported warehouse change must not falsify the local warehouse');
 assert.ok(serverSource.includes("app.post('/api/admin/fulfillment/submissions/sync-status', requireOrderAccess"), 'order owners must be able to synchronize warehouse returns');
-assert.ok(serverSource.includes("fs.status<>'returned'"), 'returned fulfillment orders must leave the submitted group');
-assert.ok(serverSource.includes("status='returned',remote_returned=TRUE"), 'Yeeke returns must restore orders to the workbench');
+assert.ok(serverSource.includes("status='returned',remote_returned=TRUE"), 'returned fulfillment orders must clear their active workbench attachment');
 assert.ok(serverSource.includes("app.put('/api/admin/erp-connectors/:id/price', requireAdmin"), 'warehouse unit prices must stay admin-only');
 assert.ok(serverSource.includes('billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`'), 'production billing integration must have an idempotent per-user order key');
 assert.ok(serverSource.includes("billing_status='charged'"), 'reserved billing events must preserve an externally completed charge');
@@ -45,5 +56,11 @@ assert.ok(serverSource.includes('Yeeke 当前公开 API 未提供原订单修改
 assert.ok(!serverSource.includes('wallet_transactions'), 'the test deployment must not create a local wallet ledger');
 assert.ok(!serverSource.includes("/recharge'"), 'the test deployment must not expose a recharge endpoint');
 assert.ok(serverSource.includes("billingIntegration: 'reserved-for-www.shanyue.site'") || serverSource.includes("fulfillmentBillingIntegration: 'reserved-for-www.shanyue.site'"), 'billing must remain an explicit shanyue.site integration reservation');
+assert.ok(!orderFrontendSource.includes('暂无已提交代贴单订单'), 'the standalone submitted-fulfillment empty state must be removed');
+assert.ok(!orderFrontendSource.includes('移入本分组'), 'the standalone submitted-fulfillment group notice must be removed');
+assert.ok(orderFrontendSource.includes('仓库：'), 'submitted warehouse data must render on the main order card');
+assert.ok(orderFrontendSource.includes('国内快递单号：'), 'domestic tracking data must render on the main order card');
+assert.ok(orderFrontendSource.includes('提交代贴单时间：'), 'fulfillment submission time must render on the main order card');
+assert.ok(orderFrontendSource.includes('代贴单提交失败') && orderFrontendSource.includes('已提交代贴单'), 'the submit action must switch to its attached submission state');
 
 console.log('order warehouse permission policy tests passed');

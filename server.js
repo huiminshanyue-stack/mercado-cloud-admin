@@ -3124,7 +3124,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-30.15',
+    version: '2026-07-30.16',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3136,8 +3136,7 @@ app.get('/api/health/order-management', (req, res) => {
     sharedAdminWarehouseCatalog: true,
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
-    submittedFulfillmentFullOrderCards: true,
-    submittedFulfillmentHiddenActions: ['apply_label','delete_order','submit_fulfillment'],
+    fulfillmentMergedIntoWorkbench: true,
     fulfillmentWarehouseChange: 'blocked-until-yeeke-original-order-api',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
@@ -3965,22 +3964,6 @@ async function getOrderListData(authUser,query = {}) {
   const req = { authUser,query };
   const page = Math.max(1, Number(req.query.page) || 1), size = Math.min(100, Math.max(1, Number(req.query.size) || 20));
   const params = [req.authUser.username], where = ['o.owner_username=$1','o.hidden_at IS NULL'];
-  const submittedFulfillmentView = String(req.query.fulfillmentView || '') === 'submitted';
-  if (submittedFulfillmentView) {
-    let submissionScope = `EXISTS (SELECT 1 FROM fulfillment_submissions fs
-      WHERE fs.owner_username=o.owner_username AND fs.status<>'returned'
-        AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id)`;
-    const warehouseId = Number(req.query.warehouseId);
-    if (Number.isFinite(warehouseId) && warehouseId > 0) {
-      params.push(warehouseId);
-      submissionScope += ` AND fs.warehouse_id=$${params.length}`;
-    }
-    where.push(`${submissionScope})`);
-  } else {
-    where.push(`NOT EXISTS (SELECT 1 FROM fulfillment_submissions fs
-      WHERE fs.owner_username=o.owner_username AND fs.status<>'returned'
-        AND fs.order_id=COALESCE(NULLIF(o.pack_id,''),o.ml_order_id))`);
-  }
   if (req.query.status) { params.push(String(req.query.status)); where.push(`o.status = $${params.length}`); }
   if (req.query.pushStatus) { params.push(String(req.query.pushStatus)); where.push(`o.push_status = $${params.length}`); }
   if (req.query.country) { params.push(String(req.query.country)); where.push(`o.country = $${params.length}`); }
@@ -4027,21 +4010,21 @@ async function getOrderListData(authUser,query = {}) {
       ? null
       : Number((Number(order.netAmountUsd) * Number(exchangeRate) - Number(order.productCost || 0)).toFixed(2));
   }
-  if (submittedFulfillmentView && packedRows.length) {
+  if (packedRows.length) {
     const displayIds = packedRows.map(order => String(order.displayOrderId || order.packId || order.orderId));
     const submissionRows = await pool.query(`SELECT f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.status,
       f.failure_reason,f.retry_count,f.provider_order_number,f.warehouse_fee,f.service_fee,f.charge_amount,f.billing_status,f.billing_key,
       f.remote_status,f.remote_message,f.remote_checked_at,f.created_at,f.updated_at,
       c.name AS warehouse_name,c.provider,c.provider_config
       FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
-      WHERE f.owner_username=$2 AND f.order_id=ANY($1::varchar[])`,[displayIds,req.authUser.username]);
+      WHERE f.owner_username=$2 AND f.status<>'returned' AND f.order_id=ANY($1::varchar[])`,[displayIds,req.authUser.username]);
     const submissionMap = new Map(submissionRows.rows.map(row => {
       let warehouseCode = '';
       if (row.provider === 'yeeke' && row.provider_config) {
         try { warehouseCode = String(JSON.parse(decryptErpCredential(row.provider_config)).warehouseCode || ''); } catch (_) { /* 仅返回安全仓库代码 */ }
       }
       return [String(row.order_id),{
-        id:row.id,warehouseId:row.warehouse_id,warehouseName:row.warehouse_name || '',warehouseCode,
+        id:row.id,orderId:row.order_id,warehouseId:row.warehouse_id,warehouseName:row.warehouse_name || '',warehouseCode,
         provider:row.provider || '',carrier:row.carrier,trackingNumber:row.tracking_number,status:row.status,
         failureReason:row.failure_reason || '',retryCount:row.retry_count || 0,providerOrderNumber:row.provider_order_number || row.order_id,
         warehouseFee:Number(row.warehouse_fee || 0),serviceFee:Number(row.service_fee || 0),chargeAmount:Number(row.charge_amount || 0),
