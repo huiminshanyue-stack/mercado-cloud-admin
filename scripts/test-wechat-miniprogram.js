@@ -39,7 +39,7 @@ async function runHandlers(handlers,req,res) {
 
 async function testRoutes() {
   process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
-  const routes=new Map(),listCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
+  const routes=new Map(),listCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],fulfillmentOptionCalls=[],fulfillmentSubmitCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -86,6 +86,14 @@ async function testRoutes() {
       summaryCalls.push({ user,query });
       return { period:query.period,orderCount:2,salesCny:72,profitCny:52,profitRate:72.2,pendingPayoutCount:1,exchangeRate:7.2 };
     },
+    getFulfillmentOptionsData:async()=>{
+      fulfillmentOptionCalls.push(true);
+      return { connectors:[{ id:4,name:'东莞仓',provider:'yeeke' }],services:[],carriers:[{ id:1,name:'中通快递' }] };
+    },
+    submitFulfillmentRequest:async (req,res)=>{
+      fulfillmentSubmitCalls.push({ user:req.authUser,body:req.body });
+      res.json({ code:0,data:{ success:1,failed:0,results:[{ orderId:req.body.orderIds[0],success:true }] },message:'代贴单已提交' });
+    },
     refreshOrderDimensionsData:async (user,orderId) => {
       dimensionCalls.push({ user,orderId });
       return { dimensionsLatest:{ available:true },dimensionsChanged:true };
@@ -129,7 +137,7 @@ async function testRoutes() {
   assert.equal(configRes.statusCode,200);
   assert.equal(configRes.body.data.appId,DEFAULT_APP_ID);
   assert.equal(configRes.body.data.writeOperationsEnabled,true);
-  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply','dimension_refresh']);
+  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit']);
 
   const anonymousRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/orders'),{ headers:{},query:{} },anonymousRes);
@@ -170,6 +178,27 @@ async function testRoutes() {
   assert.equal(dimensionCalls.length,1);
   assert.equal(dimensionCalls[0].user.username,'CNTORO');
   assert.equal(dimensionCalls[0].orderId,'order-1');
+
+  const fulfillmentOptionsRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/fulfillment-options'),{
+    headers:{ authorization:'Bearer cntoro-token' },query:{}
+  },fulfillmentOptionsRes);
+  assert.equal(fulfillmentOptionsRes.statusCode,200);
+  assert.equal(fulfillmentOptionsRes.body.data.connectors[0].name,'东莞仓');
+  assert.equal(fulfillmentOptionCalls.length,1);
+
+  const fulfillmentBody={
+    orderIds:['order-1'],warehouseId:4,carrier:'中通快递',serviceIds:[],
+    trackingByOrder:{ 'order-1':'ZT123' },quantityByOrder:{ 'order-1':2 },remarkByOrder:{ 'order-1':'易碎' }
+  };
+  const fulfillmentSubmitRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/fulfillment/submit'),{
+    headers:{ authorization:'Bearer cntoro-token' },body:fulfillmentBody
+  },fulfillmentSubmitRes);
+  assert.equal(fulfillmentSubmitRes.statusCode,200);
+  assert.equal(fulfillmentSubmitRes.body.data.success,1);
+  assert.equal(fulfillmentSubmitCalls[0].user.username,'CNTORO');
+  assert.deepEqual(fulfillmentSubmitCalls[0].body,fulfillmentBody);
 
   const costRes=responseRecorder();
   await runHandlers(routes.get('PATCH /api/miniprogram/v1/orders/:orderId/cost'),{

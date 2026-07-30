@@ -471,6 +471,8 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS previous_provider_order_number VARCHAR(120)');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS resubmit_count INTEGER NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS last_resubmitted_at TIMESTAMPTZ');
+  await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS shipping_quantity INTEGER NOT NULL DEFAULT 1');
+  await pool.query("ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS shipping_remark TEXT NOT NULL DEFAULT ''");
   await pool.query(`UPDATE fulfillment_submissions SET provider_order_number=order_id
     WHERE provider_order_number IS NULL OR provider_order_number=''`);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_order ON fulfillment_submissions(owner_username,order_id)');
@@ -3142,7 +3144,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.23',
+    version: '2026-07-31.24',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3179,7 +3181,12 @@ app.get('/api/health/order-management', (req, res) => {
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
     yeekeErpOrderNumberFormat: 'SY00000',
-    yeekeTrackingNumberField: 'trackingNo',
+    yeekeIdentityFields: ['note','erpOrdersn','shopId'],
+    yeekeAirwaybillTrackingField: 'trackingNo',
+    yeekeDomesticExpressField: 'orderItems[].expressInfos[]',
+    fulfillmentShippingQuantity: true,
+    fulfillmentShippingRemark: true,
+    miniProgramFulfillmentSubmit: true,
     fulfillmentSubmittedOrderGroup: true,
     fulfillmentWarehouseFilter: true,
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
@@ -4050,7 +4057,7 @@ async function getOrderListData(authUser,query = {}) {
   }
   if (packedRows.length) {
     const displayIds = packedRows.map(order => String(order.displayOrderId || order.packId || order.orderId));
-    const submissionRows = await pool.query(`SELECT f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.status,
+    const submissionRows = await pool.query(`SELECT f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.shipping_quantity,f.shipping_remark,f.status,
       f.failure_reason,f.retry_count,f.provider_order_number,f.previous_provider_order_number,f.resubmit_count,f.last_resubmitted_at,
       f.warehouse_fee,f.service_fee,f.charge_amount,f.billing_status,f.billing_key,
       f.remote_status,f.remote_message,f.remote_checked_at,f.created_at,f.updated_at,
@@ -4064,7 +4071,8 @@ async function getOrderListData(authUser,query = {}) {
       }
       return [String(row.order_id),{
         id:row.id,orderId:row.order_id,warehouseId:row.warehouse_id,warehouseName:row.warehouse_name || '',warehouseCode,
-        provider:row.provider || '',carrier:row.carrier,trackingNumber:row.tracking_number,status:row.status,
+        provider:row.provider || '',carrier:row.carrier,trackingNumber:row.tracking_number,
+        shippingQuantity:Number(row.shipping_quantity || 1),shippingRemark:row.shipping_remark || '',status:row.status,
         failureReason:row.failure_reason || '',retryCount:row.retry_count || 0,providerOrderNumber:row.provider_order_number || row.order_id,
         previousProviderOrderNumber:row.previous_provider_order_number || '',resubmitCount:Number(row.resubmit_count || 0),lastResubmittedAt:row.last_resubmitted_at,
         warehouseFee:Number(row.warehouse_fee || 0),serviceFee:Number(row.service_fee || 0),chargeAmount:Number(row.charge_amount || 0),
@@ -6959,28 +6967,31 @@ app.delete('/api/admin/warehouse-addresses/:id', requireAdmin, async (req, res) 
   }
 });
 
+async function getFulfillmentOptionsData() {
+  await ensureDefaultLogisticsCompanies();
+  const [connectorResult,serviceResult,carrierResult] = await Promise.all([
+    pool.query(`SELECT c.id,c.name,c.provider,c.provider_config,c.unit_price AS "unitPrice"
+      FROM erp_connectors c JOIN users u ON u.username=c.owner_username AND u.role='admin'
+      WHERE c.enabled=TRUE ORDER BY c.id DESC`),
+    pool.query(`SELECT fs.id,fs.name,fs.description,fs.source,fs.external_price AS "externalPrice",
+      fs.connector_id AS "connectorId",fs.enabled FROM fulfillment_services fs
+      JOIN users u ON u.username=fs.owner_username AND u.role='admin' ORDER BY fs.source DESC,fs.id DESC`),
+    pool.query(`SELECT lc.id,lc.name,lc.code,lc.enabled FROM logistics_companies lc
+      JOIN users u ON u.username=lc.owner_username AND u.role='admin' ORDER BY lc.name`)
+  ]);
+  const connectors = connectorResult.rows.map(({ provider_config:providerConfig, ...row }) => {
+    let warehouseCode = '';
+    if (row.provider === 'yeeke' && providerConfig) {
+      try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不暴露损坏的配置 */ }
+    }
+    return { ...row,warehouseCode };
+  });
+  return { connectors,services:serviceResult.rows,carriers:carrierResult.rows };
+}
+
 app.get('/api/admin/fulfillment-options', requireOrderAccess, async (req, res) => {
-  try {
-    await ensureDefaultLogisticsCompanies();
-    const [connectorResult,serviceResult,carrierResult] = await Promise.all([
-      pool.query(`SELECT c.id,c.name,c.provider,c.provider_config,c.unit_price AS "unitPrice"
-        FROM erp_connectors c JOIN users u ON u.username=c.owner_username AND u.role='admin'
-        WHERE c.enabled=TRUE ORDER BY c.id DESC`),
-      pool.query(`SELECT fs.id,fs.name,fs.description,fs.source,fs.external_price AS "externalPrice",
-        fs.connector_id AS "connectorId",fs.enabled FROM fulfillment_services fs
-        JOIN users u ON u.username=fs.owner_username AND u.role='admin' ORDER BY fs.source DESC,fs.id DESC`),
-      pool.query(`SELECT lc.id,lc.name,lc.code,lc.enabled FROM logistics_companies lc
-        JOIN users u ON u.username=lc.owner_username AND u.role='admin' ORDER BY lc.name`)
-    ]);
-    const connectors = connectorResult.rows.map(({ provider_config:providerConfig, ...row }) => {
-      let warehouseCode = '';
-      if (row.provider === 'yeeke' && providerConfig) {
-        try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不暴露损坏的配置 */ }
-      }
-      return { ...row,warehouseCode };
-    });
-    res.json({ code:0,data:{ connectors,services:serviceResult.rows,carriers:carrierResult.rows } });
-  } catch (error) {
+  try { res.json({ code:0,data:await getFulfillmentOptionsData() }); }
+  catch (error) {
     console.error('[Orders] fulfillment options failed:',error.message);
     res.status(500).json({ code:500,message:'代贴单可选项读取失败' });
   }
@@ -7000,6 +7011,19 @@ function getYeekeConnectorConfig(connector) {
 async function getOrderExternalUserId(username) {
   const { rows } = await pool.query('SELECT order_external_id FROM users WHERE username=$1 LIMIT 1', [username]);
   return String(rows[0]?.order_external_id || '');
+}
+
+function fulfillmentOrderQuantity(orderRows) {
+  return (Array.isArray(orderRows) ? orderRows : [orderRows]).reduce((orderTotal,row) => {
+    const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
+    const items = Array.isArray(row?.items) && row.items.length
+      ? row.items
+      : (Array.isArray(raw.order_items) ? raw.order_items : (Array.isArray(raw.items) ? raw.items : []));
+    return orderTotal + items.reduce((itemTotal,entry) => {
+      const item = entry?.item && typeof entry.item === 'object' ? entry.item : entry;
+      return itemTotal + Math.max(1,Math.floor(Number(entry?.quantity || item?.quantity || 1)));
+    },0);
+  },0) || 1;
 }
 
 async function syncYeekeServicesForConnector(ownerUsername, connector) {
@@ -7075,7 +7099,9 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
       serviceCodes: options.serviceCodes,
       warehouseCode: config.warehouseCode,
       carrier: options.carrier,
-      trackingNumber: options.trackingNumber
+      trackingNumber: options.trackingNumber,
+      shippingQuantity: options.shippingQuantity,
+      shippingRemark: options.shippingRemark
     });
     try {
       return await client.createOrderV2(payload);
@@ -7189,11 +7215,14 @@ function startYeekeSubmissionStatusSync() {
   yeekeSubmissionStatusSyncTimer.unref?.();
 }
 
-app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) => {
+async function handleFulfillmentSubmit(req, res) {
   const orderIds = [...new Set((Array.isArray(req.body?.orderIds) ? req.body.orderIds : []).map(String).filter(Boolean))];
   const requestedResubmits = new Set((Array.isArray(req.body?.resubmitOrderIds) ? req.body.resubmitOrderIds : []).map(String).filter(Boolean));
   const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
-  const trackingByOrder = req.body?.trackingByOrder || {}, serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
+  const trackingByOrder = req.body?.trackingByOrder || {};
+  const quantityByOrder = req.body?.quantityByOrder || {};
+  const remarkByOrder = req.body?.remarkByOrder || {};
+  const serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
   if (!orderIds.length) return res.status(400).json({ code: 400, message: '请先选择需要提交代贴单的订单' });
   if (!warehouseId) return res.status(400).json({ code: 400, message: '请选择要提交的仓库' });
   if (!carrier) return res.status(400).json({ code: 400, message: '请选择国内物流公司' });
@@ -7233,6 +7262,17 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     if (!eligibility.allowed) { results.push({ orderId:displayOrderId,success:false,message:eligibility.message }); continue; }
     const trackingNumber = String(trackingByOrder[displayOrderId] || '').trim();
     if (!trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少国内快递单号，请填写后重新推送' }); continue; }
+    const maximumShippingQuantity = fulfillmentOrderQuantity(orderResult.rows);
+    const shippingQuantity = Math.floor(Number(quantityByOrder[displayOrderId] ?? maximumShippingQuantity));
+    if (!Number.isFinite(shippingQuantity) || shippingQuantity < 1 || shippingQuantity > maximumShippingQuantity) {
+      results.push({ orderId:displayOrderId,success:false,message:`发货数量必须是 1 至 ${maximumShippingQuantity} 的整数` });
+      continue;
+    }
+    const shippingRemark = String(remarkByOrder[displayOrderId] || '').trim();
+    if (shippingRemark.length > 500) {
+      results.push({ orderId:displayOrderId,success:false,message:'快递备注不能超过 500 个字' });
+      continue;
+    }
     const existingResult = await pool.query(`SELECT f.*,c.provider AS old_provider,c.provider_config AS old_provider_config
       FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
       WHERE f.owner_username=$2 AND f.order_id=$1`,[displayOrderId,req.authUser.username]);
@@ -7259,20 +7299,23 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     const providerOrderNumber = isResubmit ? buildYeekeResubmitOrderNumber(displayOrderId) : displayOrderId;
     const payload = { source:'shanyue-erp',action:isResubmit ? 'fulfillment_resubmit' : 'fulfillment_label',order_id:displayOrderId,
       provider_order_number:providerOrderNumber,previous_provider_order_number:existing?.provider_order_number || null,
-      carrier,tracking_number:trackingNumber,value_added_services:serviceResult.rows,orders:orderResult.rows.map(row => row.raw_data) };
+      carrier,tracking_number:trackingNumber,shipping_quantity:shippingQuantity,shipping_remark:shippingRemark,
+      value_added_services:serviceResult.rows,orders:orderResult.rows.map(row => row.raw_data) };
     try {
       const pdfString = String(warehouse.provider || 'generic') === 'yeeke'
         ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
-      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId,providerOrderNumber,externalUserId,carrier,trackingNumber,pdfString,serviceCodes,payload }, yeekeClient);
+      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, {
+        displayOrderId,providerOrderNumber,externalUserId,carrier,trackingNumber,shippingQuantity,shippingRemark,pdfString,serviceCodes,payload
+      }, yeekeClient);
       const billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`;
       if (isResubmit) {
-        await pool.query(`UPDATE fulfillment_submissions SET warehouse_id=$1,carrier=$2,tracking_number=$3,service_ids=$4::jsonb,
-          previous_provider_order_number=provider_order_number,provider_order_number=$5,status='success',request_data=$6::jsonb,response_text=$7,
-          failure_reason=NULL,warehouse_fee=$8,service_fee=$9,charge_amount=$10,
+        await pool.query(`UPDATE fulfillment_submissions SET warehouse_id=$1,carrier=$2,tracking_number=$3,shipping_quantity=$4,shipping_remark=$5,service_ids=$6::jsonb,
+          previous_provider_order_number=provider_order_number,provider_order_number=$7,status='success',request_data=$8::jsonb,response_text=$9,
+          failure_reason=NULL,warehouse_fee=$10,service_fee=$11,charge_amount=$12,
           billing_status=CASE WHEN billing_status='charged' THEN 'charged' ELSE 'reserved' END,
-          billing_key=COALESCE(billing_key,$11),resubmit_count=resubmit_count+1,last_resubmitted_at=NOW(),
+          billing_key=COALESCE(billing_key,$13),resubmit_count=resubmit_count+1,last_resubmitted_at=NOW(),
           remote_returned=FALSE,remote_status=NULL,remote_message=NULL,remote_checked_at=NULL,returned_at=NULL,updated_at=NOW()
-          WHERE id=$12 AND owner_username=$13`,[warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),providerOrderNumber,
+          WHERE id=$14 AND owner_username=$15`,[warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,
           JSON.stringify(payload),JSON.stringify({ pushed }).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey,existing.id,req.authUser.username]);
         let cancellationWarning = '';
         if (!returnedResubmit) {
@@ -7290,17 +7333,17 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
         results.push({ orderId:displayOrderId,success:true,resubmitted:true,providerOrderNumber,warning:cancellationWarning,
           billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
       } else {
-        await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at)
-          VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,'success',$8::jsonb,$9,NULL,$10,$11,$12,'reserved',$13,FALSE,NULL,NULL,NULL)`,
-        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey]);
+        await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'success',$10::jsonb,$11,NULL,$12,$13,$14,'reserved',$15,FALSE,NULL,NULL,NULL)`,
+        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey]);
         results.push({ orderId:displayOrderId,success:true,providerOrderNumber,billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
       }
     } catch (error) {
       const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
       if (!isResubmit) {
-        await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,provider_order_number,status,request_data,response_text,failure_reason,retry_count)
-          VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,'failed',$8::jsonb,$9,$10,1)`,
-        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason]);
+        await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,retry_count)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'failed',$10::jsonb,$11,$12,1)`,
+        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason]);
       }
       results.push({ orderId: displayOrderId, success: false, message: error.response?.data?.message || error.message });
     }
@@ -7308,7 +7351,9 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
   const success = results.filter(item => item.success).length;
   const firstFailure = results.find(item => !item.success)?.message || '';
   res.status(success ? 200 : 502).json({ code: success ? 0 : 502, data: { success, failed: results.length - success, results }, message: success ? '代贴单已提交' : (firstFailure || '代贴单提交失败') });
-});
+}
+
+app.post('/api/admin/fulfillment/submit', requireOrderAccess, handleFulfillmentSubmit);
 
 app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, res) => {
   const params = [req.authUser.username], where = ['f.owner_username=$1',"f.status<>'returned'"];
@@ -7317,7 +7362,8 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
     params.push(warehouseId);
     where.push(`f.warehouse_id=$${params.length}`);
   }
-  const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.provider_order_number AS "providerOrderNumber",f.carrier,f.tracking_number AS "trackingNumber",f.status,
+  const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.provider_order_number AS "providerOrderNumber",f.carrier,f.tracking_number AS "trackingNumber",
+    f.shipping_quantity AS "shippingQuantity",f.shipping_remark AS "shippingRemark",f.status,
     f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.warehouse_fee AS "warehouseFee",
     f.service_fee AS "serviceFee",f.charge_amount AS "chargeAmount",f.billing_status AS "billingStatus",f.billing_key AS "billingKey",
     f.remote_status AS "remoteStatus",f.remote_message AS "remoteMessage",f.remote_checked_at AS "remoteCheckedAt",
@@ -7371,7 +7417,17 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       retryWarehouseFee = feeAmount(submission.unit_price);
       retryServiceFee = Number(retryServices.rows.reduce((sum,service) => sum + feeAmount(service.external_price),0).toFixed(2));
       retryChargeAmount = Number((retryWarehouseFee + retryServiceFee).toFixed(2));
-      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, providerOrderNumber: submission.provider_order_number || submission.order_id, externalUserId, carrier: submission.carrier, trackingNumber: submission.tracking_number, pdfString, serviceCodes });
+      responseData = await sendOrderToConnector(submission, orderResult.rows, {
+        displayOrderId: submission.order_id,
+        providerOrderNumber: submission.provider_order_number || submission.order_id,
+        externalUserId,
+        carrier: submission.carrier,
+        trackingNumber: submission.tracking_number,
+        shippingQuantity: submission.shipping_quantity,
+        shippingRemark: submission.shipping_remark,
+        pdfString,
+        serviceCodes
+      });
     } else {
       const headers = { 'Content-Type': 'application/json' };
       if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
@@ -8023,6 +8079,7 @@ async function start() {
   await mercadoLibreWebhookService.init();
   mercadoLibreWebhookService.registerRoutes(app);
   registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getMiniOrderWorkbenchSummaryData,getOrderStoresData,refreshOrderDimensionsData,
+    getFulfillmentOptionsData,submitFulfillmentRequest:handleFulfillmentSubmit,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
     getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,translateOrderMessageData,getOrderRealtimeStateData,
     getOfficialNotificationPreferences:officialAccountService.getPreferences,

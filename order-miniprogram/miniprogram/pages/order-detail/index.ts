@@ -2,14 +2,20 @@ import { request,showError } from '../../utils/request';
 import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWeightState,formatDate,money,orderState,platformDimensionSourceNote,reputationReasonText } from '../../utils/format';
 
 Page({
-  data:{ loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false },
+  data:{
+    loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false,
+    fulfillmentOptionsLoading:false,fulfillmentSubmitting:false,
+    warehouses:[] as any[],carriers:[] as any[],warehouseNames:[] as string[],carrierNames:[] as string[],
+    warehouseIndex:0,carrierIndex:0,
+    fulfillmentForm:{ trackingNumber:'',quantity:'1',remark:'' }
+  },
   async onLoad(options:Record<string,string>) {
     if (!options.id) {
       wx.navigateBack();
       return;
     }
     this.setData({ displayOrderId:options.id });
-    await this.loadOrder();
+    await Promise.all([this.loadOrder(),this.loadFulfillmentOptions()]);
     this.setData({ loadedOnce:true });
   },
   onShow() { if (this.data.loadedOnce) this.loadOrder(); },
@@ -49,10 +55,84 @@ Page({
         sellerWeightHintClass:dimensionState.sellerHintClass,
         weightAnomaly:dimensionState.weightAnomaly,
         dimensionsAvailable:Boolean(raw.dimensionsOriginal?.available || raw.dimensionsLatest?.available),
-        reputationReasonText:reputationReasonText(raw.reputationReason)
+        reputationReasonText:reputationReasonText(raw.reputationReason),
+        canSubmitFulfillment:raw.status !== 'cancelled'
+          && Number(raw.refundAmount || 0) <= 0
+          && raw.shipmentStatus === 'ready_to_ship',
+        totalQuantity:products.reduce((total:number,item:any)=>total + Math.max(1,Number(item.quantity || 1)),0) || 1
       } });
+      if (!raw.fulfillmentSubmission) {
+        const totalQuantity=products.reduce((total:number,item:any)=>total + Math.max(1,Number(item.quantity || 1)),0) || 1;
+        this.setData({ 'fulfillmentForm.quantity':String(totalQuantity) });
+      }
     } catch (error) { showError(error); }
     finally { this.setData({ loading:false }); }
+  },
+  async loadFulfillmentOptions() {
+    if (this.data.fulfillmentOptionsLoading) return;
+    this.setData({ fulfillmentOptionsLoading:true });
+    try {
+      const data=await request<any>({ path:'/api/miniprogram/v1/fulfillment-options' });
+      const warehouses=(data.connectors || []).filter((item:any)=>item.enabled !== false);
+      const carriers=(data.carriers || []).filter((item:any)=>item.enabled !== false);
+      this.setData({
+        warehouses,carriers,
+        warehouseNames:warehouses.map((item:any)=>item.warehouseCode ? `${item.name}（${item.warehouseCode}）` : item.name),
+        carrierNames:carriers.map((item:any)=>item.name),
+        warehouseIndex:0,carrierIndex:0
+      });
+    } catch (error) { showError(error); }
+    finally { this.setData({ fulfillmentOptionsLoading:false }); }
+  },
+  onWarehouseChange(event:WechatMiniprogram.PickerChange) {
+    this.setData({ warehouseIndex:Number(event.detail.value || 0) });
+  },
+  onCarrierChange(event:WechatMiniprogram.PickerChange) {
+    this.setData({ carrierIndex:Number(event.detail.value || 0) });
+  },
+  onFulfillmentInput(event:WechatMiniprogram.Input) {
+    const field=String(event.currentTarget.dataset.field || '');
+    if (!['trackingNumber','quantity','remark'].includes(field)) return;
+    this.setData({ [`fulfillmentForm.${field}`]:event.detail.value });
+  },
+  async submitFulfillment() {
+    const order=this.data.order;
+    if (!order?.canSubmitFulfillment || order.fulfillmentSubmission) return;
+    const warehouse=this.data.warehouses[this.data.warehouseIndex];
+    const carrier=this.data.carriers[this.data.carrierIndex];
+    const trackingNumber=String(this.data.fulfillmentForm.trackingNumber || '').trim();
+    const quantity=Number(this.data.fulfillmentForm.quantity);
+    const remark=String(this.data.fulfillmentForm.remark || '').trim();
+    if (!warehouse) return wx.showToast({ title:'请选择仓库',icon:'none' });
+    if (!carrier) return wx.showToast({ title:'请选择快递公司',icon:'none' });
+    if (!trackingNumber) return wx.showToast({ title:'请填写快递单号',icon:'none' });
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > Number(order.totalQuantity || 1)) {
+      return wx.showToast({ title:`发货数量应为1至${order.totalQuantity}`,icon:'none' });
+    }
+    if (remark.length > 500) return wx.showToast({ title:'备注不能超过500字',icon:'none' });
+    const confirmation=await new Promise<boolean>(resolve=>wx.showModal({
+      title:'确认提交代贴单',
+      content:`${warehouse.name} · ${carrier.name}\n快递单号：${trackingNumber}\n发货数量：${quantity}`,
+      success:result=>resolve(Boolean(result.confirm)),fail:()=>resolve(false)
+    }));
+    if (!confirmation) return;
+    const orderId=String(order.displayOrderId || order.orderId);
+    this.setData({ fulfillmentSubmitting:true });
+    wx.showLoading({ title:'正在提交',mask:true });
+    try {
+      await request<any>({
+        path:'/api/miniprogram/v1/fulfillment/submit',method:'POST',timeout:60000,
+        data:{
+          orderIds:[orderId],warehouseId:warehouse.id,carrier:carrier.name,serviceIds:[],
+          trackingByOrder:{ [orderId]:trackingNumber },
+          quantityByOrder:{ [orderId]:quantity },
+          remarkByOrder:{ [orderId]:remark }
+        }
+      });
+      await this.loadOrder();
+      wx.showToast({ title:'代贴单已提交',icon:'success' });
+    } catch (error) { showError(error); }
+    finally { wx.hideLoading();this.setData({ fulfillmentSubmitting:false }); }
   },
   previewImage(event:WechatMiniprogram.TouchEvent) {
     const images=(this.data.order?.products || []).map((item:any)=>item.image).filter(Boolean);

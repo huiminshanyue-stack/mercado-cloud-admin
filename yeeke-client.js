@@ -129,7 +129,7 @@ function yeekeExpressCode(carrier) {
   return codes[name] || (/^[a-z0-9-]+$/i.test(name) ? name : 'other');
 }
 
-function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, displayOrderId, providerOrderNumber, externalUserId, pdfString, serviceCodes }) {
+function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, shippingQuantity, shippingRemark, displayOrderId, providerOrderNumber, externalUserId, pdfString, serviceCodes }) {
   const sourceRows = (Array.isArray(rows) && rows.length ? rows : [row]).filter(Boolean);
   row = sourceRows[0] || {};
   const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
@@ -139,9 +139,21 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
       ? sourceRow.items
       : (Array.isArray(sourceRaw.order_items) ? sourceRaw.order_items : (Array.isArray(sourceRaw.items) ? sourceRaw.items : []));
   });
+  const totalItemQuantity = sourceItems.reduce((total, entry) => {
+    const item = entry?.item && typeof entry.item === 'object' ? entry.item : entry;
+    return total + Math.max(1, Math.floor(Number(entry?.quantity || item?.quantity || 1)));
+  }, 0);
+  let remainingShippingQuantity = Math.min(
+    Math.max(1, Math.floor(Number(shippingQuantity) || totalItemQuantity || 1)),
+    Math.max(1, totalItemQuantity || 1)
+  );
+  const domesticTrackingNumber = String(trackingNumber || '').trim();
+  const domesticRemark = String(shippingRemark || '').trim().slice(0, 500);
   const orderItems = sourceItems.map((entry) => {
     const item = entry?.item && typeof entry.item === 'object' ? entry.item : entry;
-    const quantity = Math.max(1, Number(entry?.quantity || item?.quantity || 1));
+    const quantity = Math.max(1, Math.floor(Number(entry?.quantity || item?.quantity || 1)));
+    const sendQuantity = Math.min(quantity, remainingShippingQuantity);
+    remainingShippingQuantity = Math.max(0, remainingShippingQuantity - sendQuantity);
     const sku = item?.seller_custom_field || item?.variation_sku || item?.seller_sku || item?.sku || '';
     const imageUrl = item?.secure_thumbnail || item?.thumbnail || item?.picture_url || item?.pictures?.[0]?.secure_url || item?.pictures?.[0]?.url || '';
     return {
@@ -151,7 +163,12 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
       variationSku: sku ? String(sku).slice(0, 200) : undefined,
       variationName: item?.variation_name ? String(item.variation_name).slice(0, 200) : undefined,
       productEnName: item?.title ? String(item.title).slice(0, 500) : undefined,
-      expressInfos: trackingNumber ? [{ trackingNo: String(trackingNumber), sendQuantity: quantity, expressCode: yeekeExpressCode(carrier) }] : [],
+      expressInfos: domesticTrackingNumber && sendQuantity > 0 ? [{
+        trackingNo: domesticTrackingNumber,
+        sendQuantity,
+        expressCode: yeekeExpressCode(carrier),
+        note: domesticRemark || undefined
+      }] : [],
       stockInfos: [],
       distributionProducts: []
     };
@@ -170,13 +187,30 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   } : undefined;
   const sourceOrderId = String(displayOrderId || row.pack_id || row.ml_order_id || raw.pack_id || raw.id || raw.order_id || '');
   const orderId = String(providerOrderNumber || sourceOrderId);
+  const identity = buildYeekeErpOrderNumber(externalUserId, sourceOrderId);
+  const officialTrackingNumber = String(sourceRows.map((sourceRow) => {
+    const sourceRaw = sourceRow?.raw_data && typeof sourceRow.raw_data === 'object' ? sourceRow.raw_data : {};
+    return sourceRow?.tracking_number
+      || sourceRaw?._shipment_detail?.tracking_number
+      || sourceRaw?.shipping?.tracking_number
+      || sourceRaw?.shipping?.tracking_no
+      || '';
+  }).find(Boolean) || '').trim();
+  const internationalCarrier = String(sourceRows.map((sourceRow) => {
+    const sourceRaw = sourceRow?.raw_data && typeof sourceRow.raw_data === 'object' ? sourceRow.raw_data : {};
+    return sourceRow?.tracking_method
+      || sourceRaw?._shipment_detail?.tracking_method
+      || sourceRaw?.shipping?.tracking_method
+      || '';
+  }).find(Boolean) || '').trim();
   const totalAmount = sourceRows.reduce((total, sourceRow) => total + Number(sourceRow.total_amount || sourceRow.raw_data?.total_amount || 0), 0);
   const payload = {
     ordersn: orderId,
-    erpOrdersn: buildYeekeErpOrderNumber(externalUserId, sourceOrderId),
-    note: externalUserId ? `山月ERP ${buildYeekeErpOrderNumber(externalUserId, sourceOrderId)}` : '山月ERP',
+    erpOrdersn: identity,
+    shopId: identity,
+    note: externalUserId ? `山月ERP ${identity}` : '山月ERP',
     pdfString: pdfString || undefined,
-    trackingNo: trackingNumber ? String(trackingNumber) : undefined,
+    trackingNo: officialTrackingNumber || undefined,
     selectProList: [...new Set((Array.isArray(serviceCodes) ? serviceCodes : []).map(String).filter(Boolean))],
     packageType: 1,
     wareHouse: String(warehouseCode),
@@ -189,7 +223,7 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
     shipByDate: toTimestamp(row.handling_deadline || row.ship_by_date),
     payTime: toTimestamp(raw.payments?.[0]?.date_created || raw.paid_at),
     orderStatus: String(row.status || raw.status || '').slice(0, 100) || undefined,
-    shippingCarrier: String(carrier || '').slice(0, 100) || undefined,
+    shippingCarrier: internationalCarrier.slice(0, 100) || undefined,
     receiverInfo,
     orderItems
   };

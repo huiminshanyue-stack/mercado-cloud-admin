@@ -40,6 +40,9 @@ assert.strictEqual(fulfillmentSubmissionEligibility([
 ]).allowed,false,'a mixed-status pack must be rejected');
 
 const serverSource = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+const yeekeSource = fs.readFileSync(path.join(__dirname, '..', 'yeeke-client.js'), 'utf8');
+const miniDetailSource = fs.readFileSync(path.join(__dirname, '..', 'order-miniprogram', 'miniprogram', 'pages', 'order-detail', 'index.ts'), 'utf8');
+const miniDetailTemplate = fs.readFileSync(path.join(__dirname, '..', 'order-miniprogram', 'miniprogram', 'pages', 'order-detail', 'index.wxml'), 'utf8');
 const publicIndex = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
 const rootAssetName = publicIndex.match(/assets\/(index-[A-Za-z0-9_-]+\.js)/)?.[1];
 assert.ok(rootAssetName, 'the production index must reference its root JavaScript asset');
@@ -79,6 +82,11 @@ assert.ok(serverSource.includes('fulfillmentResubmit: true'), 'users must be all
 assert.ok(serverSource.includes("fulfillmentSubmissionAllowedShipmentStatus: 'ready_to_ship'"), 'only ready-to-ship orders may enter fulfillment submission');
 assert.ok((serverSource.match(/fulfillmentSubmissionEligibility\(orderResult\.rows\)/g) || []).length >= 2, 'both new submissions and retries must enforce shipment eligibility');
 assert.ok(serverSource.includes('请先选择需要提交代贴单的订单') && serverSource.includes('请选择要提交的仓库') && serverSource.includes('请选择国内物流公司'), 'missing submit parameters must return field-specific feedback');
+assert.ok(serverSource.includes('quantityByOrder') && serverSource.includes('remarkByOrder'), 'shipping quantity and courier remarks must be accepted per order');
+assert.ok(serverSource.includes('发货数量必须是 1 至') && serverSource.includes('快递备注不能超过 500 个字'), 'shipping quantity and remark validation must be actionable');
+assert.ok(yeekeSource.includes('erpOrdersn: identity') && yeekeSource.includes('shopId: identity') && yeekeSource.includes('`山月ERP ${identity}`'), 'all three Yeeke identity positions must receive the stable SY id');
+assert.ok(yeekeSource.includes('trackingNo: officialTrackingNumber') && yeekeSource.includes('expressInfos: domesticTrackingNumber'), 'international and domestic tracking numbers must use separate Yeeke fields');
+assert.ok(yeekeSource.includes('sendQuantity') && yeekeSource.includes('note: domesticRemark'), 'Yeeke courier details must include shipping quantity and remark');
 assert.ok(serverSource.includes('官方面单未申请成功，请先点击订单上的“申请面单”查看原因'), 'official label failures must tell the user how to recover');
 assert.ok(serverSource.includes('const requestedResubmits = new Set'), 'resubmission must require an explicit order id list');
 assert.ok(serverSource.includes("message:'二次推单必须选择与当前不同的仓库'"), 'resubmission must reject the current warehouse');
@@ -114,6 +122,8 @@ assert.ok(orderFrontendSource.includes('尚未生成官方面单，请先同步�
 assert.ok(!orderFrontendSource.includes('修改仓库'), 'the unavailable warehouse-change button must be removed');
 assert.ok(orderFrontendSource.includes('重新提交代贴单'), 'successful submissions must expose the explicit second-push action');
 assert.ok(orderFrontendSource.includes('resubmitOrderIds'), 'the second-push action must identify resubmitted orders to the API');
+assert.ok(orderFrontendSource.includes('发货数量') && orderFrontendSource.includes('随国内快递一起推送'), 'the web fulfillment dialog must collect shipping quantity and courier remarks');
+assert.ok(orderFrontendSource.includes('quantityByOrder') && orderFrontendSource.includes('remarkByOrder'), 'the web fulfillment request must send quantity and remark maps');
 assert.ok(orderFrontendSource.includes('www.kuaidi100.com/chaxun'), 'domestic tracking must open a prefilled Kuaidi100 web query');
 assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.includes('shunfeng') && orderFrontendSource.includes('jtexpress'), 'common domestic carriers must be mapped for automatic query filling');
 assert.ok(orderFrontendSource.includes('仓库收货地址') && orderFrontendSource.includes('recipientDisplay') && orderFrontendSource.includes('addressDisplay'), 'the workbench must render user-specific shared warehouse addresses');
@@ -126,5 +136,10 @@ assert.ok(serverSource.includes("warehouseConfigurationReadRole: 'admin'") && se
 assert.ok(orderFrontendSource.includes('二次推单会在新仓库创建新订单'), 'the UI must explain the second-push and previous-order cancellation flow');
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');
+assert.ok(miniDetailSource.includes('/api/miniprogram/v1/fulfillment-options') && miniDetailSource.includes('/api/miniprogram/v1/fulfillment/submit'), 'the mini-program order detail must use the protected fulfillment APIs');
+assert.ok(miniDetailSource.includes('quantityByOrder') && miniDetailSource.includes('remarkByOrder'), 'the mini-program must submit quantity and courier remarks');
+for (const label of ['选择仓库','快递公司','国内快递单号','发货数量','备注','提交代贴单']) {
+  assert.ok(miniDetailTemplate.includes(label), `the mini-program fulfillment form must include ${label}`);
+}
 
 console.log('order warehouse permission policy tests passed');
