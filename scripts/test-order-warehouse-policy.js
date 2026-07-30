@@ -2,6 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { canAccessOrderManagement, canManageWarehouses } = require('../order-warehouse-policy');
+const { fulfillmentSubmissionEligibility } = require('../order-fulfillment-policy');
 
 for (const role of ['admin', 'agent', 'user']) {
   assert.strictEqual(canAccessOrderManagement({ role }), true, `${role} should access order management`);
@@ -12,6 +13,23 @@ assert.strictEqual(canAccessOrderManagement({ role: 'guest', username: 'CNTORO' 
 assert.strictEqual(canManageWarehouses({ role: 'admin' }), true);
 assert.strictEqual(canManageWarehouses({ role: 'agent' }), false);
 assert.strictEqual(canManageWarehouses({ role: 'user' }), false);
+
+assert.deepStrictEqual(fulfillmentSubmissionEligibility([{ status:'paid',shipment_status:'ready_to_ship',refund_amount:0 }]), { allowed:true,message:'' });
+for (const [row,reason] of [
+  [{ status:'paid',shipment_status:'shipped' },'运输中'],
+  [{ status:'paid',shipment_status:'delivered' },'已送达'],
+  [{ status:'cancelled',shipment_status:'ready_to_ship' },'已取消'],
+  [{ status:'paid',shipment_status:'ready_to_ship',refund_amount:1 },'已退款'],
+  [{ status:'paid',shipment_status:'handling' },'处理中']
+]) {
+  const result = fulfillmentSubmissionEligibility([row]);
+  assert.strictEqual(result.allowed,false,`${reason} orders must be rejected`);
+  assert.ok(result.message.includes(reason),`${reason} rejection must be actionable`);
+}
+assert.strictEqual(fulfillmentSubmissionEligibility([
+  { status:'paid',shipment_status:'ready_to_ship' },
+  { status:'paid',shipment_status:'shipped' }
+]).allowed,false,'a mixed-status pack must be rejected');
 
 const serverSource = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
 const publicIndex = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
@@ -41,6 +59,10 @@ assert.ok(serverSource.includes('if (packedRows.length) {'), 'the main order wor
 assert.ok(serverSource.includes("f.status<>'returned' AND f.order_id=ANY"), 'active fulfillment data must be attached directly to main order cards');
 assert.ok(serverSource.includes('fulfillmentMergedIntoWorkbench: true'), 'health metadata must expose the unified workbench');
 assert.ok(serverSource.includes('fulfillmentResubmit: true'), 'users must be allowed to submit an already successful order again');
+assert.ok(serverSource.includes("fulfillmentSubmissionAllowedShipmentStatus: 'ready_to_ship'"), 'only ready-to-ship orders may enter fulfillment submission');
+assert.ok((serverSource.match(/fulfillmentSubmissionEligibility\(orderResult\.rows\)/g) || []).length >= 2, 'both new submissions and retries must enforce shipment eligibility');
+assert.ok(serverSource.includes('请先选择需要提交代贴单的订单') && serverSource.includes('请选择要提交的仓库') && serverSource.includes('请选择国内物流公司'), 'missing submit parameters must return field-specific feedback');
+assert.ok(serverSource.includes('官方面单未申请成功，请先点击订单上的“申请面单”查看原因'), 'official label failures must tell the user how to recover');
 assert.ok(serverSource.includes('const requestedResubmits = new Set'), 'resubmission must require an explicit order id list');
 assert.ok(serverSource.includes("message:'二次推单必须选择与当前不同的仓库'"), 'resubmission must reject the current warehouse');
 assert.ok(serverSource.includes("updateOrderStatus({ ordersn:existing.provider_order_number || displayOrderId,status:'cancelled' })"), 'a successful resubmission must push the Mercado cancellation status to the previous Yeeke order');
@@ -65,6 +87,10 @@ assert.ok(orderFrontendSource.includes('仓库：'), 'submitted warehouse data m
 assert.ok(orderFrontendSource.includes('国内快递单号：'), 'domestic tracking data must render on the main order card');
 assert.ok(orderFrontendSource.includes('提交代贴单时间：'), 'fulfillment submission time must render on the main order card');
 assert.ok(orderFrontendSource.includes('代贴单提交失败') && orderFrontendSource.includes('已提交代贴单'), 'the submit action must switch to its attached submission state');
+assert.ok(orderFrontendSource.includes('代贴单提交失败，点击重新推送'), 'failed submissions must expose a clickable retry action');
+assert.ok(orderFrontendSource.includes('仅待发货可提交'), 'terminal and non-ready orders must show that fulfillment is unavailable');
+assert.ok(orderFrontendSource.includes('缺少国内快递单号，请填写后再推送'), 'the submit dialog must validate domestic tracking numbers before calling the API');
+assert.ok(orderFrontendSource.includes('尚未生成官方面单，请先同步订单状态并点击“申请面单”'), 'orders without a shipment label must receive actionable feedback');
 assert.ok(!orderFrontendSource.includes('修改仓库'), 'the unavailable warehouse-change button must be removed');
 assert.ok(orderFrontendSource.includes('重新提交代贴单'), 'successful submissions must expose the explicit second-push action');
 assert.ok(orderFrontendSource.includes('resubmitOrderIds'), 'the second-push action must identify resubmitted orders to the API');

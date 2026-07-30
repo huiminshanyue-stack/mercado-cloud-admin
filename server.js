@@ -1,5 +1,6 @@
 const express = require('express');
 const { canAccessOrderManagement } = require('./order-warehouse-policy');
+const { fulfillmentSubmissionEligibility } = require('./order-fulfillment-policy');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -3128,7 +3129,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.18',
+    version: '2026-07-31.19',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3147,6 +3148,10 @@ app.get('/api/health/order-management', (req, res) => {
     batchLabelPrint: true,
     batchLabelPrintScope: 'current-user-ready-to-ship-orders',
     batchLabelPrintOutput: 'single-merged-pdf',
+    fulfillmentFailureActionFeedback: true,
+    fulfillmentFailedSubmissionRetryButton: true,
+    fulfillmentSubmissionAllowedShipmentStatus: 'ready_to_ship',
+    fulfillmentSubmissionTerminalStatusBlocked: true,
     fulfillmentWarehouseCorrection: 'second-push-and-cancel-previous',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
@@ -6895,7 +6900,7 @@ async function syncYeekeServicesForConnector(ownerUsername, connector) {
 async function resolveOfficialLabelPdfForPush(authUser, orderRows) {
   const rows = (Array.isArray(orderRows) ? orderRows : [orderRows]).filter(Boolean);
   const shipmentIds = [...new Set(rows.map(row => String(row.shipping_id || '')).filter(Boolean))];
-  if (!shipmentIds.length) throw new Error('该订单没有国际运单，无法向 Yeeke 推送打印面单');
+  if (!shipmentIds.length) throw new Error('该订单尚未生成官方面单（缺少 Shipment ID），请先同步订单状态，再点击订单上的“申请面单”；面单成功后重新推送');
   const cached = await pool.query(`SELECT pdf_data FROM order_shipping_labels
     WHERE owner_username=$1 AND shipment_id=ANY($2::varchar[]) ORDER BY fetched_at DESC LIMIT 1`,
   [authUser.username,shipmentIds]);
@@ -6919,8 +6924,8 @@ async function resolveOfficialLabelPdfForPush(authUser, orderRows) {
       } catch (error) { lastError = error; }
     }
   }
-  if (lastError) throw new Error(`美客多官方面单获取失败：${decodeOfficialLabelError(lastError).message}`);
-  throw new Error('当前用户没有可用的店铺授权，无法取得打印面单');
+  if (lastError) throw new Error(`官方面单未申请成功，请先点击订单上的“申请面单”查看原因，面单成功后重新推送。美客多返回：${decodeOfficialLabelError(lastError).message}`);
+  throw new Error('当前用户没有可用的店铺授权，无法申请官方面单；请先完成订单所属店铺授权，再点击“申请面单”并重新推送');
 }
 
 async function sendOrderToConnector(connector, row, options = {}, yeekeClient = null) {
@@ -7057,7 +7062,9 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
   const requestedResubmits = new Set((Array.isArray(req.body?.resubmitOrderIds) ? req.body.resubmitOrderIds : []).map(String).filter(Boolean));
   const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
   const trackingByOrder = req.body?.trackingByOrder || {}, serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
-  if (!orderIds.length || !warehouseId || !carrier) return res.status(400).json({ code: 400, message: '请选择订单、仓库和物流公司' });
+  if (!orderIds.length) return res.status(400).json({ code: 400, message: '请先选择需要提交代贴单的订单' });
+  if (!warehouseId) return res.status(400).json({ code: 400, message: '请选择要提交的仓库' });
+  if (!carrier) return res.status(400).json({ code: 400, message: '请选择国内物流公司' });
   const connectorResult = await pool.query(`SELECT c.* FROM erp_connectors c
     JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE c.id=$1 AND c.enabled=TRUE`, [warehouseId]);
@@ -7088,10 +7095,12 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
   }
   const results = [];
   for (const displayOrderId of orderIds) {
-    const trackingNumber = String(trackingByOrder[displayOrderId] || '').trim();
-    if (!trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少快递单号' }); continue; }
     const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [displayOrderId,req.authUser.username]);
     if (!orderResult.rows.length) { results.push({ orderId: displayOrderId, success: false, message: '订单不存在' }); continue; }
+    const eligibility = fulfillmentSubmissionEligibility(orderResult.rows);
+    if (!eligibility.allowed) { results.push({ orderId:displayOrderId,success:false,message:eligibility.message }); continue; }
+    const trackingNumber = String(trackingByOrder[displayOrderId] || '').trim();
+    if (!trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少国内快递单号，请填写后重新推送' }); continue; }
     const existingResult = await pool.query(`SELECT f.*,c.provider AS old_provider,c.provider_config AS old_provider_config
       FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
       WHERE f.owner_username=$2 AND f.order_id=$1`,[displayOrderId,req.authUser.username]);
@@ -7218,6 +7227,8 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
     if (String(submission.provider || 'generic') === 'yeeke') {
       const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [submission.order_id,req.authUser.username]);
       if (!orderResult.rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
+      const eligibility = fulfillmentSubmissionEligibility(orderResult.rows);
+      if (!eligibility.allowed) return res.status(409).json({ code:409,message:eligibility.message });
       const externalUserId = await getOrderExternalUserId(req.authUser.username);
       const pdfString = (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64');
       const retryServiceIds = (Array.isArray(submission.service_ids) ? submission.service_ids : []).map(Number).filter(Number.isFinite);
