@@ -17,6 +17,7 @@ const { orderSyncPageDecision,resolveRequestedOrderScope } = require('./order-sy
 const { resolveOfficialHandlingDeadline } = require('./order-deadline-policy');
 const { normalizeOrderItems } = require('./order-items');
 const { normalizeSummaryPeriod,buildOrderWorkbenchSummary } = require('./order-workbench-summary');
+const { DEFAULT_YEEKE_BASE_URL, createYeekeClient, buildYeekeOrderPayload } = require('./yeeke-client');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
@@ -349,12 +350,16 @@ async function initOrderManagementTables() {
       endpoint TEXT NOT NULL,
       auth_header VARCHAR(120),
       auth_value TEXT,
+      provider VARCHAR(40) NOT NULL DEFAULT 'generic',
+      provider_config TEXT,
       enabled BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
   await pool.query('ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
+  await pool.query("ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS provider VARCHAR(40) NOT NULL DEFAULT 'generic'");
+  await pool.query('ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS provider_config TEXT');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS erp_push_logs (
       id BIGSERIAL PRIMARY KEY,
@@ -6700,6 +6705,37 @@ app.delete('/api/admin/logistics-companies/:id', requireOrderAccess, async (req,
   res.json({ code: 0 });
 });
 
+function getYeekeConnectorConfig(connector) {
+  const encrypted = connector.provider_config || connector.auth_value;
+  if (!encrypted) throw new Error('Yeeke 连接器未配置凭证');
+  let config;
+  try { config = JSON.parse(decryptErpCredential(encrypted)); } catch (_) { throw new Error('Yeeke 连接器凭证格式无效'); }
+  if (!config.appId || !config.appSecret || !config.userName || !config.password || !config.warehouseCode) {
+    throw new Error('Yeeke 连接器配置不完整');
+  }
+  return config;
+}
+
+async function sendOrderToConnector(connector, row, options = {}, yeekeClient = null) {
+  if (String(connector.provider || 'generic') === 'yeeke') {
+    const config = getYeekeConnectorConfig(connector);
+    const client = yeekeClient || createYeekeClient(config);
+    if (!yeekeClient) await client.authorize(config.userName, config.password);
+    return client.createOrderV2(buildYeekeOrderPayload({
+      row: Array.isArray(row) ? row[0] : row,
+      rows: Array.isArray(row) ? row : undefined,
+      displayOrderId: options.displayOrderId,
+      warehouseCode: config.warehouseCode,
+      carrier: options.carrier,
+      trackingNumber: options.trackingNumber
+    }));
+  }
+  const headers = { 'Content-Type': 'application/json' };
+  if (connector.auth_header && connector.auth_value) headers[connector.auth_header] = decryptErpCredential(connector.auth_value);
+  const response = await axios.post(connector.endpoint, options.payload || { source: 'shanyue-erp', order: row.raw_data }, { headers, timeout: 30000, maxRedirects: 0 });
+  return response.data;
+}
+
 app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) => {
   const orderIds = [...new Set((Array.isArray(req.body?.orderIds) ? req.body.orderIds : []).map(String).filter(Boolean))];
   const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
@@ -6710,8 +6746,17 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
   const carrierResult = await pool.query('SELECT id FROM logistics_companies WHERE owner_username=$1 AND name=$2 AND enabled=TRUE',[req.authUser.username,carrier]);
   if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
   const serviceResult = serviceIds.length ? await pool.query('SELECT id,name,code,description FROM fulfillment_services WHERE owner_username=$2 AND enabled=TRUE AND id=ANY($1::bigint[])', [serviceIds,req.authUser.username]) : { rows: [] };
-  const warehouse = connectorResult.rows[0], headers = { 'Content-Type': 'application/json' };
-  if (warehouse.auth_header && warehouse.auth_value) headers[warehouse.auth_header] = decryptErpCredential(warehouse.auth_value);
+  const warehouse = connectorResult.rows[0];
+  let yeekeClient = null;
+  if (String(warehouse.provider || 'generic') === 'yeeke') {
+    try {
+      const config = getYeekeConnectorConfig(warehouse);
+      yeekeClient = createYeekeClient(config);
+      await yeekeClient.authorize(config.userName, config.password);
+    } catch (error) {
+      return res.status(502).json({ code: 502, message: `Yeeke 授权失败: ${error.response?.data?.message || error.message}` });
+    }
+  }
   const results = [];
   for (const displayOrderId of orderIds) {
     const trackingNumber = String(trackingByOrder[displayOrderId] || '').trim();
@@ -6720,8 +6765,8 @@ app.post('/api/admin/fulfillment/submit', requireOrderAccess, async (req, res) =
     if (!orderResult.rows.length) { results.push({ orderId: displayOrderId, success: false, message: '订单不存在' }); continue; }
     const payload = { source: 'shanyue-erp', action: 'fulfillment_label', order_id: displayOrderId, carrier, tracking_number: trackingNumber, value_added_services: serviceResult.rows, orders: orderResult.rows.map(row => row.raw_data) };
     try {
-      const pushed = await axios.post(warehouse.endpoint, payload, { headers, timeout: 30000, maxRedirects: 0 });
-      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed.data).slice(0,5000)]);
+      const pushed = await sendOrderToConnector(warehouse, orderResult.rows, { displayOrderId, carrier, trackingNumber, payload }, yeekeClient);
+      await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,service_ids,status,request_data,response_text,failure_reason) VALUES($1,$2,$3,$4,$5,$6::jsonb,'success',$7::jsonb,$8,NULL) ON CONFLICT(order_id) DO UPDATE SET owner_username=EXCLUDED.owner_username,warehouse_id=EXCLUDED.warehouse_id,carrier=EXCLUDED.carrier,tracking_number=EXCLUDED.tracking_number,service_ids=EXCLUDED.service_ids,status='success',request_data=EXCLUDED.request_data,response_text=EXCLUDED.response_text,failure_reason=NULL,updated_at=NOW()`, [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,JSON.stringify(serviceIds),JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000)]);
       results.push({ orderId: displayOrderId, success: true });
     } catch (error) {
       const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
@@ -6742,16 +6787,24 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
 });
 
 app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query(`SELECT f.*,c.endpoint,c.auth_header,c.auth_value FROM fulfillment_submissions f
+  const { rows } = await pool.query(`SELECT f.*,c.endpoint,c.auth_header,c.auth_value,c.provider,c.provider_config FROM fulfillment_submissions f
     JOIN erp_connectors c ON c.id=f.warehouse_id AND c.owner_username=f.owner_username
     WHERE f.id=$1 AND f.owner_username=$2`, [req.params.id,req.authUser.username]);
   const submission = rows[0];
   if (!submission) return res.status(404).json({ code: 404, message: '代贴单提交记录不存在' });
-  const headers = { 'Content-Type': 'application/json' };
-  if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
   try {
-    const response = await axios.post(submission.endpoint, submission.request_data, { headers, timeout: 30000, maxRedirects: 0 });
-    await pool.query(`UPDATE fulfillment_submissions SET status='success',response_text=$1,failure_reason=NULL,retry_count=retry_count+1,updated_at=NOW() WHERE id=$2 AND owner_username=$3`, [JSON.stringify(response.data).slice(0,5000),submission.id,req.authUser.username]);
+    let responseData;
+    if (String(submission.provider || 'generic') === 'yeeke') {
+      const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [submission.order_id,req.authUser.username]);
+      if (!orderResult.rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
+      responseData = await sendOrderToConnector(submission, orderResult.rows, { displayOrderId: submission.order_id, carrier: submission.carrier, trackingNumber: submission.tracking_number });
+    } else {
+      const headers = { 'Content-Type': 'application/json' };
+      if (submission.auth_header && submission.auth_value) headers[submission.auth_header] = decryptErpCredential(submission.auth_value);
+      const response = await axios.post(submission.endpoint, submission.request_data, { headers, timeout: 30000, maxRedirects: 0 });
+      responseData = response.data;
+    }
+    await pool.query(`UPDATE fulfillment_submissions SET status='success',response_text=$1,failure_reason=NULL,retry_count=retry_count+1,updated_at=NOW() WHERE id=$2 AND owner_username=$3`, [JSON.stringify(responseData).slice(0,5000),submission.id,req.authUser.username]);
     res.json({ code: 0, message: '重试成功' });
   } catch (error) {
     const reason = String(error.response?.data?.message || error.message || '重试失败').slice(0,2000);
@@ -6761,19 +6814,53 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
 });
 
 app.get('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,name,endpoint,auth_header AS "authHeader",enabled,created_at AS "createdAt" FROM erp_connectors WHERE owner_username=$1 ORDER BY id DESC',[req.authUser.username]);
-  res.json({ code: 0, data: rows });
+  const { rows } = await pool.query('SELECT id,name,endpoint,provider,provider_config,auth_header AS "authHeader",enabled,created_at AS "createdAt" FROM erp_connectors WHERE owner_username=$1 ORDER BY id DESC',[req.authUser.username]);
+  const data = rows.map(({ provider_config: providerConfig, ...row }) => {
+    let warehouseCode = '';
+    if (row.provider === 'yeeke' && providerConfig) {
+      try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不向前端暴露损坏的凭据内容 */ }
+    }
+    return { ...row, hasProviderConfig: Boolean(providerConfig), warehouseCode };
+  });
+  res.json({ code: 0, data });
 });
 
 app.post('/api/admin/erp-connectors', requireOrderAccess, async (req, res) => {
   const { name, endpoint, authHeader, authValue } = req.body || {};
-  if (!name || !endpoint) return res.status(400).json({ code: 400, message: '缺少连接名称或推单地址' });
-  let target; try { target = new URL(endpoint); } catch { return res.status(400).json({ code: 400, message: '推单地址格式错误' }); }
+  const provider = String(req.body?.provider || 'generic').trim().toLowerCase() === 'yeeke' ? 'yeeke' : 'generic';
+  if (!name) return res.status(400).json({ code: 400, message: '缺少连接名称' });
+  let target;
+  let providerConfig = '';
+  if (provider === 'yeeke') {
+    const config = {
+      baseUrl: String(req.body?.baseUrl || DEFAULT_YEEKE_BASE_URL).trim(),
+      appId: String(req.body?.appId || '').trim(),
+      appSecret: String(req.body?.appSecret || '').trim(),
+      userName: String(req.body?.userName || '').trim(),
+      password: String(req.body?.password || ''),
+      warehouseCode: String(req.body?.warehouseCode || '').trim()
+    };
+    if (!config.appId || !config.appSecret || !config.userName || !config.password || !config.warehouseCode) return res.status(400).json({ code: 400, message: 'Yeeke 配置不完整' });
+    try { target = new URL(`${config.baseUrl.replace(/\/+$/, '')}/agent-foreign/erp/api/order/create/v2`); } catch { return res.status(400).json({ code: 400, message: 'Yeeke 地址格式错误' }); }
+    if (target.hostname !== 'mi.yeeke.com') return res.status(400).json({ code: 400, message: 'Yeeke 生产连接只允许 mi.yeeke.com' });
+    try {
+      const client = createYeekeClient(config);
+      await client.authorize(config.userName, config.password);
+      const warehouses = await client.listWarehouses();
+      if (!Array.isArray(warehouses) || !warehouses.some(item => String(item.wareHouse) === config.warehouseCode)) return res.status(400).json({ code: 400, message: 'Yeeke 账号下不存在所选仓库代码' });
+    } catch (error) {
+      return res.status(502).json({ code: 502, message: `Yeeke 配置验证失败: ${error.response?.data?.message || error.message}` });
+    }
+    try { providerConfig = encryptErpCredential(JSON.stringify(config)); } catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
+  } else {
+    if (!endpoint) return res.status(400).json({ code: 400, message: '缺少推单地址' });
+    try { target = new URL(endpoint); } catch { return res.status(400).json({ code: 400, message: '推单地址格式错误' }); }
+  }
   if (target.protocol !== 'https:' || /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(target.hostname)) return res.status(400).json({ code: 400, message: '只允许公网 HTTPS 推单地址' });
   let encryptedAuth;
-  try { encryptedAuth = encryptErpCredential(String(authValue || '').slice(0,2000)); }
+  try { encryptedAuth = provider === 'yeeke' ? '' : encryptErpCredential(String(authValue || '').slice(0,2000)); }
   catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
-  const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value) VALUES($1,$2,$3,$4,$5) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, String(authHeader || '').slice(0,120), encryptedAuth]);
+  const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value,provider,provider_config) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, provider === 'yeeke' ? 'yeeke' : String(authHeader || '').slice(0,120), encryptedAuth, provider, providerConfig]);
   res.json({ code: 0, data: { id: rows[0].id } });
 });
 
@@ -6786,13 +6873,12 @@ app.post('/api/admin/orders/:orderId/push', requireOrderAccess, async (req, res)
   const order = await pool.query('SELECT * FROM ml_orders WHERE ml_order_id=$1 AND owner_username=$2', [req.params.orderId,req.authUser.username]);
   const connector = await pool.query('SELECT * FROM erp_connectors WHERE id=$1 AND owner_username=$2 AND enabled=TRUE', [req.body?.connectorId,req.authUser.username]);
   if (!order.rows[0] || !connector.rows[0]) return res.status(404).json({ code: 404, message: '订单或ERP连接不存在' });
-  const c = connector.rows[0], headers = { 'Content-Type': 'application/json' };
+  const c = connector.rows[0];
   try {
-    if (c.auth_header && c.auth_value) headers[c.auth_header] = decryptErpCredential(c.auth_value);
-    const pushed = await axios.post(c.endpoint, { source: 'shanyue-erp', order: order.rows[0].raw_data }, { headers, timeout: 30000, maxRedirects: 0 });
+    const pushed = await sendOrderToConnector(c, order.rows[0]);
     await pool.query("UPDATE ml_orders SET push_status='success',last_pushed_at=NOW() WHERE ml_order_id=$1 AND owner_username=$2", [req.params.orderId,req.authUser.username]);
-    await pool.query('INSERT INTO erp_push_logs(owner_username,order_id,connector_id,success,http_status,response_text) VALUES($1,$2,$3,TRUE,$4,$5)', [req.authUser.username,req.params.orderId,c.id,pushed.status,JSON.stringify(pushed.data).slice(0,5000)]);
-    res.json({ code: 0, data: { status: pushed.status } });
+    await pool.query('INSERT INTO erp_push_logs(owner_username,order_id,connector_id,success,http_status,response_text) VALUES($1,$2,$3,TRUE,$4,$5)', [req.authUser.username,req.params.orderId,c.id,200,JSON.stringify(pushed).slice(0,5000)]);
+    res.json({ code: 0, data: { status: 200, result: pushed } });
   } catch (e) {
     await pool.query("UPDATE ml_orders SET push_status='failed',last_pushed_at=NOW() WHERE ml_order_id=$1 AND owner_username=$2", [req.params.orderId,req.authUser.username]);
     await pool.query('INSERT INTO erp_push_logs(owner_username,order_id,connector_id,success,http_status,response_text) VALUES($1,$2,$3,FALSE,$4,$5)', [req.authUser.username,req.params.orderId,c.id,e.response?.status || null,JSON.stringify(e.response?.data || e.message).slice(0,5000)]);

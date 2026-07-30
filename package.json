@@ -19,6 +19,7 @@
     "test:miniprogram": "node scripts/test-wechat-miniprogram.js",
     "test:webhook": "node scripts/test-mercadolibre-webhook.js",
     "test:wechat-official": "node scripts/test-wechat-official-account.js",
+    "test:yeeke": "node scripts/test-yeeke-client.js",
     "test:marketing-api": "node scripts/test-marketing-api-policy.js"
   },
   "dependencies": {
