@@ -1,7 +1,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { canAccessOrderManagement, canManageWarehouses } = require('../order-warehouse-policy');
+const { canAccessOrderManagement, canManageWarehouses, formatWarehouseAddressForUser } = require('../order-warehouse-policy');
 const { fulfillmentSubmissionEligibility } = require('../order-fulfillment-policy');
 
 for (const role of ['admin', 'agent', 'user']) {
@@ -13,6 +13,14 @@ assert.strictEqual(canAccessOrderManagement({ role: 'guest', username: 'CNTORO' 
 assert.strictEqual(canManageWarehouses({ role: 'admin' }), true);
 assert.strictEqual(canManageWarehouses({ role: 'agent' }), false);
 assert.strictEqual(canManageWarehouses({ role: 'user' }), false);
+
+const formattedAddress = formatWarehouseAddressForUser({
+  recipientName:'山月',address:'浙江省义乌市测试路 1 号',phone:'13800000000',postalCode:'322000'
+},'sy43571');
+assert.strictEqual(formattedAddress.recipientDisplay,'山月（SY43571）');
+assert.strictEqual(formattedAddress.addressDisplay,'浙江省义乌市测试路 1 号（SY43571）');
+assert.strictEqual(formattedAddress.phone,'13800000000');
+assert.strictEqual(formattedAddress.postalCode,'322000');
 
 assert.deepStrictEqual(fulfillmentSubmissionEligibility([{ status:'paid',shipment_status:'ready_to_ship',refund_amount:0 }]), { allowed:true,message:'' });
 for (const [row,reason] of [
@@ -49,8 +57,13 @@ for (const route of [
   "app.post('/api/admin/fulfillment-services', requireAdmin",
   "app.delete('/api/admin/fulfillment-services/:id', requireAdmin",
   "app.post('/api/admin/logistics-companies', requireAdmin",
-  "app.delete('/api/admin/logistics-companies/:id', requireAdmin"
+  "app.delete('/api/admin/logistics-companies/:id', requireAdmin",
+  "app.post('/api/admin/warehouse-addresses', requireAdmin",
+  "app.put('/api/admin/warehouse-addresses/:id', requireAdmin",
+  "app.delete('/api/admin/warehouse-addresses/:id', requireAdmin"
 ]) assert.ok(serverSource.includes(route), `${route} must stay admin-only`);
+assert.ok(serverSource.includes("app.get('/api/admin/warehouse-addresses', requireOrderAccess"), 'all order-management users must be able to read the shared address catalog');
+assert.ok(serverSource.includes("JOIN users u ON u.username=wa.owner_username AND u.role='admin'"), 'only administrator-owned addresses may enter the shared catalog');
 assert.ok(serverSource.includes("JOIN users u ON u.username=c.owner_username AND u.role='admin'"), 'warehouse reads must use the shared admin catalog');
 assert.ok(serverSource.includes("WHERE c.id=$1 AND c.enabled=TRUE"), 'order submission must accept an enabled shared admin warehouse');
 assert.ok(serverSource.includes('UPDATE erp_connectors c SET owner_username='), 'legacy user-owned warehouses must be adopted by an administrator');
@@ -99,6 +112,8 @@ assert.ok(orderFrontendSource.includes('重新提交代贴单'), 'successful sub
 assert.ok(orderFrontendSource.includes('resubmitOrderIds'), 'the second-push action must identify resubmitted orders to the API');
 assert.ok(orderFrontendSource.includes('www.kuaidi100.com/chaxun'), 'domestic tracking must open a prefilled Kuaidi100 web query');
 assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.includes('shunfeng') && orderFrontendSource.includes('jtexpress'), 'common domestic carriers must be mapped for automatic query filling');
+assert.ok(orderFrontendSource.includes('仓库收货地址') && orderFrontendSource.includes('recipientDisplay') && orderFrontendSource.includes('addressDisplay'), 'the workbench must render user-specific shared warehouse addresses');
+assert.ok(orderFrontendSource.includes('/api/admin/warehouse-addresses'), 'the workbench must load and manage warehouse addresses through the protected API');
 assert.ok(orderFrontendSource.includes('二次推单会在新仓库创建新订单'), 'the UI must explain the second-push and previous-order cancellation flow');
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');

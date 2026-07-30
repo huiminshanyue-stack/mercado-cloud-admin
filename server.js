@@ -1,5 +1,5 @@
 const express = require('express');
-const { canAccessOrderManagement } = require('./order-warehouse-policy');
+const { canAccessOrderManagement, formatWarehouseAddressForUser } = require('./order-warehouse-policy');
 const { fulfillmentSubmissionEligibility } = require('./order-fulfillment-policy');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
@@ -432,6 +432,19 @@ async function initOrderManagementTables() {
     id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120) NOT NULL,
     name VARCHAR(120) NOT NULL, code VARCHAR(100), enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(owner_username,name)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS warehouse_addresses (
+    id BIGSERIAL PRIMARY KEY,
+    owner_username VARCHAR(120) NOT NULL,
+    warehouse_name VARCHAR(120) NOT NULL,
+    recipient_name VARCHAR(120) NOT NULL DEFAULT '山月',
+    address TEXT NOT NULL,
+    phone VARCHAR(40) NOT NULL,
+    postal_code VARCHAR(30) NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(owner_username,warehouse_name)
   )`);
   await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_submissions (
     id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120), order_id VARCHAR(80) NOT NULL, warehouse_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
@@ -3129,7 +3142,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.20',
+    version: '2026-07-31.21',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3155,6 +3168,9 @@ app.get('/api/health/order-management', (req, res) => {
     domesticLogisticsTracking: true,
     domesticLogisticsMode: 'kuaidi100-prefilled-web-query',
     domesticLogisticsApiQuotaRequired: false,
+    sharedWarehouseAddressCatalog: true,
+    warehouseAddressWriteRole: 'admin',
+    warehouseAddressUserIdentitySuffix: 'SY00000',
     fulfillmentWarehouseCorrection: 'second-push-and-cancel-previous',
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
@@ -6855,6 +6871,84 @@ app.post('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
 app.delete('/api/admin/logistics-companies/:id', requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM logistics_companies WHERE id=$1 AND owner_username=$2',[req.params.id,req.authUser.username]);
   res.json({ code: 0 });
+});
+
+function warehouseAddressInput(body = {}) {
+  return {
+    warehouseName: String(body.warehouseName || '').trim().slice(0,120),
+    recipientName: String(body.recipientName || '山月').trim().slice(0,120) || '山月',
+    address: String(body.address || '').trim().slice(0,1000),
+    phone: String(body.phone || '').trim().slice(0,40),
+    postalCode: String(body.postalCode || '').trim().slice(0,30)
+  };
+}
+
+function validateWarehouseAddressInput(input) {
+  if (!input.warehouseName) return '仓库名称不能为空';
+  if (!input.address) return '仓库地址不能为空';
+  if (!input.phone) return '手机号不能为空';
+  if (!input.postalCode) return '邮编不能为空';
+  return '';
+}
+
+app.get('/api/admin/warehouse-addresses', requireOrderAccess, async (req, res) => {
+  try {
+    const [externalUserId,{ rows }] = await Promise.all([
+      getOrderExternalUserId(req.authUser.username),
+      pool.query(`SELECT wa.id,wa.warehouse_name AS "warehouseName",wa.recipient_name AS "recipientName",
+        wa.address,wa.phone,wa.postal_code AS "postalCode",wa.created_at AS "createdAt",wa.updated_at AS "updatedAt"
+        FROM warehouse_addresses wa JOIN users u ON u.username=wa.owner_username AND u.role='admin'
+        WHERE wa.enabled=TRUE ORDER BY wa.id DESC`)
+    ]);
+    res.json({ code:0,data:rows.map(row => formatWarehouseAddressForUser(row,externalUserId)) });
+  } catch (error) {
+    console.error('[Orders] warehouse address list failed:',error.message);
+    res.status(500).json({ code:500,message:'仓库地址读取失败' });
+  }
+});
+
+app.post('/api/admin/warehouse-addresses', requireAdmin, async (req, res) => {
+  const input = warehouseAddressInput(req.body);
+  const message = validateWarehouseAddressInput(input);
+  if (message) return res.status(400).json({ code:400,message });
+  try {
+    const { rows } = await pool.query(`INSERT INTO warehouse_addresses(owner_username,warehouse_name,recipient_name,address,phone,postal_code)
+      VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [req.authUser.username,input.warehouseName,input.recipientName,input.address,input.phone,input.postalCode]);
+    res.json({ code:0,data:{ id:rows[0].id },message:'仓库地址已添加' });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ code:409,message:'该仓库名称的地址已经存在，可点击编辑进行修改' });
+    console.error('[Orders] warehouse address create failed:',error.message);
+    res.status(500).json({ code:500,message:'仓库地址保存失败' });
+  }
+});
+
+app.put('/api/admin/warehouse-addresses/:id', requireAdmin, async (req, res) => {
+  const input = warehouseAddressInput(req.body);
+  const message = validateWarehouseAddressInput(input);
+  if (message) return res.status(400).json({ code:400,message });
+  try {
+    const { rowCount } = await pool.query(`UPDATE warehouse_addresses SET warehouse_name=$1,recipient_name=$2,address=$3,phone=$4,postal_code=$5,updated_at=NOW()
+      WHERE id=$6 AND owner_username=$7`,
+    [input.warehouseName,input.recipientName,input.address,input.phone,input.postalCode,req.params.id,req.authUser.username]);
+    if (!rowCount) return res.status(404).json({ code:404,message:'仓库地址不存在或无权修改' });
+    res.json({ code:0,message:'仓库地址已更新' });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ code:409,message:'该仓库名称的地址已经存在' });
+    console.error('[Orders] warehouse address update failed:',error.message);
+    res.status(500).json({ code:500,message:'仓库地址修改失败' });
+  }
+});
+
+app.delete('/api/admin/warehouse-addresses/:id', requireAdmin, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query('DELETE FROM warehouse_addresses WHERE id=$1 AND owner_username=$2',[req.params.id,req.authUser.username]);
+    if (!rowCount) return res.status(404).json({ code:404,message:'仓库地址不存在或无权删除' });
+    res.json({ code:0,message:'仓库地址已删除' });
+  } catch (error) {
+    console.error('[Orders] warehouse address delete failed:',error.message);
+    res.status(500).json({ code:500,message:'仓库地址删除失败' });
+  }
 });
 
 function getYeekeConnectorConfig(connector) {

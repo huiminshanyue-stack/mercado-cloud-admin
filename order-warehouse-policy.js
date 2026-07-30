@@ -11,4 +11,19 @@ function canManageWarehouses(user = {}) {
   return String(user.role || '').trim().toLowerCase() === 'admin';
 }
 
-module.exports = { canAccessOrderManagement, canManageWarehouses };
+function formatWarehouseAddressForUser(address = {}, externalUserId = '') {
+  const userId = String(externalUserId || '').trim().toUpperCase();
+  const suffix = /^SY\d{5}$/.test(userId) ? `（${userId}）` : '';
+  const recipientName = String(address.recipientName || address.recipient_name || '山月').trim() || '山月';
+  const addressText = String(address.address || '').trim();
+  return {
+    ...address,
+    recipientName,
+    recipientDisplay: `${recipientName}${suffix}`,
+    address: addressText,
+    addressDisplay: `${addressText}${suffix}`,
+    userIdentity: userId
+  };
+}
+
+module.exports = { canAccessOrderManagement, canManageWarehouses, formatWarehouseAddressForUser };
