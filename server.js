@@ -479,6 +479,34 @@ async function initOrderManagementTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_order ON fulfillment_submissions(owner_username,order_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_warehouse ON fulfillment_submissions(owner_username,warehouse_id)');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_submissions_billing_key ON fulfillment_submissions(owner_username,billing_key) WHERE billing_key IS NOT NULL');
+  await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_agent_rebate_rules (
+    agent_username VARCHAR(120) PRIMARY KEY,
+    amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by VARCHAR(120),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_agent_rebates (
+    id BIGSERIAL PRIMARY KEY,
+    agent_username VARCHAR(120) NOT NULL,
+    user_username VARCHAR(120) NOT NULL,
+    order_id VARCHAR(80) NOT NULL,
+    fulfillment_submission_id BIGINT,
+    submission_seq INTEGER NOT NULL DEFAULT 0,
+    warehouse_id BIGINT,
+    entry_type VARCHAR(40) NOT NULL DEFAULT 'fulfillment_order',
+    amount NUMERIC(12,2) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'pending',
+    event_key VARCHAR(300) NOT NULL UNIQUE,
+    reversal_of_id BIGINT,
+    note TEXT NOT NULL DEFAULT '',
+    settled_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_agent_rebates_agent ON fulfillment_agent_rebates(agent_username,created_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_agent_rebates_user_order ON fulfillment_agent_rebates(user_username,order_id)');
   await pool.query('ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS unit_price NUMERIC(12,2) NOT NULL DEFAULT 0');
   await pool.query(`CREATE TABLE IF NOT EXISTS order_message_reads (
     owner_username VARCHAR(120) NOT NULL, thread_type VARCHAR(30) NOT NULL,
@@ -3145,7 +3173,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.27',
+    version: '2026-07-31.28',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3164,6 +3192,11 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentReturnClearsWarehouse: true,
     fulfillmentReturnMarker: true,
     yeekeReturnLookupFallbackWithoutWarehouse: true,
+    fulfillmentAgentRebateTestLedger: true,
+    fulfillmentAgentRebateFixedPerOrder: true,
+    fulfillmentAgentRebateExcludesValueAddedServices: true,
+    fulfillmentAgentRebateReversesOnReturn: true,
+    fulfillmentAgentRebateResubmitCreatesNewEntry: true,
     orderCardFontSize: '12px',
     batchLabelPrint: true,
     batchLabelPrintScope: 'current-user-ready-to-ship-orders',
@@ -7155,7 +7188,7 @@ async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,for
     }
     params.push(Math.min(100,Math.max(1,Number(limit) || 50)));
     const staleFilter = force ? '' : " AND (f.remote_checked_at IS NULL OR f.remote_checked_at<NOW()-INTERVAL '2 minutes')";
-    const { rows } = await pool.query(`SELECT f.id,f.owner_username,f.order_id,f.provider_order_number,f.warehouse_id,
+    const { rows } = await pool.query(`SELECT f.id,f.owner_username,f.order_id,f.provider_order_number,f.warehouse_id,f.resubmit_count,
       c.provider_config FROM fulfillment_submissions f
       JOIN erp_connectors c ON c.id=f.warehouse_id
       WHERE f.status='success' AND c.provider='yeeke'${ownerFilter}${staleFilter}
@@ -7200,6 +7233,12 @@ async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,for
           [remoteStatus || '7',reason,submission.id,submission.owner_username]);
           if (updateResult.rowCount) {
             returned++;
+            try {
+              await reverseFulfillmentAgentRebate({ submissionId:submission.id,
+                submissionSeq:Number(submission.resubmit_count || 0),reason });
+            } catch (rebateError) {
+              console.error('[Fulfillment rebate] reversal failed:',rebateError.message);
+            }
             await pool.query(`INSERT INTO order_alerts(owner_username,order_id,alert_type,title,content,event_key)
               VALUES($1,$2,'fulfillment_return','代贴单已被仓库退回',$3,$4) ON CONFLICT(event_key) DO NOTHING`,
             [submission.owner_username,submission.order_id,reason,
@@ -7234,6 +7273,119 @@ function startYeekeSubmissionStatusSync() {
   yeekeSubmissionStatusSyncTimer = setInterval(tick,2*60*1000);
   yeekeSubmissionStatusSyncTimer.unref?.();
 }
+
+async function recordFulfillmentAgentRebate({ ownerUsername,orderId,submissionId,submissionSeq = 0,warehouseId = null }) {
+  const eventKey = `fulfillment-rebate:${ownerUsername}:${orderId}:${Number(submissionSeq) || 0}`;
+  const { rows } = await pool.query(`INSERT INTO fulfillment_agent_rebates(
+      agent_username,user_username,order_id,fulfillment_submission_id,submission_seq,warehouse_id,
+      entry_type,amount,status,event_key,note)
+    SELECT agent.username,customer.username,$2,$3,$4,$5,'fulfillment_order',rule.amount,'pending',$6,
+      CONCAT('受邀用户 ',customer.username,' 提交代贴单 ', $2, '，固定返利 ',TO_CHAR(rule.amount,'FM999999990.00'),' 元')
+    FROM users customer
+    JOIN users agent ON agent.username=customer.created_by AND agent.role='agent'
+    JOIN fulfillment_agent_rebate_rules rule ON rule.agent_username=agent.username AND rule.enabled=TRUE AND rule.amount>0
+    WHERE customer.username=$1
+    ON CONFLICT(event_key) DO NOTHING
+    RETURNING id,agent_username AS "agentUsername",user_username AS "userUsername",order_id AS "orderId",
+      amount,status,event_key AS "eventKey",created_at AS "createdAt"`,[
+    ownerUsername,String(orderId),submissionId || null,Math.max(0,Number(submissionSeq) || 0),warehouseId || null,eventKey
+  ]);
+  return rows[0] || null;
+}
+
+async function reverseFulfillmentAgentRebate({ submissionId,submissionSeq = 0,reason = '' }) {
+  const { rows } = await pool.query(`SELECT * FROM fulfillment_agent_rebates
+    WHERE fulfillment_submission_id=$1 AND submission_seq=$2 AND entry_type='fulfillment_order'
+    ORDER BY id DESC LIMIT 1`,[submissionId,Math.max(0,Number(submissionSeq) || 0)]);
+  const original = rows[0];
+  if (!original) return null;
+  const eventKey = `fulfillment-rebate-return:${submissionId}:${Math.max(0,Number(submissionSeq) || 0)}`;
+  const reversal = await pool.query(`INSERT INTO fulfillment_agent_rebates(
+      agent_username,user_username,order_id,fulfillment_submission_id,submission_seq,warehouse_id,
+      entry_type,amount,status,event_key,reversal_of_id,note,settled_at)
+    VALUES($1,$2,$3,$4,$5,$6,'fulfillment_return_reversal',$7,'settled',$8,$9,$10,NOW())
+    ON CONFLICT(event_key) DO NOTHING
+    RETURNING id,agent_username AS "agentUsername",user_username AS "userUsername",order_id AS "orderId",
+      amount,status,event_key AS "eventKey",created_at AS "createdAt"`,[
+    original.agent_username,original.user_username,original.order_id,submissionId,
+    Math.max(0,Number(submissionSeq) || 0),original.warehouse_id,-Math.abs(Number(original.amount || 0)),eventKey,original.id,
+    `仓库退回订单 ${original.order_id}，冲正代理返利：${String(reason || '仓库退单').slice(0,500)}`
+  ]);
+  await pool.query(`UPDATE fulfillment_agent_rebates SET status='reversed',updated_at=NOW()
+    WHERE id=$1 AND status<>'reversed'`,[original.id]);
+  return reversal.rows[0] || null;
+}
+
+function requireAgentOrAdmin(req,res,next) {
+  if (!['admin','agent'].includes(req.authUser?.role)) return res.status(403).json({ code:403,message:'仅管理员和代理可查看返利流水' });
+  next();
+}
+
+app.get('/api/admin/fulfillment-agent-rebate-rules', requireAdmin, async (req,res) => {
+  const { rows } = await pool.query(`SELECT agent.username AS "agentUsername",agent.nickname,
+    COALESCE(rule.amount,0)::float AS amount,COALESCE(rule.enabled,FALSE) AS enabled,rule.updated_at AS "updatedAt"
+    FROM users agent LEFT JOIN fulfillment_agent_rebate_rules rule ON rule.agent_username=agent.username
+    WHERE agent.role='agent' ORDER BY agent.username`);
+  res.json({ code:0,data:rows });
+});
+
+app.post('/api/admin/fulfillment-agent-rebate-rules', requireAdmin, async (req,res) => {
+  const agentUsername = String(req.body?.agentUsername || '').trim();
+  const amount = Number(req.body?.amount);
+  const enabled = req.body?.enabled !== false;
+  if (!agentUsername || !Number.isFinite(amount) || amount < 0 || amount > 10000) {
+    return res.status(400).json({ code:400,message:'请选择代理并填写有效的每单返利金额' });
+  }
+  const agent = await pool.query("SELECT username FROM users WHERE username=$1 AND role='agent'",[agentUsername]);
+  if (!agent.rows.length) return res.status(404).json({ code:404,message:'代理账号不存在' });
+  const { rows } = await pool.query(`INSERT INTO fulfillment_agent_rebate_rules(agent_username,amount,enabled,updated_by)
+    VALUES($1,$2,$3,$4) ON CONFLICT(agent_username) DO UPDATE SET
+      amount=EXCLUDED.amount,enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,updated_at=NOW()
+    RETURNING agent_username AS "agentUsername",amount::float,enabled,updated_at AS "updatedAt"`,[
+    agentUsername,Number(amount.toFixed(2)),enabled,req.authUser.username
+  ]);
+  res.json({ code:0,data:rows[0],message:'代理每单返利设置已保存' });
+});
+
+app.get('/api/admin/fulfillment-agent-rebates', requireAuth, requireAgentOrAdmin, async (req,res) => {
+  const page = Math.max(1,Number(req.query.page) || 1);
+  const size = Math.min(100,Math.max(1,Number(req.query.size) || 20));
+  const params = [];
+  const where = [];
+  if (req.authUser.role === 'agent') {
+    params.push(req.authUser.username);
+    where.push(`r.agent_username=$${params.length}`);
+  } else if (req.query.agentUsername) {
+    params.push(String(req.query.agentUsername));
+    where.push(`r.agent_username=$${params.length}`);
+  }
+  if (req.query.userUsername) { params.push(String(req.query.userUsername));where.push(`r.user_username=$${params.length}`); }
+  if (req.query.orderId) { params.push(String(req.query.orderId));where.push(`r.order_id=$${params.length}`); }
+  if (req.query.status) { params.push(String(req.query.status));where.push(`r.status=$${params.length}`); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const count = await pool.query(`SELECT COUNT(*)::int AS total FROM fulfillment_agent_rebates r ${clause}`,params);
+  const summary = await pool.query(`SELECT
+      COALESCE(SUM(amount) FILTER (WHERE status='pending'),0)::float AS "pendingAmount",
+      COUNT(*) FILTER (WHERE status='pending')::int AS "pendingCount",
+      COALESCE(SUM(amount) FILTER (WHERE status IN ('settled','reversed')),0)::float AS "settledAmount",
+      COALESCE(SUM(amount),0)::float AS "netAmount"
+    FROM fulfillment_agent_rebates r ${clause}`,params);
+  const listParams = [...params,size,(page-1)*size];
+  const { rows } = await pool.query(`SELECT id,agent_username AS "agentUsername",user_username AS "userUsername",
+      order_id AS "orderId",submission_seq AS "submissionSeq",entry_type AS "entryType",amount::float,status,
+      event_key AS "eventKey",reversal_of_id AS "reversalOfId",note,settled_at AS "settledAt",created_at AS "createdAt"
+    FROM fulfillment_agent_rebates r ${clause} ORDER BY created_at DESC,id DESC
+    LIMIT $${listParams.length-1} OFFSET $${listParams.length}`,listParams);
+  res.json({ code:0,data:{ items:rows,total:count.rows[0].total,page,size,summary:summary.rows[0] } });
+});
+
+app.post('/api/admin/fulfillment-agent-rebates/:id/settle', requireAdmin, async (req,res) => {
+  const { rows } = await pool.query(`UPDATE fulfillment_agent_rebates SET status='settled',settled_at=NOW(),updated_at=NOW()
+    WHERE id=$1 AND entry_type='fulfillment_order' AND status='pending'
+    RETURNING id,agent_username AS "agentUsername",amount::float,status,settled_at AS "settledAt"`,[req.params.id]);
+  if (!rows.length) return res.status(409).json({ code:409,message:'该返利不是待结算状态' });
+  res.json({ code:0,data:rows[0],message:'返利已标记结算（测试账本不修改主站余额）' });
+});
 
 async function handleFulfillmentSubmit(req, res) {
   const orderIds = [...new Set((Array.isArray(req.body?.orderIds) ? req.body.orderIds : []).map(String).filter(Boolean))];
@@ -7346,13 +7498,35 @@ async function handleFulfillmentSubmit(req, res) {
         }
         await pool.query('UPDATE fulfillment_submissions SET response_text=$1,updated_at=NOW() WHERE id=$2 AND owner_username=$3',
         [JSON.stringify({ pushed,previousOrderCancellation: cancellationWarning ? { success:false,message:cancellationWarning } : { success:true } }).slice(0,5000),existing.id,req.authUser.username]);
+        let rebate = null;
+        let rebateWarning = '';
+        try {
+          rebate = await recordFulfillmentAgentRebate({ ownerUsername:req.authUser.username,orderId:displayOrderId,
+            submissionId:existing.id,submissionSeq:Number(existing.resubmit_count || 0) + 1,warehouseId });
+        } catch (rebateError) {
+          rebateWarning = `代贴单已成功，但代理返利流水写入失败：${rebateError.message}`;
+          console.error('[Fulfillment rebate] record failed:',rebateError.message);
+        }
         results.push({ orderId:displayOrderId,success:true,resubmitted:true,providerOrderNumber,warning:cancellationWarning,
+          rebate,rebateWarning,
           billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
       } else {
-        await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'success',$10::jsonb,$11,NULL,$12,$13,$14,'reserved',$15,FALSE,NULL,NULL,NULL)`,
-        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey]);
-        results.push({ orderId:displayOrderId,success:true,providerOrderNumber,billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
+        const insertedSubmission = await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'success',$10::jsonb,$11,NULL,$12,$13,$14,'reserved',$15,FALSE,NULL,NULL,NULL)
+          RETURNING id`,
+        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey],
+        );
+        let rebate = null;
+        let rebateWarning = '';
+        try {
+          rebate = await recordFulfillmentAgentRebate({ ownerUsername:req.authUser.username,orderId:displayOrderId,
+            submissionId:insertedSubmission.rows[0]?.id,submissionSeq:0,warehouseId });
+        } catch (rebateError) {
+          rebateWarning = `代贴单已成功，但代理返利流水写入失败：${rebateError.message}`;
+          console.error('[Fulfillment rebate] record failed:',rebateError.message);
+        }
+        results.push({ orderId:displayOrderId,success:true,providerOrderNumber,rebate,rebateWarning,
+          billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
       }
     } catch (error) {
       const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
