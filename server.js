@@ -3173,7 +3173,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.29',
+    version: '2026-07-31.30',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3220,7 +3220,7 @@ app.get('/api/health/order-management', (req, res) => {
     yeekeValueAddedServiceSync: true,
     yeekeValueAddedServicePayloadField: 'selectProList',
     yeekeErpOrderNumberFormat: 'SY00000',
-    yeekeIdentityFields: ['note','erpOrdersn','shopId'],
+    yeekeIdentityFields: ['note','erpOrdersn','erpOrderSn','shopID'],
     yeekeAirwaybillTrackingField: 'trackingNo',
     yeekeDomesticExpressField: 'orderItems[].expressInfos[]',
     fulfillmentShippingQuantity: true,

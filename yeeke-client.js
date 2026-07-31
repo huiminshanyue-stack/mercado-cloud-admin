@@ -302,7 +302,12 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   const payload = {
     ordersn: orderId,
     erpOrdersn: identity,
-    shopId: identity,
+    // Yeeke distinguishes shopID (the external shop identifier) from shopId.
+    // Sending the latter with a SY value makes the warehouse render it as shopName.
+    shopID: identity,
+    // Keep the camel-case spelling accepted by newer Yeeke deployments for the
+    // third-party order number; older deployments continue to read erpOrdersn.
+    erpOrderSn: identity,
     note: externalUserId ? `山月ERP ${identity}` : '山月ERP',
     pdfString: pdfString || undefined,
     trackingNo: officialTrackingNumber || undefined,

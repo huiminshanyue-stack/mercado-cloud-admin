@@ -129,7 +129,9 @@ async function run() {
   assert.strictEqual(payload.receiverInfo.zipcode, '123');
   assert.strictEqual(payload.receiverInfo.fullAddress, 'Street 1');
   assert.strictEqual(payload.erpOrdersn, 'SY12345');
-  assert.strictEqual(payload.shopId, 'SY12345');
+  assert.strictEqual(payload.shopID, 'SY12345');
+  assert.strictEqual(payload.shopId, undefined);
+  assert.strictEqual(payload.erpOrderSn, 'SY12345');
   assert.strictEqual(payload.note, '山月ERP SY12345');
   assert.strictEqual(payload.pdfString, 'JVBERi0xLjQ=');
   assert.strictEqual(payload.trackingNo, 'INTL-ML-9988');
@@ -145,6 +147,8 @@ async function run() {
   });
   assert.strictEqual(replacementPayload.ordersn, '200001-R123456');
   assert.strictEqual(replacementPayload.erpOrdersn, 'SY12345');
+  assert.strictEqual(replacementPayload.erpOrderSn, 'SY12345');
+  assert.strictEqual(replacementPayload.shopID, 'SY12345');
 
   const packPayload = buildYeekeOrderPayload({
     rows: [
