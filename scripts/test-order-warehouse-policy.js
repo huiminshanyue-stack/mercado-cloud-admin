@@ -40,6 +40,10 @@ assert.strictEqual(fulfillmentSubmissionEligibility([
 ]).allowed,false,'a mixed-status pack must be rejected');
 
 const serverSource = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+const returnSyncSource = serverSource.slice(
+  serverSource.indexOf('async function syncYeekeSubmissionStatuses'),
+  serverSource.indexOf('function startYeekeSubmissionStatusSync')
+);
 const yeekeSource = fs.readFileSync(path.join(__dirname, '..', 'yeeke-client.js'), 'utf8');
 const miniDetailSource = fs.readFileSync(path.join(__dirname, '..', 'order-miniprogram', 'miniprogram', 'pages', 'order-detail', 'index.ts'), 'utf8');
 const miniDetailTemplate = fs.readFileSync(path.join(__dirname, '..', 'order-miniprogram', 'miniprogram', 'pages', 'order-detail', 'index.wxml'), 'utf8');
@@ -76,7 +80,7 @@ assert.ok(serverSource.includes("WHERE c.id=$1 AND c.enabled=TRUE"), 'order subm
 assert.ok(serverSource.includes('UPDATE erp_connectors c SET owner_username='), 'legacy user-owned warehouses must be adopted by an administrator');
 assert.ok(!serverSource.includes("String(req.query.fulfillmentView || '') === 'submitted'"), 'submitted orders must not be split into a second workbench query');
 assert.ok(serverSource.includes('if (packedRows.length) {'), 'the main order workbench must hydrate fulfillment data');
-assert.ok(serverSource.includes("f.status<>'returned' AND f.order_id=ANY"), 'active fulfillment data must be attached directly to main order cards');
+assert.ok(serverSource.includes('SELECT DISTINCT ON (f.order_id)') && serverSource.includes('order.fulfillmentSubmission = fulfillment?.isReturned ? null'), 'returned submissions must clear the active warehouse while preserving a return marker');
 assert.ok(serverSource.includes('fulfillmentMergedIntoWorkbench: true'), 'health metadata must expose the unified workbench');
 assert.ok(serverSource.includes('fulfillmentResubmit: true'), 'users must be allowed to submit an already successful order again');
 assert.ok(serverSource.includes("fulfillmentSubmissionAllowedShipmentStatus: 'ready_to_ship'"), 'only ready-to-ship orders may enter fulfillment submission');
@@ -93,7 +97,7 @@ assert.ok(serverSource.includes("app.post('/api/admin/fulfillment/update-express
 assert.ok(serverSource.includes('previousTrackingNo:previousTrackingNumber') && serverSource.includes('providerOrderNumber = String(submission.provider_order_number'), 'courier correction must target the stored original provider order and tracking number');
 assert.ok(serverSource.includes('官方面单未申请成功，请先点击订单上的“申请面单”查看原因'), 'official label failures must tell the user how to recover');
 assert.ok(serverSource.includes('const requestedResubmits = new Set'), 'resubmission must require an explicit order id list');
-assert.ok(serverSource.includes("message:'二次推单必须选择与当前不同的仓库'"), 'resubmission must reject the current warehouse');
+assert.ok(!serverSource.includes('requestedResubmit && Number(existing.warehouse_id) === warehouseId'), 'resubmission must allow the current warehouse to be selected again');
 assert.ok(serverSource.includes("updateOrderStatus({ ordersn:existing.provider_order_number || displayOrderId,status:'cancelled' })"), 'a successful resubmission must push the Mercado cancellation status to the previous Yeeke order');
 assert.ok(serverSource.includes('previous_provider_order_number=provider_order_number'), 'the previous provider order number must be retained for audit');
 assert.ok(serverSource.includes('resubmit_count=resubmit_count+1'), 'each successful resubmission must be counted');
@@ -102,7 +106,8 @@ assert.ok(!serverSource.includes('submittedFulfillmentTab'), 'the separate submi
 assert.ok(!serverSource.includes('submittedFulfillmentFullOrderCards'), 'legacy submitted-group metadata must be removed');
 assert.ok(!serverSource.includes("/change-warehouse'"), 'the unavailable direct warehouse-change route must be removed');
 assert.ok(serverSource.includes("app.post('/api/admin/fulfillment/submissions/sync-status', requireOrderAccess"), 'order owners must be able to synchronize warehouse returns');
-assert.ok(serverSource.includes("status='returned',remote_returned=TRUE"), 'returned fulfillment orders must clear their active workbench attachment');
+assert.ok(serverSource.includes("status='returned',warehouse_id=NULL,remote_returned=TRUE"), 'returned fulfillment orders must clear their warehouse and active workbench attachment');
+assert.ok(!returnSyncSource.includes("JOIN users administrator ON administrator.username=c.owner_username AND administrator.role='admin'"), 'return polling must include legacy enabled Yeeke warehouses');
 assert.ok(serverSource.includes("app.put('/api/admin/erp-connectors/:id/price', requireAdmin"), 'warehouse unit prices must stay admin-only');
 assert.ok(serverSource.includes('billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`'), 'production billing integration must have an idempotent per-user order key');
 assert.ok(serverSource.includes("billing_status='charged'"), 'reserved billing events must preserve an externally completed charge');
@@ -126,6 +131,8 @@ assert.ok(orderFrontendSource.includes('尚未生成官方面单，请先同步�
 assert.ok(!orderFrontendSource.includes('修改仓库'), 'the unavailable warehouse-change button must be removed');
 assert.ok(orderFrontendSource.includes('重新提交代贴单'), 'successful submissions must expose the explicit second-push action');
 assert.ok(orderFrontendSource.includes('resubmitOrderIds'), 'the second-push action must identify resubmitted orders to the API');
+assert.ok(!orderFrontendSource.includes(':disabled="fulfillmentResubmitMode && String(w.id)'), 'the current warehouse must remain selectable during resubmission');
+assert.ok(orderFrontendSource.includes('fulfillmentReturn') && orderFrontendSource.includes('仓库退单'), 'returned warehouse orders must render a visible return marker');
 assert.ok(orderFrontendSource.includes('发货数量') && orderFrontendSource.includes('随国内快递一起推送'), 'the web fulfillment dialog must collect shipping quantity and courier remarks');
 assert.ok(orderFrontendSource.includes('quantityByOrder') && orderFrontendSource.includes('remarkByOrder'), 'the web fulfillment request must send quantity and remark maps');
 assert.ok(orderFrontendSource.includes('修改原订单国内快递号') && orderFrontendSource.includes('/api/admin/fulfillment/update-express'), 'the web workbench must expose original-order courier correction');
@@ -138,7 +145,7 @@ assert.ok(orderFrontendSource.includes('仓库地址') && orderFrontendSource.in
 assert.ok(serverSource.includes("warehouseAddressTabRoles: ['admin','agent','user']"), 'warehouse address tab metadata must allow all order roles');
 assert.ok(serverSource.includes("warehouseConfigurationTabRole: 'admin'"), 'warehouse configuration tab metadata must stay administrator-only');
 assert.ok(serverSource.includes("warehouseConfigurationReadRole: 'admin'") && serverSource.includes('fulfillmentOptionsExcludeCredentials: true'), 'configuration reads must stay admin-only while safe options exclude credentials');
-assert.ok(orderFrontendSource.includes('二次推单会在新仓库创建新订单'), 'the UI must explain the second-push and previous-order cancellation flow');
+assert.ok(orderFrontendSource.includes('二次推单会在所选仓库创建新订单') && orderFrontendSource.includes('可以继续选择当前仓库'), 'the UI must explain the second-push and same-warehouse flow');
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');
 assert.ok(orderStyleSource.includes('grid-template-columns:minmax(0,1fr) auto'), 'the fulfillment summary must use the compact two-column layout');

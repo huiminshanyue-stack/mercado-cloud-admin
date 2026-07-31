@@ -3145,7 +3145,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.25',
+    version: '2026-07-31.26',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3159,7 +3159,10 @@ app.get('/api/health/order-management', (req, res) => {
     orderManagementRoles: ['admin','agent','user'],
     fulfillmentMergedIntoWorkbench: true,
     fulfillmentResubmit: true,
+    fulfillmentResubmitAllowsSameWarehouse: true,
     fulfillmentResubmitCancelsPrevious: true,
+    fulfillmentReturnClearsWarehouse: true,
+    fulfillmentReturnMarker: true,
     orderCardFontSize: '12px',
     batchLabelPrint: true,
     batchLabelPrintScope: 'current-user-ready-to-ship-orders',
@@ -4061,13 +4064,14 @@ async function getOrderListData(authUser,query = {}) {
   }
   if (packedRows.length) {
     const displayIds = packedRows.map(order => String(order.displayOrderId || order.packId || order.orderId));
-    const submissionRows = await pool.query(`SELECT f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.shipping_quantity,f.shipping_remark,f.status,
+    const submissionRows = await pool.query(`SELECT DISTINCT ON (f.order_id) f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.shipping_quantity,f.shipping_remark,f.status,
       f.failure_reason,f.retry_count,f.provider_order_number,f.previous_provider_order_number,f.resubmit_count,f.last_resubmitted_at,
       f.warehouse_fee,f.service_fee,f.charge_amount,f.billing_status,f.billing_key,
-      f.remote_status,f.remote_message,f.remote_checked_at,f.created_at,f.updated_at,
+      f.remote_status,f.remote_message,f.remote_checked_at,f.returned_at,f.created_at,f.updated_at,
       c.name AS warehouse_name,c.provider,c.provider_config
       FROM fulfillment_submissions f LEFT JOIN erp_connectors c ON c.id=f.warehouse_id
-      WHERE f.owner_username=$2 AND f.status<>'returned' AND f.order_id=ANY($1::varchar[])`,[displayIds,req.authUser.username]);
+      WHERE f.owner_username=$2 AND f.order_id=ANY($1::varchar[])
+      ORDER BY f.order_id,f.updated_at DESC`,[displayIds,req.authUser.username]);
     const submissionMap = new Map(submissionRows.rows.map(row => {
       let warehouseCode = '';
       if (row.provider === 'yeeke' && row.provider_config) {
@@ -4080,11 +4084,19 @@ async function getOrderListData(authUser,query = {}) {
         failureReason:row.failure_reason || '',retryCount:row.retry_count || 0,providerOrderNumber:row.provider_order_number || row.order_id,
         previousProviderOrderNumber:row.previous_provider_order_number || '',resubmitCount:Number(row.resubmit_count || 0),lastResubmittedAt:row.last_resubmitted_at,
         warehouseFee:Number(row.warehouse_fee || 0),serviceFee:Number(row.service_fee || 0),chargeAmount:Number(row.charge_amount || 0),
-        billingStatus:row.billing_status || 'reserved',billingKey:row.billing_key || '',remoteStatus:row.remote_status || '',remoteMessage:row.remote_message || '',remoteCheckedAt:row.remote_checked_at,
+        billingStatus:row.billing_status || 'reserved',billingKey:row.billing_key || '',remoteStatus:row.remote_status || '',remoteMessage:row.remote_message || '',remoteCheckedAt:row.remote_checked_at,returnedAt:row.returned_at,
+        isReturned:row.status === 'returned',
         createdAt:row.created_at,updatedAt:row.updated_at
       }];
     }));
-    for (const order of packedRows) order.fulfillmentSubmission = submissionMap.get(String(order.displayOrderId || order.packId || order.orderId)) || null;
+    for (const order of packedRows) {
+      const fulfillment = submissionMap.get(String(order.displayOrderId || order.packId || order.orderId));
+      order.fulfillmentSubmission = fulfillment?.isReturned ? null : (fulfillment || null);
+      order.fulfillmentReturn = fulfillment?.isReturned ? {
+        returnedAt:fulfillment.returnedAt,
+        reason:fulfillment.remoteMessage || fulfillment.failureReason || '仓库已退回代贴单'
+      } : null;
+    }
   }
   return { items: packedRows, total: count.rows[0].total, page, size, exchangeRate:Number(exchangeRate) };
 }
@@ -7145,7 +7157,6 @@ async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,for
     const { rows } = await pool.query(`SELECT f.id,f.owner_username,f.order_id,f.provider_order_number,f.warehouse_id,
       c.provider_config FROM fulfillment_submissions f
       JOIN erp_connectors c ON c.id=f.warehouse_id
-      JOIN users administrator ON administrator.username=c.owner_username AND administrator.role='admin'
       WHERE f.status='success' AND c.provider='yeeke'${ownerFilter}${staleFilter}
       ORDER BY f.remote_checked_at ASC NULLS FIRST,f.updated_at DESC LIMIT $${params.length}`,params);
     const clients = new Map();
@@ -7178,7 +7189,7 @@ async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,for
         const remoteMessage = String(record.messageToUser || '').trim().slice(0,2000);
         if (isYeekeOrderReturned(record)) {
           const reason = yeekeOrderReturnReason(record);
-          const updateResult = await pool.query(`UPDATE fulfillment_submissions SET status='returned',remote_returned=TRUE,
+          const updateResult = await pool.query(`UPDATE fulfillment_submissions SET status='returned',warehouse_id=NULL,remote_returned=TRUE,
             remote_status=$1,remote_message=$2,remote_checked_at=NOW(),returned_at=COALESCE(returned_at,NOW()),
             failure_reason=$2,updated_at=NOW() WHERE id=$3 AND owner_username=$4 AND status<>'returned'`,
           [remoteStatus || '7',reason,submission.id,submission.owner_username]);
@@ -7290,10 +7301,6 @@ async function handleFulfillmentSubmit(req, res) {
     }
     if (requestedResubmit && (!existing || existing.status !== 'success')) {
       results.push({ orderId:displayOrderId,success:false,message:'只有已成功提交的订单可以二次推单' });
-      continue;
-    }
-    if (requestedResubmit && Number(existing.warehouse_id) === warehouseId) {
-      results.push({ orderId:displayOrderId,success:false,message:'二次推单必须选择与当前不同的仓库' });
       continue;
     }
     if (isResubmit && (String(warehouse.provider || '') !== 'yeeke' || (!returnedResubmit && String(existing?.old_provider || '') !== 'yeeke'))) {
