@@ -3145,7 +3145,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.26',
+    version: '2026-07-31.27',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3163,6 +3163,7 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentResubmitCancelsPrevious: true,
     fulfillmentReturnClearsWarehouse: true,
     fulfillmentReturnMarker: true,
+    yeekeReturnLookupFallbackWithoutWarehouse: true,
     orderCardFontSize: '12px',
     batchLabelPrint: true,
     batchLabelPrintScope: 'current-user-ready-to-ship-orders',
@@ -7172,13 +7173,17 @@ async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,for
           clients.set(connectorKey,entry);
         }
         const providerOrderNumber = String(submission.provider_order_number || submission.order_id);
-        const remoteData = await entry.client.listOrders({
+        let remoteData = await entry.client.listOrders({
           ordersn:providerOrderNumber,
           wareHouse:entry.config.warehouseCode,
           pageNo:1,
           pageSize:20
         });
-        const record = extractYeekeOrderRecords(remoteData).find(item => String(item?.ordersn || '') === providerOrderNumber);
+        let record = extractYeekeOrderRecords(remoteData).find(item => String(item?.ordersn || '') === providerOrderNumber);
+        if (!record && entry.config.warehouseCode) {
+          remoteData = await entry.client.listOrders({ ordersn:providerOrderNumber,pageNo:1,pageSize:20 });
+          record = extractYeekeOrderRecords(remoteData).find(item => String(item?.ordersn || '') === providerOrderNumber);
+        }
         checked++;
         if (!record) {
           await pool.query('UPDATE fulfillment_submissions SET remote_checked_at=NOW() WHERE id=$1 AND owner_username=$2',

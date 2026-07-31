@@ -108,6 +108,7 @@ assert.ok(!serverSource.includes("/change-warehouse'"), 'the unavailable direct 
 assert.ok(serverSource.includes("app.post('/api/admin/fulfillment/submissions/sync-status', requireOrderAccess"), 'order owners must be able to synchronize warehouse returns');
 assert.ok(serverSource.includes("status='returned',warehouse_id=NULL,remote_returned=TRUE"), 'returned fulfillment orders must clear their warehouse and active workbench attachment');
 assert.ok(!returnSyncSource.includes("JOIN users administrator ON administrator.username=c.owner_username AND administrator.role='admin'"), 'return polling must include legacy enabled Yeeke warehouses');
+assert.ok(returnSyncSource.includes('if (!record && entry.config.warehouseCode)') && returnSyncSource.includes('listOrders({ ordersn:providerOrderNumber,pageNo:1,pageSize:20 })'), 'returned orders missing from the original warehouse view must be retried without a warehouse filter');
 assert.ok(serverSource.includes("app.put('/api/admin/erp-connectors/:id/price', requireAdmin"), 'warehouse unit prices must stay admin-only');
 assert.ok(serverSource.includes('billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`'), 'production billing integration must have an idempotent per-user order key');
 assert.ok(serverSource.includes("billing_status='charged'"), 'reserved billing events must preserve an externally completed charge');
