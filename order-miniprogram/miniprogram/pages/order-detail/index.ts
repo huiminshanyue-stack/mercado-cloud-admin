@@ -4,7 +4,7 @@ import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWei
 Page({
   data:{
     loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false,
-    fulfillmentOptionsLoading:false,fulfillmentSubmitting:false,
+    fulfillmentOptionsLoading:false,fulfillmentSubmitting:false,fulfillmentExpressEditing:false,fulfillmentExpressUpdating:false,
     warehouses:[] as any[],carriers:[] as any[],warehouseNames:[] as string[],carrierNames:[] as string[],
     warehouseIndex:0,carrierIndex:0,
     fulfillmentForm:{ trackingNumber:'',quantity:'1',remark:'' }
@@ -133,6 +133,54 @@ Page({
       wx.showToast({ title:'代贴单已提交',icon:'success' });
     } catch (error) { showError(error); }
     finally { wx.hideLoading();this.setData({ fulfillmentSubmitting:false }); }
+  },
+  startExpressUpdate() {
+    const submission=this.data.order?.fulfillmentSubmission;
+    if (!submission || submission.status !== 'success' || submission.provider !== 'yeeke') return;
+    const carrierIndex=Math.max(0,this.data.carriers.findIndex((item:any)=>item.name === submission.carrier));
+    this.setData({
+      fulfillmentExpressEditing:true,carrierIndex,
+      fulfillmentForm:{
+        trackingNumber:String(submission.trackingNumber || ''),
+        quantity:String(submission.shippingQuantity || this.data.order?.totalQuantity || 1),
+        remark:String(submission.shippingRemark || '')
+      }
+    });
+  },
+  cancelExpressUpdate() { this.setData({ fulfillmentExpressEditing:false }); },
+  async submitExpressUpdate() {
+    const order=this.data.order;
+    const submission=order?.fulfillmentSubmission;
+    const carrier=this.data.carriers[this.data.carrierIndex];
+    const trackingNumber=String(this.data.fulfillmentForm.trackingNumber || '').trim();
+    const shippingRemark=String(this.data.fulfillmentForm.remark || '').trim();
+    if (!submission || submission.status !== 'success' || submission.provider !== 'yeeke') return;
+    if (!carrier) return wx.showToast({ title:'请选择快递公司',icon:'none' });
+    if (!trackingNumber) return wx.showToast({ title:'请填写新的快递单号',icon:'none' });
+    if (shippingRemark.length > 500) return wx.showToast({ title:'备注不能超过500字',icon:'none' });
+    if (trackingNumber === String(submission.trackingNumber || '') && carrier.name === submission.carrier && shippingRemark === String(submission.shippingRemark || '')) {
+      return wx.showToast({ title:'快递信息没有变化',icon:'none' });
+    }
+    const confirmed=await new Promise<boolean>(resolve=>wx.showModal({
+      title:'确认修改快递号',
+      content:'修改会同步到 Yeeke 原订单，不会创建新订单。',
+      success:result=>resolve(Boolean(result.confirm)),fail:()=>resolve(false)
+    }));
+    if (!confirmed) return;
+    this.setData({ fulfillmentExpressUpdating:true });
+    wx.showLoading({ title:'正在同步修改',mask:true });
+    try {
+      await request<any>({
+        path:'/api/miniprogram/v1/fulfillment/update-express',method:'POST',timeout:60000,
+        data:{
+          orderId:String(order.displayOrderId || order.orderId),carrier:carrier.name,trackingNumber,shippingRemark
+        }
+      });
+      this.setData({ fulfillmentExpressEditing:false });
+      await this.loadOrder();
+      wx.showToast({ title:'快递号已修改',icon:'success' });
+    } catch (error) { showError(error); }
+    finally { wx.hideLoading();this.setData({ fulfillmentExpressUpdating:false }); }
   },
   previewImage(event:WechatMiniprogram.TouchEvent) {
     const images=(this.data.order?.products || []).map((item:any)=>item.image).filter(Boolean);

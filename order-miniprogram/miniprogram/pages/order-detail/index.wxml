@@ -72,6 +72,19 @@
       <view class="row"><text>发货数量</text><text>{{order.fulfillmentSubmission.shippingQuantity || order.totalQuantity}}</text></view>
       <view wx:if="{{order.fulfillmentSubmission.shippingRemark}}" class="row"><text>备注</text><text>{{order.fulfillmentSubmission.shippingRemark}}</text></view>
       <view wx:if="{{order.fulfillmentSubmission.status === 'failed'}}" class="fulfillment-error">{{order.fulfillmentSubmission.failureReason || '提交失败，请在订单工作台重新推送'}}</view>
+      <button wx:if="{{order.fulfillmentSubmission.status === 'success' && order.fulfillmentSubmission.provider === 'yeeke' && !fulfillmentExpressEditing}}" class="express-update-button" bindtap="startExpressUpdate">修改国内快递号</button>
+      <view wx:if="{{fulfillmentExpressEditing}}" class="express-update-form">
+        <view class="form-hint">只修改 Yeeke 原订单的快递记录，不会创建新订单或改变仓库。</view>
+        <view class="form-label">快递公司</view>
+        <picker mode="selector" range="{{carrierNames}}" value="{{carrierIndex}}" bindchange="onCarrierChange">
+          <view class="picker-value">{{carrierNames[carrierIndex] || '请选择快递公司'}}</view>
+        </picker>
+        <view class="form-label">新国内快递单号</view>
+        <input class="form-input" data-field="trackingNumber" value="{{fulfillmentForm.trackingNumber}}" placeholder="请输入正确的国内快递单号" bindinput="onFulfillmentInput" />
+        <view class="form-label">备注</view>
+        <textarea class="form-textarea" data-field="remark" value="{{fulfillmentForm.remark}}" maxlength="500" placeholder="备注会随新快递记录同步到 Yeeke" bindinput="onFulfillmentInput" />
+        <view class="express-update-actions"><button size="mini" bindtap="cancelExpressUpdate">取消</button><button size="mini" type="primary" loading="{{fulfillmentExpressUpdating}}" disabled="{{fulfillmentExpressUpdating}}" bindtap="submitExpressUpdate">同步修改</button></view>
+      </view>
     </view>
 
     <view wx:elif="{{order.canSubmitFulfillment}}" class="card section fulfillment-form">

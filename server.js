@@ -26,7 +26,8 @@ const {
   buildYeekeResubmitOrderNumber,
   extractYeekeOrderRecords,
   isYeekeOrderReturned,
-  yeekeOrderReturnReason
+  yeekeOrderReturnReason,
+  replaceYeekeDomesticExpress
 } = require('./yeeke-client');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
@@ -3144,7 +3145,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.24',
+    version: '2026-07-31.25',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3187,6 +3188,9 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentShippingQuantity: true,
     fulfillmentShippingRemark: true,
     miniProgramFulfillmentSubmit: true,
+    yeekeOriginalOrderExpressUpdate: true,
+    yeekeOriginalOrderExpressUpdateFlow: ['order/list','deliveryinfo/delete','express/add'],
+    fulfillmentExpressUpdateCreatesNewOrder: false,
     fulfillmentSubmittedOrderGroup: true,
     fulfillmentWarehouseFilter: true,
     dispatchDeadlineSource: 'marketplace-shipment-lead-time',
@@ -7355,6 +7359,80 @@ async function handleFulfillmentSubmit(req, res) {
 
 app.post('/api/admin/fulfillment/submit', requireOrderAccess, handleFulfillmentSubmit);
 
+async function handleFulfillmentExpressUpdate(req, res) {
+  const orderId = String(req.body?.orderId || '').trim();
+  const carrier = String(req.body?.carrier || '').trim();
+  const trackingNumber = String(req.body?.trackingNumber || '').trim();
+  const shippingRemark = String(req.body?.shippingRemark || '').trim();
+  if (!orderId) return res.status(400).json({ code:400,message:'缺少订单号' });
+  if (!carrier) return res.status(400).json({ code:400,message:'请选择国内快递公司' });
+  if (!trackingNumber) return res.status(400).json({ code:400,message:'请填写新的国内快递单号' });
+  if (trackingNumber.length > 120) return res.status(400).json({ code:400,message:'国内快递单号不能超过 120 个字符' });
+  if (shippingRemark.length > 500) return res.status(400).json({ code:400,message:'快递备注不能超过 500 个字' });
+
+  const { rows } = await pool.query(`SELECT f.*,c.provider,c.provider_config,c.enabled
+    FROM fulfillment_submissions f
+    JOIN erp_connectors c ON c.id=f.warehouse_id
+    JOIN users administrator ON administrator.username=c.owner_username AND administrator.role='admin'
+    WHERE f.owner_username=$1 AND f.order_id=$2`,[req.authUser.username,orderId]);
+  const submission = rows[0];
+  if (!submission) return res.status(404).json({ code:404,message:'未找到该订单的代贴单提交记录' });
+  if (submission.status !== 'success') return res.status(400).json({ code:400,message:'只有已经成功提交的代贴单才能修改国内快递号' });
+  if (String(submission.provider || '') !== 'yeeke') return res.status(400).json({ code:400,message:'当前仓库不支持原单修改国内快递号' });
+  if (!submission.enabled) return res.status(400).json({ code:400,message:'该仓库连接已经停用，无法同步修改' });
+  const previousTrackingNumber = String(submission.tracking_number || '').trim();
+  if (!previousTrackingNumber) return res.status(400).json({ code:400,message:'原提交记录没有国内快递号，无法定位 Yeeke 快递记录' });
+  if (previousTrackingNumber === trackingNumber && String(submission.carrier || '') === carrier && String(submission.shipping_remark || '') === shippingRemark) {
+    return res.status(400).json({ code:400,message:'快递公司、快递单号和备注均未发生变化' });
+  }
+  const carrierResult = await pool.query(`SELECT lc.id FROM logistics_companies lc
+    JOIN users administrator ON administrator.username=lc.owner_username AND administrator.role='admin'
+    WHERE lc.name=$1 AND lc.enabled=TRUE`,[carrier]);
+  if (!carrierResult.rows[0]) return res.status(404).json({ code:404,message:'请选择管理员维护的国内快递公司' });
+
+  try {
+    const config = getYeekeConnectorConfig({ provider_config:submission.provider_config });
+    const client = createYeekeClient(config);
+    await client.authorize(config.userName,config.password);
+    const providerOrderNumber = String(submission.provider_order_number || submission.order_id);
+    const remoteResult = await replaceYeekeDomesticExpress(client,{
+      ordersn:providerOrderNumber,
+      warehouseCode:config.warehouseCode,
+      previousTrackingNo:previousTrackingNumber,
+      trackingNo:trackingNumber,
+      carrier,
+      remark:shippingRemark,
+      previousCarrier:submission.carrier,
+      previousRemark:submission.shipping_remark
+    });
+    const audit = {
+      action:'fulfillment_express_update',
+      provider_order_number:providerOrderNumber,
+      previous_tracking_number:previousTrackingNumber,
+      tracking_number:trackingNumber,
+      carrier,
+      shipping_remark:shippingRemark,
+      new_order_created:false,
+      updated_at:new Date().toISOString()
+    };
+    await pool.query(`UPDATE fulfillment_submissions SET carrier=$1,tracking_number=$2,shipping_remark=$3,
+      request_data=COALESCE(request_data,'{}'::jsonb)||jsonb_build_object('last_express_update',$4::jsonb),
+      response_text=$5,failure_reason=NULL,remote_checked_at=NULL,updated_at=NOW()
+      WHERE id=$6 AND owner_username=$7`,[
+      carrier,trackingNumber,shippingRemark,JSON.stringify(audit),JSON.stringify({ remoteResult }).slice(0,5000),submission.id,req.authUser.username
+    ]);
+    return res.json({ code:0,data:{
+      orderId,providerOrderNumber,previousTrackingNumber,trackingNumber,carrier,shippingRemark,
+      newOrderCreated:false,remoteUpdated:true
+    },message:'国内快递号已在 Yeeke 原订单上修改成功' });
+  } catch (error) {
+    const message = String(error.response?.data?.message || error.message || 'Yeeke 国内快递号修改失败').slice(0,2000);
+    return res.status(502).json({ code:502,message });
+  }
+}
+
+app.post('/api/admin/fulfillment/update-express', requireOrderAccess, handleFulfillmentExpressUpdate);
+
 app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, res) => {
   const params = [req.authUser.username], where = ['f.owner_username=$1',"f.status<>'returned'"];
   const warehouseId = Number(req.query?.warehouseId);
@@ -8080,6 +8158,7 @@ async function start() {
   mercadoLibreWebhookService.registerRoutes(app);
   registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getMiniOrderWorkbenchSummaryData,getOrderStoresData,refreshOrderDimensionsData,
     getFulfillmentOptionsData,submitFulfillmentRequest:handleFulfillmentSubmit,
+    updateFulfillmentExpressRequest:handleFulfillmentExpressUpdate,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
     getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,translateOrderMessageData,getOrderRealtimeStateData,
     getOfficialNotificationPreferences:officialAccountService.getPreferences,

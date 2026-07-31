@@ -7,7 +7,8 @@ const {
   buildYeekeOrderPayload,
   extractYeekeOrderRecords,
   isYeekeOrderReturned,
-  yeekeOrderReturnReason
+  yeekeOrderReturnReason,
+  replaceYeekeDomesticExpress
 } = require('../yeeke-client');
 
 async function run() {
@@ -27,9 +28,12 @@ async function run() {
       if (url.endsWith('/ware/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ wareHouse: 'th', wareName: '东莞仓' }] } };
       if (url.endsWith('/otherService/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ id: 'service-1', name: '打包', price: 1 }] } };
       if (url.endsWith('/order/create/v2')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'Y1' } } };
+      if (url.endsWith('/order/list') && JSON.parse(envelope.data).ordersn === 'ORIGINAL-1') return { status: 200, data: { code: '0', message: '成功', data: { records: [{ ordersn: 'ORIGINAL-1', dgStatus: '3', expressList: [{ id:'EXP-1',itemId:'ITEM-1',trackingNo:'OLD123',sendQuantity:2,status:'0' }] }] } } };
       if (url.endsWith('/order/list')) return { status: 200, data: { code: '0', message: '成功', data: { records: [{ ordersn: '200001', dgStatus: '3' }] } } };
       if (url.endsWith('/airwaybill/change')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       if (url.endsWith('/status/update')) return { status: 200, data: { code: '0', message: '成功', data: null } };
+      if (url.endsWith('/deliveryinfo/delete')) return { status: 200, data: { code: '0', message: '成功', data: null } };
+      if (url.endsWith('/express/add')) return { status: 200, data: { code: '0', message: '成功', data: null } };
       throw new Error(`unexpected URL ${url}`);
     }
   };
@@ -52,6 +56,49 @@ async function run() {
   await client.updateOrderStatus({ ordersn: '200001', status: 'cancelled' });
   assert.strictEqual(calls[6].body.status, 'cancelled');
   assert.ok(calls[6].url.endsWith('/status/update'));
+
+  const expressUpdate = await replaceYeekeDomesticExpress(client,{
+    ordersn:'ORIGINAL-1',warehouseCode:'th',previousTrackingNo:'OLD123',trackingNo:'NEW456',
+    carrier:'中通快递',remark:'更正快递号',previousCarrier:'圆通快递',previousRemark:'原备注'
+  });
+  assert.strictEqual(expressUpdate.newOrderCreated,false);
+  assert.deepStrictEqual(expressUpdate.deletedExpressIds,['EXP-1']);
+  assert.ok(calls[8].url.endsWith('/deliveryinfo/delete'));
+  assert.strictEqual(calls[8].body.expressId,'EXP-1');
+  assert.ok(calls[9].url.endsWith('/express/add'));
+  assert.strictEqual(calls[9].body.ordersn,'ORIGINAL-1');
+  assert.strictEqual(calls[9].body.trackingNo,'NEW456');
+  assert.strictEqual(calls[9].body.itemId,'ITEM-1');
+  assert.strictEqual(calls[9].body.goodsNum,2);
+  assert.strictEqual(calls[9].body.expressCode,'zt');
+  assert.strictEqual(calls[9].body.desp,'更正快递号');
+  let receivedDeleteCalled = false;
+  await assert.rejects(() => replaceYeekeDomesticExpress({
+    listOrders:async()=>({ records:[{ ordersn:'RECEIVED-1',expressList:[{ id:'EXP-2',trackingNo:'OLD',sendQuantity:1,status:'1' }] }] }),
+    deleteDeliveryInfo:async()=>{ receivedDeleteCalled = true; },
+    addExpress:async()=>{}
+  },{ ordersn:'RECEIVED-1',previousTrackingNo:'OLD',trackingNo:'NEW',carrier:'中通快递' }),/已被仓库收货/);
+  assert.strictEqual(receivedDeleteCalled,false);
+  let rollbackListCount=0,newAddCount=0;
+  const rollbackDeleted=[],rollbackAdds=[];
+  await assert.rejects(() => replaceYeekeDomesticExpress({
+    listOrders:async()=>{
+      rollbackListCount++;
+      return rollbackListCount === 1
+        ? { records:[{ ordersn:'ROLLBACK-1',expressList:[
+          { id:'OLD-1',itemId:'ITEM-1',trackingNo:'OLD',sendQuantity:1,status:'0' },
+          { id:'OLD-2',itemId:'ITEM-2',trackingNo:'OLD',sendQuantity:1,status:'0' }
+        ] }] }
+        : { records:[{ ordersn:'ROLLBACK-1',expressList:[{ id:'NEW-REMOTE-1',trackingNo:'NEW',sendQuantity:1,status:'0' }] }] };
+    },
+    deleteDeliveryInfo:async id=>rollbackDeleted.push(id),
+    addExpress:async payload=>{
+      rollbackAdds.push(payload);
+      if (payload.trackingNo === 'NEW' && ++newAddCount === 2) throw new Error('second add failed');
+    }
+  },{ ordersn:'ROLLBACK-1',previousTrackingNo:'OLD',trackingNo:'NEW',carrier:'中通快递',previousCarrier:'圆通快递' }),/second add failed/);
+  assert.deepStrictEqual(rollbackDeleted,['OLD-1','OLD-2','NEW-REMOTE-1']);
+  assert.strictEqual(rollbackAdds.filter(item=>item.trackingNo === 'OLD').length,2);
 
   const payload = buildYeekeOrderPayload({
     row: {

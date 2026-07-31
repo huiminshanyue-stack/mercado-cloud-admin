@@ -70,6 +70,14 @@ function createYeekeClient(config, request = axios) {
     async updateOrderStatus(order) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/status/update', { ...order, accessToken, timestamp: Date.now() });
+    },
+    async deleteDeliveryInfo(expressId) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/deliveryinfo/delete', { expressId: String(expressId), accessToken, timestamp: Date.now() });
+    },
+    async addExpress(express) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/express/add', { ...express, accessToken, timestamp: Date.now() });
     }
   };
 }
@@ -127,6 +135,93 @@ function yeekeExpressCode(carrier) {
     '德邦快递': 'db', '德邦物流': 'db', '安能物流': 'aneng', '菜鸟物流': 'tmdn'
   };
   return codes[name] || (/^[a-z0-9-]+$/i.test(name) ? name : 'other');
+}
+
+async function replaceYeekeDomesticExpress(client, options = {}) {
+  const ordersn = String(options.ordersn || '').trim();
+  const previousTrackingNo = String(options.previousTrackingNo || '').trim();
+  const trackingNo = String(options.trackingNo || '').trim();
+  const carrier = String(options.carrier || '').trim();
+  const remark = String(options.remark || '').trim().slice(0, 500);
+  if (!ordersn) throw new Error('缺少 Yeeke 原订单号');
+  if (!previousTrackingNo) throw new Error('缺少原国内快递单号');
+  if (!trackingNo) throw new Error('请填写新的国内快递单号');
+
+  const remoteData = await client.listOrders({
+    ordersn,
+    wareHouse: String(options.warehouseCode || '').trim() || undefined,
+    pageNo: 1,
+    pageSize: 20
+  });
+  const record = extractYeekeOrderRecords(remoteData).find(item => String(item?.ordersn || '') === ordersn);
+  if (!record) throw new Error(`Yeeke 未找到原订单 ${ordersn}`);
+  const matches = (Array.isArray(record.expressList) ? record.expressList : []).filter(item =>
+    String(item?.trackingNo || '').trim() === previousTrackingNo
+  );
+  if (!matches.length) throw new Error(`Yeeke 原订单中未找到快递号 ${previousTrackingNo}，未执行任何修改`);
+  if (matches.some(item => String(item?.status ?? '').trim() === '1')) {
+    throw new Error('该快递已被仓库收货，Yeeke 不允许再修改快递号');
+  }
+  const snapshots = matches.map(item => ({
+    id: String(item.id || '').trim(),
+    itemId: String(item.itemId || '').trim() || undefined,
+    goodsNum: Math.max(1, Math.floor(Number(item.sendQuantity) || 1))
+  }));
+  if (snapshots.some(item => !item.id)) throw new Error('Yeeke 快递记录缺少 expressId，未执行任何修改');
+
+  const deleted = [];
+  const added = [];
+  const addPayload = (snapshot, targetTrackingNo, targetCarrier, targetRemark) => ({
+    ordersn,
+    itemId: snapshot.itemId,
+    trackingNo: targetTrackingNo,
+    goodsNum: snapshot.goodsNum,
+    expressCode: yeekeExpressCode(targetCarrier),
+    desp: targetRemark || undefined
+  });
+  try {
+    for (const snapshot of snapshots) {
+      await client.deleteDeliveryInfo(snapshot.id);
+      deleted.push(snapshot);
+    }
+    for (const snapshot of snapshots) {
+      await client.addExpress(addPayload(snapshot, trackingNo, carrier, remark));
+      added.push(snapshot);
+    }
+  } catch (error) {
+    const rollbackErrors = [];
+    if (added.length) {
+      try {
+        const currentData = await client.listOrders({ ordersn, pageNo:1, pageSize:20 });
+        const currentRecord = extractYeekeOrderRecords(currentData).find(item => String(item?.ordersn || '') === ordersn);
+        const newEntries = (Array.isArray(currentRecord?.expressList) ? currentRecord.expressList : []).filter(item =>
+          String(item?.trackingNo || '').trim() === trackingNo && String(item?.id || '').trim()
+        );
+        for (const entry of newEntries) await client.deleteDeliveryInfo(String(entry.id));
+      } catch (cleanupError) {
+        rollbackErrors.push(`新快递记录清理失败：${cleanupError.response?.data?.message || cleanupError.message || cleanupError}`);
+      }
+    }
+    for (const snapshot of deleted) {
+      try {
+        await client.addExpress(addPayload(snapshot, previousTrackingNo, options.previousCarrier || carrier, options.previousRemark || ''));
+      } catch (rollbackError) {
+        rollbackErrors.push(String(rollbackError.response?.data?.message || rollbackError.message || rollbackError));
+      }
+    }
+    if (rollbackErrors.length) {
+      error.message = `${error.message || 'Yeeke 快递号修改失败'}；原快递恢复也失败，请立即联系管理员：${rollbackErrors.join('；')}`;
+    }
+    throw error;
+  }
+  return {
+    ordersn,
+    previousTrackingNo,
+    trackingNo,
+    deletedExpressIds: snapshots.map(item => item.id),
+    addedCount: added.length,
+    newOrderCreated: false
+  };
 }
 
 function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, shippingQuantity, shippingRemark, displayOrderId, providerOrderNumber, externalUserId, pdfString, serviceCodes }) {
@@ -240,5 +335,7 @@ module.exports = {
   buildYeekeOrderPayload,
   extractYeekeOrderRecords,
   isYeekeOrderReturned,
-  yeekeOrderReturnReason
+  yeekeOrderReturnReason,
+  yeekeExpressCode,
+  replaceYeekeDomesticExpress
 };

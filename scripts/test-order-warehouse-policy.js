@@ -87,6 +87,10 @@ assert.ok(serverSource.includes('发货数量必须是 1 至') && serverSource.i
 assert.ok(yeekeSource.includes('erpOrdersn: identity') && yeekeSource.includes('shopId: identity') && yeekeSource.includes('`山月ERP ${identity}`'), 'all three Yeeke identity positions must receive the stable SY id');
 assert.ok(yeekeSource.includes('trackingNo: officialTrackingNumber') && yeekeSource.includes('expressInfos: domesticTrackingNumber'), 'international and domestic tracking numbers must use separate Yeeke fields');
 assert.ok(yeekeSource.includes('sendQuantity') && yeekeSource.includes('note: domesticRemark'), 'Yeeke courier details must include shipping quantity and remark');
+assert.ok(yeekeSource.includes("call('/deliveryinfo/delete'") && yeekeSource.includes("call('/express/add'"), 'Yeeke original-order courier updates must use the documented delete and add endpoints');
+assert.ok(yeekeSource.includes('newOrderCreated: false') && yeekeSource.includes('replaceYeekeDomesticExpress'), 'courier correction must explicitly preserve the original Yeeke order');
+assert.ok(serverSource.includes("app.post('/api/admin/fulfillment/update-express', requireOrderAccess"), 'order users must have a protected original-order courier correction route');
+assert.ok(serverSource.includes('previousTrackingNo:previousTrackingNumber') && serverSource.includes('providerOrderNumber = String(submission.provider_order_number'), 'courier correction must target the stored original provider order and tracking number');
 assert.ok(serverSource.includes('官方面单未申请成功，请先点击订单上的“申请面单”查看原因'), 'official label failures must tell the user how to recover');
 assert.ok(serverSource.includes('const requestedResubmits = new Set'), 'resubmission must require an explicit order id list');
 assert.ok(serverSource.includes("message:'二次推单必须选择与当前不同的仓库'"), 'resubmission must reject the current warehouse');
@@ -124,6 +128,7 @@ assert.ok(orderFrontendSource.includes('重新提交代贴单'), 'successful sub
 assert.ok(orderFrontendSource.includes('resubmitOrderIds'), 'the second-push action must identify resubmitted orders to the API');
 assert.ok(orderFrontendSource.includes('发货数量') && orderFrontendSource.includes('随国内快递一起推送'), 'the web fulfillment dialog must collect shipping quantity and courier remarks');
 assert.ok(orderFrontendSource.includes('quantityByOrder') && orderFrontendSource.includes('remarkByOrder'), 'the web fulfillment request must send quantity and remark maps');
+assert.ok(orderFrontendSource.includes('修改原订单国内快递号') && orderFrontendSource.includes('/api/admin/fulfillment/update-express'), 'the web workbench must expose original-order courier correction');
 assert.ok(orderFrontendSource.includes('www.kuaidi100.com/chaxun'), 'domestic tracking must open a prefilled Kuaidi100 web query');
 assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.includes('shunfeng') && orderFrontendSource.includes('jtexpress'), 'common domestic carriers must be mapped for automatic query filling');
 assert.ok(orderFrontendSource.includes('仓库收货地址') && orderFrontendSource.includes('recipientDisplay') && orderFrontendSource.includes('addressDisplay'), 'the workbench must render user-specific shared warehouse addresses');
@@ -137,6 +142,7 @@ assert.ok(orderFrontendSource.includes('二次推单会在新仓库创建新订�
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');
 assert.ok(miniDetailSource.includes('/api/miniprogram/v1/fulfillment-options') && miniDetailSource.includes('/api/miniprogram/v1/fulfillment/submit'), 'the mini-program order detail must use the protected fulfillment APIs');
+assert.ok(miniDetailSource.includes('/api/miniprogram/v1/fulfillment/update-express'), 'the mini-program must update courier details on the original Yeeke order');
 assert.ok(miniDetailSource.includes('quantityByOrder') && miniDetailSource.includes('remarkByOrder'), 'the mini-program must submit quantity and courier remarks');
 for (const label of ['选择仓库','快递公司','国内快递单号','发货数量','备注','提交代贴单']) {
   assert.ok(miniDetailTemplate.includes(label), `the mini-program fulfillment form must include ${label}`);

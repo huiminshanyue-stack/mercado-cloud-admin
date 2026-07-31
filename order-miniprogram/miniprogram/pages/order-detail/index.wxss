@@ -17,6 +17,9 @@
 .form-hint { margin-top:8rpx; color:#8d99a7; font-size:21rpx; }
 .fulfillment-submit { margin-top:30rpx; background:#1677ff; font-size:27rpx; }
 .fulfillment-error { margin-top:20rpx; padding:18rpx; color:#d93025; background:#fff1f0; border-radius:10rpx; font-size:23rpx; line-height:1.6; }
+.express-update-button { margin-top:24rpx; color:#1677ff; background:#edf5ff; font-size:25rpx; }
+.express-update-form { margin-top:22rpx; padding-top:20rpx; border-top:1rpx solid #e7ebf0; }
+.express-update-actions { display:flex; justify-content:flex-end; gap:18rpx; margin-top:24rpx; }.express-update-actions button { margin:0; }
 .danger { color:#ef5350; }
 .weight-hint.is-lower { color:#16825d; background:#e9f7f1; }
 .weight-hint.is-higher { color:#b26a00; background:#fdf1dc; }

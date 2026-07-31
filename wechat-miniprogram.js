@@ -60,6 +60,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     getOrderStoresData,
     getFulfillmentOptionsData,
     submitFulfillmentRequest,
+    updateFulfillmentExpressRequest,
     refreshOrderDimensionsData,
     updateOrderCostData,
     getOrderInquiriesData,
@@ -157,7 +158,7 @@ function registerMiniProgramRoutes(app, dependencies) {
       wechatLoginEnabled: Boolean(appSecret),
       erpTestLoginEnabled: true,
       writeOperationsEnabled: true,
-      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit'],
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit','fulfillment_express_update'],
       environment: process.env.NODE_ENV || 'production'
     } });
   });
@@ -232,7 +233,7 @@ function registerMiniProgramRoutes(app, dependencies) {
       authSource: req.miniAuth.source,
       user: req.authUser || null,
       writeOperationsEnabled: true,
-      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit']
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit','fulfillment_express_update']
     } });
   });
 
@@ -364,6 +365,14 @@ function registerMiniProgramRoutes(app, dependencies) {
     catch (error) {
       console.error('[MiniProgram] fulfillment submission failed:',error.message);
       if (!res.headersSent) res.status(500).json({ code:500,message:error.message || '代贴单提交失败' });
+    }
+  });
+
+  app.post('/api/miniprogram/v1/fulfillment/update-express',requireBoundOrderUser,async (req,res) => {
+    try { await updateFulfillmentExpressRequest(req,res); }
+    catch (error) {
+      console.error('[MiniProgram] fulfillment express update failed:',error.message);
+      if (!res.headersSent) res.status(500).json({ code:500,message:error.message || '国内快递号修改失败' });
     }
   });
 

@@ -39,7 +39,7 @@ async function runHandlers(handlers,req,res) {
 
 async function testRoutes() {
   process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
-  const routes=new Map(),listCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],fulfillmentOptionCalls=[],fulfillmentSubmitCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
+  const routes=new Map(),listCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],fulfillmentOptionCalls=[],fulfillmentSubmitCalls=[],fulfillmentExpressUpdateCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -94,6 +94,10 @@ async function testRoutes() {
       fulfillmentSubmitCalls.push({ user:req.authUser,body:req.body });
       res.json({ code:0,data:{ success:1,failed:0,results:[{ orderId:req.body.orderIds[0],success:true }] },message:'代贴单已提交' });
     },
+    updateFulfillmentExpressRequest:async (req,res)=>{
+      fulfillmentExpressUpdateCalls.push({ user:req.authUser,body:req.body });
+      res.json({ code:0,data:{ orderId:req.body.orderId,newOrderCreated:false,remoteUpdated:true },message:'国内快递号已修改' });
+    },
     refreshOrderDimensionsData:async (user,orderId) => {
       dimensionCalls.push({ user,orderId });
       return { dimensionsLatest:{ available:true },dimensionsChanged:true };
@@ -137,7 +141,7 @@ async function testRoutes() {
   assert.equal(configRes.statusCode,200);
   assert.equal(configRes.body.data.appId,DEFAULT_APP_ID);
   assert.equal(configRes.body.data.writeOperationsEnabled,true);
-  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit']);
+  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit','fulfillment_express_update']);
 
   const anonymousRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/orders'),{ headers:{},query:{} },anonymousRes);
@@ -199,6 +203,16 @@ async function testRoutes() {
   assert.equal(fulfillmentSubmitRes.body.data.success,1);
   assert.equal(fulfillmentSubmitCalls[0].user.username,'CNTORO');
   assert.deepEqual(fulfillmentSubmitCalls[0].body,fulfillmentBody);
+
+  const expressUpdateBody={ orderId:'order-1',carrier:'中通快递',trackingNumber:'ZT999',shippingRemark:'更正单号' };
+  const expressUpdateRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/fulfillment/update-express'),{
+    headers:{ authorization:'Bearer cntoro-token' },body:expressUpdateBody
+  },expressUpdateRes);
+  assert.equal(expressUpdateRes.statusCode,200);
+  assert.equal(expressUpdateRes.body.data.newOrderCreated,false);
+  assert.equal(fulfillmentExpressUpdateCalls[0].user.username,'CNTORO');
+  assert.deepEqual(fulfillmentExpressUpdateCalls[0].body,expressUpdateBody);
 
   const costRes=responseRecorder();
   await runHandlers(routes.get('PATCH /api/miniprogram/v1/orders/:orderId/cost'),{
