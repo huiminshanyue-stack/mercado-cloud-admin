@@ -309,6 +309,10 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
     // third-party order number; older deployments continue to read erpOrdersn.
     erpOrderSn: identity,
     note: externalUserId ? `山月ERP ${identity}` : '山月ERP',
+    // Yeeke renders sysUserNote in the order metadata area beneath the goods
+    // status. Keep goodsType numeric (1 = 普货) and use this text field for
+    // the stable Shanyue user identity instead.
+    sysUserNote: externalUserId ? identity : undefined,
     pdfString: pdfString || undefined,
     trackingNo: officialTrackingNumber || undefined,
     selectProList: [...new Set((Array.isArray(serviceCodes) ? serviceCodes : []).map(String).filter(Boolean))],
