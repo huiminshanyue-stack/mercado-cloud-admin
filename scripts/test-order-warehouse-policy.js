@@ -141,6 +141,8 @@ assert.ok(serverSource.includes("warehouseConfigurationReadRole: 'admin'") && se
 assert.ok(orderFrontendSource.includes('二次推单会在新仓库创建新订单'), 'the UI must explain the second-push and previous-order cancellation flow');
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');
+assert.ok(orderStyleSource.includes('grid-template-columns:minmax(0,1fr) auto'), 'the fulfillment summary must use the compact two-column layout');
+assert.ok(orderStyleSource.includes('flex-wrap:wrap') && orderStyleSource.includes('font-size:10px'), 'the fulfillment actions must wrap compactly instead of covering order details');
 assert.ok(miniDetailSource.includes('/api/miniprogram/v1/fulfillment-options') && miniDetailSource.includes('/api/miniprogram/v1/fulfillment/submit'), 'the mini-program order detail must use the protected fulfillment APIs');
 assert.ok(miniDetailSource.includes('/api/miniprogram/v1/fulfillment/update-express'), 'the mini-program must update courier details on the original Yeeke order');
 assert.ok(miniDetailSource.includes('quantityByOrder') && miniDetailSource.includes('remarkByOrder'), 'the mini-program must submit quantity and courier remarks');
