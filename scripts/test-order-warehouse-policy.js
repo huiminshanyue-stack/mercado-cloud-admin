@@ -144,6 +144,8 @@ assert.ok(orderFrontendSource.includes('/api/admin/warehouse-addresses'), 'the w
 assert.ok(orderFrontendSource.includes('/api/admin/fulfillment-options'), 'non-admin users must load only safe fulfillment choices');
 assert.ok(orderFrontendSource.includes('仓库地址') && orderFrontendSource.includes('warehouse-addresses'), 'warehouse addresses must have a standalone tab visible to order users');
 assert.ok(serverSource.includes("warehouseAddressTabRoles: ['admin','agent','user']"), 'warehouse address tab metadata must allow all order roles');
+assert.ok(serverSource.includes("orderManagementMenuRoles: ['admin','agent']"), 'the temporary web order-management menu must be limited to administrators and agents');
+assert.ok(/admin","agent"\]\.includes\(/.test(rootAssetSource), 'the production root bundle must hide order management from ordinary users');
 assert.ok(serverSource.includes("warehouseConfigurationTabRole: 'admin'"), 'warehouse configuration tab metadata must stay administrator-only');
 assert.ok(serverSource.includes("warehouseConfigurationReadRole: 'admin'") && serverSource.includes('fulfillmentOptionsExcludeCredentials: true'), 'configuration reads must stay admin-only while safe options exclude credentials');
 assert.ok(orderFrontendSource.includes('二次推单会在所选仓库创建新订单') && orderFrontendSource.includes('可以继续选择当前仓库'), 'the UI must explain the second-push and same-warehouse flow');

@@ -3173,7 +3173,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.28',
+    version: '2026-07-31.29',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3185,6 +3185,7 @@ app.get('/api/health/order-management', (req, res) => {
     sharedAdminWarehouseCatalog: true,
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
+    orderManagementMenuRoles: ['admin','agent'],
     fulfillmentMergedIntoWorkbench: true,
     fulfillmentResubmit: true,
     fulfillmentResubmitAllowsSameWarehouse: true,
