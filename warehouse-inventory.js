@@ -13,6 +13,7 @@ function normalizeStockAllocations(value) {
     stockSku: String(item?.stockSku || '').trim() || undefined,
     skuMismatchConfirmed: item?.skuMismatchConfirmed === true ? true : undefined,
     remoteProductId: String(item?.remoteProductId || item?.stockId || item?.sysCode || '').trim(),
+    remoteFulfillmentId: String(item?.remoteFulfillmentId || '').trim() || undefined,
     quantity: positiveInteger(item?.quantity)
   })).filter(item => item.sku && item.remoteProductId && item.quantity > 0);
 }
@@ -34,7 +35,11 @@ function takeStockAllocations(pool, sku, maximumQuantity) {
   for (const entry of entries) {
     if (remaining <= 0) break;
     const quantity = Math.min(remaining,entry.remaining);
-    if (quantity > 0) allocations.push({ remoteProductId:entry.remoteProductId,quantity });
+    if (quantity > 0) allocations.push(compactObject({
+      remoteProductId:entry.remoteProductId,
+      remoteFulfillmentId:entry.remoteFulfillmentId,
+      quantity
+    }));
     entry.remaining -= quantity;
     remaining -= quantity;
   }
@@ -87,7 +92,14 @@ function validateFulfillmentStockAllocations(orderRows, requested, availableRows
     const stock = available.get(stockId);
     if (quantity > Number(stock.availableQuantity || 0)) throw new Error(`库存 ${stock.sku} 仅剩 ${stock.availableQuantity} 件可发，不能提交 ${quantity} 件`);
   }
-  return allocations.map(allocation => ({ ...allocation,productName:available.get(allocation.remoteProductId)?.productName || '' }));
+  return allocations.map(allocation => {
+    const stock = available.get(allocation.remoteProductId) || {};
+    return compactObject({
+      ...allocation,
+      remoteFulfillmentId:String(stock.remoteFulfillmentId || '').trim() || undefined,
+      productName:stock.productName || ''
+    });
+  });
 }
 
 function extractRecords(data) {
@@ -194,6 +206,8 @@ function normalizeShopeexStock(record = {}) {
   return {
     remoteId: String(record.stockPlusId || ''),
     remoteInboundNo: String(record.trackingNumber || record.stockPlusId || ''),
+    // Shopeex documents trackingNumber as the inventory number used for order packing.
+    remoteFulfillmentId: String(record.trackingNumber || '').trim(),
     warehouseLocation,
     remoteStatus: String(record.status ?? ''),
     requestedQuantity: positiveInteger(record.skuNum),

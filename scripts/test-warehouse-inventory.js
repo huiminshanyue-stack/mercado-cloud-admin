@@ -18,10 +18,11 @@ assert.deepStrictEqual(takeStockAllocations(allocationPool,'sku-1',3),[
 ]);
 const validAllocation = validateFulfillmentStockAllocations(
   [{ items:[{ item:{ seller_custom_field:'SKU-1' },quantity:3 }] }],
-  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',quantity:2 }],
-  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',productName:'商品一',availableQuantity:2 }]
+  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',remoteFulfillmentId:'FORGED',quantity:2 }],
+  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',remoteFulfillmentId:'KC10001',productName:'商品一',availableQuantity:2 }]
 );
 assert.strictEqual(validAllocation[0].productName,'商品一');
+assert.strictEqual(validAllocation[0].remoteFulfillmentId,'KC10001');
 assert.throws(() => validateFulfillmentStockAllocations(
   [{ items:[{ item:{ seller_custom_field:'SKU-1' },quantity:3 }] }],
   [{ sku:'SKU-1',remoteProductId:'REMOTE-1',quantity:3 }],
@@ -84,6 +85,7 @@ const si = normalizeShopeexStock({ stockPlusId: 8, trackingNumber: 'KC100', stat
   arrivedStore: 1, skuNum: 6, trackingAmount: 5, itemNo: 'SKU-3',
   stockAreaCodeTitle:'X',stockGoodsCodeTitle:'01',locationNo:5 });
 assert.strictEqual(si.remoteInboundNo, 'KC100');
+assert.strictEqual(si.remoteFulfillmentId, 'KC100');
 assert.strictEqual(si.warehouseLocation, 'X-01-5');
 assert.strictEqual(si.requestedQuantity, 6);
 assert.strictEqual(si.receivedQuantity, 5);

@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const server = fs.readFileSync(path.join(__dirname,'..','server.js'),'utf8');
+const shopeex = fs.readFileSync(path.join(__dirname,'..','shopeex-client.js'),'utf8');
 const frontend = fs.readFileSync(path.join(__dirname,'..','..','frontend','src','components','WarehouseInventoryManagement.vue'),'utf8');
 const orderFrontend = fs.readFileSync(path.join(__dirname,'..','..','frontend','src','components','OrderManagement.vue'),'utf8');
 
@@ -31,6 +32,8 @@ assert.ok(orderFrontend.includes('仓库库存发货'), 'fulfillment dialog must
 assert.ok(orderFrontend.includes('/api/admin/warehouse-inventory/fulfillable'), 'fulfillment dialog must load user-owned fulfillable stock');
 assert.ok(orderFrontend.includes('stockByOrder'), 'selected stock allocations must be submitted to the server');
 assert.ok(server.includes("warehouseInventoryDisplayFields: ['remoteInboundNo','warehouseLocation']"), 'health check must expose warehouse number and location support');
+assert.ok(server.includes("shopeexStockFulfillmentIdField: 'trackingNumber'"), 'health check must expose the Shopeex packing inventory number field');
+assert.ok(shopeex.includes('allocation.remoteFulfillmentId || allocation.remoteProductId'), 'Shopeex stock fulfillment must send the documented trackingNumber inventory number');
 assert.ok(server.includes('fulfillmentStockManualSkuMapping: true'), 'health check must expose confirmed manual SKU mapping support');
 assert.ok(frontend.includes('prop="remoteInboundNo" label="仓库编号"'), 'inventory table must display the remote warehouse number');
 assert.ok(frontend.includes('prop="warehouseLocation" label="库存位置"'), 'inventory table must display the warehouse location');

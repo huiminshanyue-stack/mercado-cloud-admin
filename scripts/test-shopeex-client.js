@@ -75,10 +75,10 @@ async function run() {
   const stockPayload = buildShopeexOrderPayload({
     row:{ ml_order_id:'STOCK-1',country:'CL',items:[{ item:{ title:'Stock item',seller_custom_field:'SKU-STOCK' },quantity:2 }],raw_data:{} },
     storeAddressId:180,airwayBillUrl:'https://static.example/label.pdf',fulfillmentMode:'stock',shippingQuantity:2,
-    stockAllocations:[{ sku:'SKU-STOCK',remoteProductId:'9988',quantity:2 }]
+    stockAllocations:[{ sku:'SKU-STOCK',remoteProductId:'9988',remoteFulfillmentId:'KC10009988',quantity:2 }]
   });
   assert.deepStrictEqual(stockPayload.kjxOrderItems[0].batchItemLogisticsDTOs,[{
-    logisticsNo:'9988',logisticsType:3,stockCount:2
+    logisticsNo:'KC10009988',logisticsType:3,stockCount:2
   }]);
   console.log('Shopeex client tests passed');
 }

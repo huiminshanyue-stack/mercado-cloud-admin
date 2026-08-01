@@ -3249,7 +3249,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.02',
+    version: '2026-08-02.03',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
     orderLabelOwnershipVerification: 'official-shipment-sender-api',
@@ -3281,6 +3281,7 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentStockManualSkuMapping: true,
     yeekeStockFulfillmentField: 'orderItems[].stockInfos[]',
     shopeexStockFulfillmentLogisticsType: 3,
+    shopeexStockFulfillmentIdField: 'trackingNumber',
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
     orderManagementMenuRoles: ['admin','agent'],
@@ -7371,6 +7372,7 @@ async function getFulfillableWarehouseStock(ownerUsername, connector, { includeE
     return {
       remoteProductId:String(local.remoteProductId),sku:String(local.sku || ''),productName:String(local.productName || ''),
       image:String(local.image || remoteItem.image || remoteItem.skuImage || ''),provider:connector.provider,
+      remoteFulfillmentId:connector.provider === 'shopeex' ? shopeexStock.remoteFulfillmentId : String(local.remoteProductId),
       remoteInboundNo:connector.provider === 'shopeex' ? shopeexStock.remoteInboundNo
         : String(remoteItem.storageBillCode || remoteItem.stockCode || remoteItem.sysCode || local.remoteProductId || ''),
       warehouseLocation:connector.provider === 'shopeex' ? shopeexStock.warehouseLocation

@@ -165,7 +165,7 @@ function buildShopeexOrderPayload({ row, rows, displayOrderId, providerOrderNumb
         variationSku: sku,
         variationName: String(entry?.variation_name || item?.variation_name || '').slice(0,500),
         batchItemLogisticsDTOs: stockMode ? itemStockAllocations.map(allocation => ({
-          logisticsNo: allocation.remoteProductId,
+          logisticsNo: allocation.remoteFulfillmentId || allocation.remoteProductId,
           logisticsType: 3,
           stockCount: allocation.quantity
         })) : [{
