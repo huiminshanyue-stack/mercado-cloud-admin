@@ -35,9 +35,41 @@ function orderLabelAuthorizationCandidates(rows, authorizations, shipmentId = ''
   });
 }
 
+function officialShipmentSenderIds(shipment) {
+  const values = [
+    shipment?.sender_id,
+    shipment?.sender?.id,
+    shipment?.origin?.sender_id,
+    shipment?.origin?.sender?.id
+  ];
+  return [...new Set(values.map(text).filter(Boolean))];
+}
+
+function selectOrderLabelContext(contexts, expectedStoreIds = []) {
+  const available = (contexts || []).filter(context => context?.token);
+  const expected = new Set((expectedStoreIds || []).map(text).filter(Boolean));
+  const callerId = context => text(context.actualCallerId || context.sellerId);
+  const shipmentOwner = available.find(context =>
+    context.verifiedShipmentAccess
+    && (context.shipmentSenderIds || []).includes(callerId(context))
+  );
+  if (shipmentOwner) return shipmentOwner;
+  const exactShipmentReader = available.find(context =>
+    context.verifiedShipmentAccess && expected.has(callerId(context))
+  );
+  if (exactShipmentReader) return exactShipmentReader;
+  const exactOrderOwner = available.find(context =>
+    context.verifiedOrderOwnership && expected.has(callerId(context))
+  );
+  if (exactOrderOwner) return exactOrderOwner;
+  return null;
+}
+
 module.exports = {
   orderLabelRowsForShipment,
   orderLabelExpectedStoreIds,
   orderLabelOrderIds,
-  orderLabelAuthorizationCandidates
+  orderLabelAuthorizationCandidates,
+  officialShipmentSenderIds,
+  selectOrderLabelContext
 };
