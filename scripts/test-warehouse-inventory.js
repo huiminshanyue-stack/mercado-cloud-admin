@@ -37,6 +37,17 @@ assert.throws(() => validateFulfillmentStockAllocations(
   [{ sku:'SAME-SKU',remoteProductId:'OTHER-USER-STOCK',quantity:1 }],
   [{ sku:'SAME-SKU',remoteProductId:'CURRENT-USER-STOCK',availableQuantity:5 }]
 ),/不属于当前用户/);
+assert.throws(() => validateFulfillmentStockAllocations(
+  [{ items:[{ item:{ seller_custom_field:'ORDER-SKU' },quantity:1 }] }],
+  [{ sku:'ORDER-SKU',stockSku:'WAREHOUSE-SKU',remoteProductId:'CURRENT-STOCK',quantity:1 }],
+  [{ sku:'WAREHOUSE-SKU',remoteProductId:'CURRENT-STOCK',availableQuantity:1 }]
+),/请人工确认后再提交/);
+const manualSkuMapping = validateFulfillmentStockAllocations(
+  [{ items:[{ item:{ seller_custom_field:'ORDER-SKU' },quantity:1 }] }],
+  [{ sku:'ORDER-SKU',stockSku:'WAREHOUSE-SKU',skuMismatchConfirmed:true,remoteProductId:'CURRENT-STOCK',quantity:1 }],
+  [{ sku:'WAREHOUSE-SKU',remoteProductId:'CURRENT-STOCK',availableQuantity:1 }]
+);
+assert.strictEqual(manualSkuMapping[0].skuMismatchConfirmed,true);
 
 const yeeke = buildYeekeInboundPayload({
   warehouseCode: 'th', localInboundNo: 'IN-SY12345-1', trackingNumber: 'YT100',
@@ -70,8 +81,10 @@ assert.strictEqual(yi.requestedQuantity, 5);
 assert.strictEqual(yi.receivedQuantity, 4);
 
 const si = normalizeShopeexStock({ stockPlusId: 8, trackingNumber: 'KC100', status: 2,
-  arrivedStore: 1, skuNum: 6, trackingAmount: 5, itemNo: 'SKU-3' });
+  arrivedStore: 1, skuNum: 6, trackingAmount: 5, itemNo: 'SKU-3',
+  stockAreaCodeTitle:'X',stockGoodsCodeTitle:'01',locationNo:5 });
 assert.strictEqual(si.remoteInboundNo, 'KC100');
+assert.strictEqual(si.warehouseLocation, 'X-01-5');
 assert.strictEqual(si.requestedQuantity, 6);
 assert.strictEqual(si.receivedQuantity, 5);
 

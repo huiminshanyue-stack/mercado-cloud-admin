@@ -3249,7 +3249,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.01',
+    version: '2026-08-02.02',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
     orderLabelOwnershipVerification: 'official-shipment-sender-api',
@@ -3277,6 +3277,8 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentStockOnlyReceivedInventory: true,
     fulfillmentStockUserOwnedOnly: true,
     fulfillmentStockAvailabilityLimit: 'min(user_received_minus_allocated,remote_available)',
+    warehouseInventoryDisplayFields: ['remoteInboundNo','warehouseLocation'],
+    fulfillmentStockManualSkuMapping: true,
     yeekeStockFulfillmentField: 'orderItems[].stockInfos[]',
     shopeexStockFulfillmentLogisticsType: 3,
     warehouseConfigurationWriteRole: 'admin',
@@ -7361,6 +7363,7 @@ async function getFulfillableWarehouseStock(ownerUsername, connector, { includeE
 
   return localResult.rows.map(local => {
     const remoteItem = remoteMap.get(String(local.remoteProductId)) || {};
+    const shopeexStock = connector.provider === 'shopeex' ? normalizeShopeexStock(remoteItem) : null;
     const remoteAvailable = Math.max(0,Math.floor(Number(connector.provider === 'yeeke'
       ? remoteItem.availableNum : remoteItem.trackingAmount) || 0));
     const allocatedQuantity = used.get(String(local.remoteProductId)) || 0;
@@ -7368,6 +7371,10 @@ async function getFulfillableWarehouseStock(ownerUsername, connector, { includeE
     return {
       remoteProductId:String(local.remoteProductId),sku:String(local.sku || ''),productName:String(local.productName || ''),
       image:String(local.image || remoteItem.image || remoteItem.skuImage || ''),provider:connector.provider,
+      remoteInboundNo:connector.provider === 'shopeex' ? shopeexStock.remoteInboundNo
+        : String(remoteItem.storageBillCode || remoteItem.stockCode || remoteItem.sysCode || local.remoteProductId || ''),
+      warehouseLocation:connector.provider === 'shopeex' ? shopeexStock.warehouseLocation
+        : String(remoteItem.warehouseLocation || remoteItem.positionCode || remoteItem.location || ''),
       receivedQuantity:Number(local.receivedQuantity || 0),allocatedQuantity,remoteAvailableQuantity:remoteAvailable,
       availableQuantity:Math.min(localAvailable,remoteAvailable),remoteStatus:String(remoteItem.status ?? '')
     };

@@ -30,5 +30,10 @@ assert.ok(!frontend.includes('providerLabel'), 'warehouse selectors must only di
 assert.ok(orderFrontend.includes('仓库库存发货'), 'fulfillment dialog must offer warehouse stock fulfillment');
 assert.ok(orderFrontend.includes('/api/admin/warehouse-inventory/fulfillable'), 'fulfillment dialog must load user-owned fulfillable stock');
 assert.ok(orderFrontend.includes('stockByOrder'), 'selected stock allocations must be submitted to the server');
+assert.ok(server.includes("warehouseInventoryDisplayFields: ['remoteInboundNo','warehouseLocation']"), 'health check must expose warehouse number and location support');
+assert.ok(server.includes('fulfillmentStockManualSkuMapping: true'), 'health check must expose confirmed manual SKU mapping support');
+assert.ok(frontend.includes('prop="remoteInboundNo" label="仓库编号"'), 'inventory table must display the remote warehouse number');
+assert.ok(frontend.includes('prop="warehouseLocation" label="库存位置"'), 'inventory table must display the warehouse location');
+assert.ok(orderFrontend.includes('确认人工库存映射'), 'SKU mismatch must require explicit confirmation before submission');
 
 console.log('Warehouse inventory policy tests passed');

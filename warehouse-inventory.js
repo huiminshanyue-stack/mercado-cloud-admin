@@ -8,8 +8,10 @@ function compactObject(value) {
 }
 
 function normalizeStockAllocations(value) {
-  return (Array.isArray(value) ? value : []).map(item => ({
+  return (Array.isArray(value) ? value : []).map(item => compactObject({
     sku: String(item?.sku || '').trim(),
+    stockSku: String(item?.stockSku || '').trim() || undefined,
+    skuMismatchConfirmed: item?.skuMismatchConfirmed === true ? true : undefined,
     remoteProductId: String(item?.remoteProductId || item?.stockId || item?.sysCode || '').trim(),
     quantity: positiveInteger(item?.quantity)
   })).filter(item => item.sku && item.remoteProductId && item.quantity > 0);
@@ -65,7 +67,12 @@ function validateFulfillmentStockAllocations(orderRows, requested, availableRows
   for (const allocation of allocations) {
     const stock = available.get(allocation.remoteProductId);
     if (!stock) throw new Error(`库存 ${allocation.remoteProductId} 不属于当前用户、尚未成功入库或已经没有可用数量`);
-    if (String(stock.sku).toUpperCase() !== allocation.sku.toUpperCase()) throw new Error(`库存 ${stock.sku} 与订单 SKU ${allocation.sku} 不匹配`);
+    const actualStockSku = String(stock.sku || '').trim();
+    const skuMismatch = actualStockSku.toUpperCase() !== allocation.sku.toUpperCase();
+    if (allocation.stockSku && allocation.stockSku.toUpperCase() !== actualStockSku.toUpperCase()) {
+      throw new Error(`库存 ${allocation.remoteProductId} 的 SKU 已变化，请重新选择库存`);
+    }
+    if (skuMismatch && !allocation.skuMismatchConfirmed) throw new Error(`库存 ${actualStockSku} 与订单 SKU ${allocation.sku} 不匹配，请人工确认后再提交`);
     const skuKey = allocation.sku.toUpperCase();
     allocatedBySku.set(skuKey,(allocatedBySku.get(skuKey) || 0) + allocation.quantity);
     allocatedByStock.set(allocation.remoteProductId,(allocatedByStock.get(allocation.remoteProductId) || 0) + allocation.quantity);
@@ -181,9 +188,13 @@ function normalizeYeekeInbound(record = {}) {
 }
 
 function normalizeShopeexStock(record = {}) {
+  const warehouseLocation = String(record.stockLocation || '').trim()
+    || [record.stockAreaCodeTitle,record.stockGoodsCodeTitle,record.locationNo]
+      .map(value => String(value ?? '').trim()).filter(Boolean).join('-');
   return {
     remoteId: String(record.stockPlusId || ''),
     remoteInboundNo: String(record.trackingNumber || record.stockPlusId || ''),
+    warehouseLocation,
     remoteStatus: String(record.status ?? ''),
     requestedQuantity: positiveInteger(record.skuNum),
     receivedQuantity: Number(record.arrivedStore) === 1
