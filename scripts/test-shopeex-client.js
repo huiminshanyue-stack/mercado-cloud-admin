@@ -4,7 +4,8 @@ const {
   SHOPEEX_COUNTRY_IDS,
   buildShopeexEnvelope,
   createShopeexClient,
-  buildShopeexOrderPayload
+  buildShopeexOrderPayload,
+  selectShopeexWarehouseAddress
 } = require('../shopeex-client');
 
 async function run() {
@@ -22,13 +23,21 @@ async function run() {
     throw new Error(`unexpected URL ${url}`);
   } };
   const client = createShopeexClient({ appKey: 'app-key', appSecret: 'secret' }, request);
-  await client.authorize('c888.shopeex.cn', 'seller', 'password');
+  await client.authorize('https://c888.shopeex.cn/', 'seller', 'password');
+  assert.strictEqual(calls[0].body.requestBody.accessUrl, 'c888.shopeex.cn');
   await client.userInfo();
   assert.strictEqual(calls[1].options.headers.openId, 'OPEN-1');
   const uploaded = await client.uploadPdf('data/application/pdf/base64/JVBERi0=');
   assert.strictEqual(uploaded.fileUrl, 'https://static.example/label.pdf');
   const created = await client.createAndPackage({ orderSn: '200001' });
   assert.strictEqual(created.kjxOrderIds, 'KJX-1');
+  const addresses = [
+    { storeAddressId: 180, storeName: '浙江 义乌仓', status: 1 },
+    { storeAddressId: 1396, storeName: '广东 东莞仓', status: 1 }
+  ];
+  assert.strictEqual(selectShopeexWarehouseAddress(addresses,{ connectorName:'X东莞仓（2.5）',defaultId:180 }).storeAddressId,1396);
+  assert.strictEqual(selectShopeexWarehouseAddress(addresses,{ connectorName:'未知仓',defaultId:180 }).storeAddressId,180);
+  assert.strictEqual(selectShopeexWarehouseAddress(addresses,{ requestedId:1396,defaultId:180 }).storeAddressId,1396);
 
   const payload = buildShopeexOrderPayload({
     row: {

@@ -32,7 +32,9 @@ const {
 const {
   DEFAULT_SHOPEEX_BASE_URL,
   createShopeexClient,
-  buildShopeexOrderPayload
+  buildShopeexOrderPayload,
+  normalizeShopeexAccessUrl,
+  selectShopeexWarehouseAddress
 } = require('./shopeex-client');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
@@ -3179,7 +3181,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-01.01',
+    version: '2026-08-01.03',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3242,6 +3244,9 @@ app.get('/api/health/order-management', (req, res) => {
     shopeexKjxPdfUpload: true,
     shopeexKjxValueAddedServiceSync: true,
     shopeexKjxWarehouseAddressValidation: true,
+    shopeexKjxDefaultWarehouseAddressAutoSelect: true,
+    shopeexKjxAccessUrlNormalization: true,
+    shopeexKjxWarehouseNameMatching: true,
     fulfillmentExpressUpdateCreatesNewOrder: false,
     fulfillmentSubmittedOrderGroup: true,
     fulfillmentWarehouseFilter: true,
@@ -7893,14 +7898,14 @@ app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
       appKey: String(req.body?.appKey || '').trim(),
       appSecret: String(req.body?.appSecret || '').trim(),
       openId: String(req.body?.openId || '').trim(),
-      accessUrl: String(req.body?.accessUrl || '').trim(),
+      accessUrl: normalizeShopeexAccessUrl(req.body?.accessUrl),
       userName: String(req.body?.userName || '').trim(),
       password: String(req.body?.password || ''),
       storeAddressId: Number(req.body?.storeAddressId),
       storeName: ''
     };
-    if (!config.appKey || !config.appSecret || !config.storeAddressId || (!config.openId && (!config.accessUrl || !config.userName || !config.password))) {
-      return res.status(400).json({ code:400,message:'Shopeex/KJX 配置不完整：请填写 key、secret、仓库地址ID，并填写 openId 或仓库登录信息' });
+    if (!config.appKey || !config.appSecret || (!config.openId && (!config.accessUrl || !config.userName || !config.password))) {
+      return res.status(400).json({ code:400,message:'Shopeex/KJX 配置不完整：请填写 key、secret，并填写 openId 或仓库登录信息' });
     }
     try { target = new URL(`${config.baseUrl.replace(/\/+$/, '')}/api/batch/add`); } catch { return res.status(400).json({ code:400,message:'Shopeex/KJX 地址格式错误' }); }
     if (target.hostname !== 'openapi-v3.shopeex.cn') return res.status(400).json({ code:400,message:'Shopeex/KJX 生产连接只允许 openapi-v3.shopeex.cn' });
@@ -7910,9 +7915,14 @@ app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
         await client.authorize(config.accessUrl,config.userName,config.password);
         config.openId = client.getOpenId();
       }
-      const addresses = await client.listWarehouseAddresses();
-      const selected = Array.isArray(addresses) ? addresses.find(item => Number(item?.storeAddressId) === config.storeAddressId) : null;
-      if (!selected) return res.status(400).json({ code:400,message:'Shopeex/KJX 账号下不存在所填仓库地址ID' });
+      const [addresses,userData] = await Promise.all([client.listWarehouseAddresses(),client.userInfo()]);
+      const requestedAddressId = Number(config.storeAddressId);
+      const defaultAddressId = Number(userData?.userInfo?.storeAddressId);
+      const selected = selectShopeexWarehouseAddress(addresses,{ requestedId:requestedAddressId,defaultId:defaultAddressId,connectorName:name });
+      if (!selected) return res.status(400).json({ code:400,message:requestedAddressId
+        ? 'Shopeex/KJX 账号下不存在所填仓库地址ID'
+        : 'Shopeex/KJX 账号没有可用仓库地址，请先在仓库后台添加或启用地址' });
+      config.storeAddressId = Number(selected.storeAddressId);
       config.storeName = String(selected.storeName || selected.desp || '');
     } catch (error) {
       return res.status(502).json({ code:502,message:`Shopeex/KJX 配置验证失败: ${error.response?.data?.message || error.message}` });

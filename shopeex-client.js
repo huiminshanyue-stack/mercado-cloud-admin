@@ -5,6 +5,27 @@ const DEFAULT_SHOPEEX_BASE_URL = 'https://openapi-v3.shopeex.cn';
 const SHOPEEX_MERCADO_PLATFORM_ID = 48;
 const SHOPEEX_COUNTRY_IDS = Object.freeze({ BR: 12, MX: 13, CO: 23, CL: 25 });
 
+function normalizeShopeexAccessUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  try { return new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`).hostname; }
+  catch (_) { return text.replace(/^https?:\/\//i, '').replace(/\/+$/, ''); }
+}
+
+function selectShopeexWarehouseAddress(addresses, { requestedId, defaultId, connectorName } = {}) {
+  const active = (Array.isArray(addresses) ? addresses : []).filter(item => Number(item?.status ?? 1) !== 0 && Number(item?.storeAddressId) > 0);
+  const requested = Number(requestedId);
+  if (requested) return active.find(item => Number(item.storeAddressId) === requested) || null;
+  const localName = String(connectorName || '').replace(/[（(][^）)]*[）)]/g, '').replace(/\s+/g, '').toLowerCase();
+  const nameMatched = active.find(item => {
+    const remoteName = String(item?.storeName || item?.desp || '').trim();
+    const compact = remoteName.replace(/\s+/g, '').toLowerCase();
+    const lastToken = String(remoteName.split(/[\s,，/]+/).filter(Boolean).pop() || '').toLowerCase();
+    return [compact,lastToken].some(alias => alias.length >= 3 && (localName.includes(alias) || alias.includes(localName)));
+  });
+  return nameMatched || active.find(item => Number(item.storeAddressId) === Number(defaultId)) || active[0] || null;
+}
+
 function compactObject(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null));
 }
@@ -44,7 +65,7 @@ function createShopeexClient(config = {}, request = axios) {
   return {
     async authorize(accessUrl, username, password) {
       const data = await call('/api/kjxUser/authLogin', {
-        accessUrl: String(accessUrl || '').trim(),
+        accessUrl: normalizeShopeexAccessUrl(accessUrl),
         username: String(username || '').trim(),
         password: String(password || '')
       }, { requireOpenId: false });
@@ -188,6 +209,8 @@ module.exports = {
   DEFAULT_SHOPEEX_BASE_URL,
   SHOPEEX_MERCADO_PLATFORM_ID,
   SHOPEEX_COUNTRY_IDS,
+  normalizeShopeexAccessUrl,
+  selectShopeexWarehouseAddress,
   buildShopeexEnvelope,
   createShopeexClient,
   buildShopeexOrderPayload
