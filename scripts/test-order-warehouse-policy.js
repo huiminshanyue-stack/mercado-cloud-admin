@@ -68,6 +68,7 @@ for (const route of [
   "app.delete('/api/admin/fulfillment-services/:id', requireAdmin",
   "app.get('/api/admin/logistics-companies', requireAdmin",
   "app.post('/api/admin/logistics-companies', requireAdmin",
+  "app.put('/api/admin/logistics-companies/:id', requireAdmin",
   "app.delete('/api/admin/logistics-companies/:id', requireAdmin",
   "app.post('/api/admin/warehouse-addresses', requireAdmin",
   "app.put('/api/admin/warehouse-addresses/:id', requireAdmin",
@@ -87,6 +88,7 @@ assert.ok(serverSource.includes('fulfillmentResubmit: true'), 'users must be all
 assert.ok(serverSource.includes("fulfillmentSubmissionAllowedShipmentStatus: 'ready_to_ship'"), 'only ready-to-ship orders may enter fulfillment submission');
 assert.ok((serverSource.match(/fulfillmentSubmissionEligibility\(orderResult\.rows\)/g) || []).length >= 2, 'both new submissions and retries must enforce shipment eligibility');
 assert.ok(serverSource.includes('请先选择需要提交代贴单的订单') && serverSource.includes('请选择要提交的仓库') && serverSource.includes('请选择国内物流公司'), 'missing submit parameters must return field-specific feedback');
+assert.ok(serverSource.includes('国内物流公司“${carrier}”缺少 Shopeex/KJX 快递代码') && serverSource.includes('国内物流公司“${submission.carrier}”缺少 Shopeex/KJX 快递代码'), 'new and retry submissions must identify the carrier whose Shopeex code is missing');
 assert.ok(serverSource.includes('quantityByOrder') && serverSource.includes('remarkByOrder'), 'shipping quantity and courier remarks must be accepted per order');
 assert.ok(serverSource.includes('发货数量必须是 1 至') && serverSource.includes('快递备注不能超过 500 个字'), 'shipping quantity and remark validation must be actionable');
 assert.ok(yeekeSource.includes('erpOrdersn: identity') && yeekeSource.includes('erpOrderSn: identity') && yeekeSource.includes('shopID: identity') && yeekeSource.includes('sysUserNote: externalUserId ? identity') && !yeekeSource.includes('shopId: identity') && yeekeSource.includes('`山月ERP ${identity}`'), 'Yeeke identity must use third-party, system-note, and shopID fields without populating shopName');
@@ -147,6 +149,7 @@ assert.ok(orderFrontendSource.includes('修改原订单国内快递号') && orde
 assert.ok(orderFrontendSource.includes('www.kuaidi100.com/chaxun'), 'domestic tracking must open a prefilled Kuaidi100 web query');
 assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.includes('shunfeng') && orderFrontendSource.includes('jtexpress'), 'common domestic carriers must be mapped for automatic query filling');
 assert.ok(orderFrontendSource.includes('仓库收货地址') && orderFrontendSource.includes('recipientDisplay') && orderFrontendSource.includes('addressDisplay'), 'the workbench must render user-specific shared warehouse addresses');
+assert.ok(orderFrontendSource.includes('未填写（无法提交 Shopeex/KJX）') && orderFrontendSource.includes('设置 Shopeex/KJX 快递代码'), 'administrators must be able to see and edit missing Shopeex courier codes');
 assert.ok(orderFrontendSource.includes('/api/admin/warehouse-addresses'), 'the workbench must load and manage warehouse addresses through the protected API');
 assert.ok(orderFrontendSource.includes('/api/admin/fulfillment-options'), 'non-admin users must load only safe fulfillment choices');
 assert.ok(orderFrontendSource.includes('仓库地址') && orderFrontendSource.includes('warehouse-addresses'), 'warehouse addresses must have a standalone tab visible to order users');

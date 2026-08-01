@@ -3181,7 +3181,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-01.03',
+    version: '2026-08-01.04',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -6957,6 +6957,16 @@ app.post('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
   res.json({ code: 0, data: rows[0] });
 });
 
+app.put('/api/admin/logistics-companies/:id', requireAdmin, async (req, res) => {
+  const name = String(req.body?.name || '').trim(), code = String(req.body?.code || '').trim();
+  if (!name) return res.status(400).json({ code: 400, message: '物流公司名称不能为空' });
+  const { rows } = await pool.query(`UPDATE logistics_companies lc SET name=$2,code=$3,enabled=TRUE
+    FROM users u WHERE lc.id=$1 AND u.username=lc.owner_username AND u.role='admin'
+    RETURNING lc.id,lc.name,lc.code,lc.enabled`,[req.params.id,name.slice(0,120),code.slice(0,100)]);
+  if (!rows[0]) return res.status(404).json({ code: 404, message: '物流公司不存在' });
+  res.json({ code: 0, data: rows[0] });
+});
+
 app.delete('/api/admin/logistics-companies/:id', requireAdmin, async (req, res) => {
   await pool.query('DELETE FROM logistics_companies WHERE id=$1 AND owner_username=$2',[req.params.id,req.authUser.username]);
   res.json({ code: 0 });
@@ -7527,7 +7537,7 @@ async function handleFulfillmentSubmit(req, res) {
   const serviceCodes = ['yeeke','shopeex'].includes(provider)
     ? serviceResult.rows.filter(service => service.source === provider).map(service => String(service.code || '')).filter(Boolean) : [];
   const carrierCode = String(carrierResult.rows[0]?.code || '').trim();
-  if (provider === 'shopeex' && !carrierCode) return res.status(400).json({ code:400,message:'该国内物流公司缺少 Shopeex/KJX 快递代码，请管理员先在物流公司管理中填写代码' });
+  if (provider === 'shopeex' && !carrierCode) return res.status(400).json({ code:400,message:`国内物流公司“${carrier}”缺少 Shopeex/KJX 快递代码，请管理员在“仓库与增值服务 → 物流公司管理”中补充代码` });
   const externalUserId = await getOrderExternalUserId(req.authUser.username);
   let yeekeClient = null;
   if (String(warehouse.provider || 'generic') === 'yeeke') {
@@ -7805,7 +7815,7 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
           JOIN users u ON u.username=lc.owner_username AND u.role='admin'
           WHERE lc.name=$1 AND lc.enabled=TRUE LIMIT 1`,[submission.carrier]);
         carrierCode = String(carrierCodeResult.rows[0]?.code || '').trim();
-        if (!carrierCode) return res.status(400).json({ code:400,message:'该国内物流公司缺少 Shopeex/KJX 快递代码，请管理员先补充代码' });
+        if (!carrierCode) return res.status(400).json({ code:400,message:`国内物流公司“${submission.carrier}”缺少 Shopeex/KJX 快递代码，请管理员在“仓库与增值服务 → 物流公司管理”中补充代码后重试` });
       }
       retryWarehouseFee = feeAmount(submission.unit_price);
       retryServiceFee = Number(retryServices.rows.reduce((sum,service) => sum + feeAmount(service.external_price),0).toFixed(2));
