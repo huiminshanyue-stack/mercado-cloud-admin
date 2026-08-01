@@ -49,6 +49,13 @@ const {
   resolveShopeexLogisticsCode,
   listShopeexLogisticsCatalog
 } = require('./shopeex-logistics');
+const {
+  extractRecords: extractWarehouseRecords,
+  buildYeekeInboundPayload,
+  buildShopeexStockPayload,
+  normalizeYeekeInbound,
+  normalizeShopeexStock
+} = require('./warehouse-inventory');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
@@ -426,6 +433,50 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS owner_username VARCHAR(120)');
   await pool.query("ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS provider VARCHAR(40) NOT NULL DEFAULT 'generic'");
   await pool.query('ALTER TABLE erp_connectors ADD COLUMN IF NOT EXISTS provider_config TEXT');
+  await pool.query(`CREATE TABLE IF NOT EXISTS warehouse_inbounds (
+    id BIGSERIAL PRIMARY KEY,
+    owner_username VARCHAR(120) NOT NULL,
+    warehouse_id BIGINT REFERENCES erp_connectors(id) ON DELETE SET NULL,
+    provider VARCHAR(40) NOT NULL,
+    local_inbound_no VARCHAR(100) NOT NULL,
+    remote_id VARCHAR(160),
+    remote_inbound_no VARCHAR(300),
+    tracking_number VARCHAR(300) NOT NULL,
+    carrier_code VARCHAR(100),
+    carrier_name VARCHAR(200),
+    transport_type VARCHAR(20),
+    expected_date DATE,
+    note TEXT NOT NULL DEFAULT '',
+    status VARCHAR(40) NOT NULL DEFAULT 'creating',
+    remote_status VARCHAR(80),
+    requested_quantity INTEGER NOT NULL DEFAULT 0,
+    received_quantity INTEGER NOT NULL DEFAULT 0,
+    product_count INTEGER NOT NULL DEFAULT 0,
+    request_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    response_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    last_synced_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(owner_username,local_inbound_no)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS warehouse_inbound_items (
+    id BIGSERIAL PRIMARY KEY,
+    inbound_id BIGINT NOT NULL REFERENCES warehouse_inbounds(id) ON DELETE CASCADE,
+    sku VARCHAR(300) NOT NULL,
+    product_name VARCHAR(500) NOT NULL,
+    image TEXT,
+    remote_product_id VARCHAR(200),
+    quantity INTEGER NOT NULL,
+    received_quantity INTEGER NOT NULL DEFAULT 0,
+    remote_status VARCHAR(80),
+    response_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_warehouse_inbounds_owner_created ON warehouse_inbounds(owner_username,created_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_warehouse_inbounds_owner_warehouse ON warehouse_inbounds(owner_username,warehouse_id,status)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_warehouse_inbound_items_inbound ON warehouse_inbound_items(inbound_id,id)');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS erp_push_logs (
       id BIGSERIAL PRIMARY KEY,
@@ -3194,7 +3245,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-01.07',
+    version: '2026-08-01.08',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
     orderLabelOwnershipVerification: 'official-shipment-sender-api',
@@ -3212,6 +3263,12 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentBillingIdempotency: 'username+display-order-id',
     fulfillmentChargeIncludes: ['warehouse_unit_price','value_added_services'],
     sharedAdminWarehouseCatalog: true,
+    warehouseInventoryManagement: true,
+    warehouseInventoryProviders: ['yeeke','shopeex'],
+    warehouseInboundUserIsolation: true,
+    warehouseInboundReturnsRemoteNumberAndQuantities: true,
+    yeekeOfficialInboundOrder: true,
+    shopeexInventoryReviewInbound: true,
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
     orderManagementMenuRoles: ['admin','agent'],
@@ -7231,6 +7288,299 @@ function getShopeexConnectorConfig(connector) {
   }
   return config;
 }
+
+async function getSharedInventoryConnector(id) {
+  const { rows } = await pool.query(`SELECT c.* FROM erp_connectors c
+    JOIN users u ON u.username=c.owner_username AND u.role='admin'
+    WHERE c.id=$1 AND c.enabled=TRUE AND c.provider=ANY($2::varchar[]) LIMIT 1`,
+  [id,['yeeke','shopeex']]);
+  return rows[0] || null;
+}
+
+async function createInventoryProviderClient(connector) {
+  if (connector.provider === 'yeeke') {
+    const config = getYeekeConnectorConfig(connector);
+    const client = createYeekeClient(config);
+    await client.authorize(config.userName,config.password);
+    return { client,config };
+  }
+  if (connector.provider === 'shopeex') {
+    const config = getShopeexConnectorConfig(connector);
+    return { client:createShopeexClient(config),config };
+  }
+  throw new Error('当前仓库不支持库存管理接口');
+}
+
+function localInboundNumber(identity) {
+  const safeIdentity = String(identity || 'SY00000').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,15) || 'SY00000';
+  return `IN-${safeIdentity}-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+}
+
+function normalizedInboundStatus(provider, remoteStatus, receivedQuantity, requestedQuantity) {
+  const status = String(remoteStatus ?? '');
+  if (provider === 'yeeke') {
+    if (status === '4') return 'received';
+    if (status === '5') return 'abnormal';
+    if (status === '6') return 'partially_received';
+  } else {
+    if (status === '-1') return 'abnormal';
+    if (receivedQuantity > 0 && receivedQuantity >= requestedQuantity) return 'received';
+    if (receivedQuantity > 0) return 'partially_received';
+    if (status === '2') return 'approved';
+  }
+  return 'submitted';
+}
+
+async function warehouseInboundWithItems(ownerUsername, inboundId) {
+  const { rows } = await pool.query(`SELECT w.id,w.warehouse_id AS "warehouseId",c.name AS "warehouseName",
+    w.provider,w.local_inbound_no AS "localInboundNo",w.remote_id AS "remoteId",
+    w.remote_inbound_no AS "remoteInboundNo",w.tracking_number AS "trackingNumber",
+    w.carrier_code AS "carrierCode",w.carrier_name AS "carrierName",w.transport_type AS "transportType",
+    w.expected_date AS "expectedDate",w.note,w.status,w.remote_status AS "remoteStatus",
+    w.requested_quantity AS "requestedQuantity",w.received_quantity AS "receivedQuantity",
+    w.product_count AS "productCount",w.error_message AS "errorMessage",w.last_synced_at AS "lastSyncedAt",
+    w.created_at AS "createdAt",w.updated_at AS "updatedAt"
+    FROM warehouse_inbounds w LEFT JOIN erp_connectors c ON c.id=w.warehouse_id
+    WHERE w.owner_username=$1 AND w.id=$2 LIMIT 1`,[ownerUsername,inboundId]);
+  if (!rows[0]) return null;
+  const itemResult = await pool.query(`SELECT id,sku,product_name AS "productName",image,
+    remote_product_id AS "remoteProductId",quantity,received_quantity AS "receivedQuantity",
+    remote_status AS "remoteStatus" FROM warehouse_inbound_items WHERE inbound_id=$1 ORDER BY id`,[inboundId]);
+  return { ...rows[0],items:itemResult.rows };
+}
+
+app.get('/api/admin/warehouse-inventory/options', requireOrderAccess, async (req,res) => {
+  try {
+    const [options,identity] = await Promise.all([getFulfillmentOptionsData(),getOrderExternalUserId(req.authUser.username)]);
+    res.json({ code:0,data:{ userIdentity:identity,connectors:options.connectors.filter(item => ['yeeke','shopeex'].includes(item.provider)) } });
+  } catch (error) {
+    res.status(500).json({ code:500,message:`库存仓库读取失败：${error.message}` });
+  }
+});
+
+app.get('/api/admin/warehouse-inventory/stock', requireOrderAccess, async (req,res) => {
+  try {
+  const connector = await getSharedInventoryConnector(req.query.warehouseId);
+  if (!connector) return res.status(404).json({ code:404,message:'仓库不存在或未启用库存接口' });
+    const { client,config } = await createInventoryProviderClient(connector);
+    const page = Math.max(1,Math.floor(Number(req.query.page) || 1));
+    const size = Math.min(100,Math.max(1,Math.floor(Number(req.query.size) || 30)));
+    const query = String(req.query.query || '').trim();
+    let remote;
+    let records;
+    if (connector.provider === 'yeeke') {
+      remote = await client.listStock({ pageNo:page,pageSize:size,wareHouse:config.warehouseCode,
+        sku:query || undefined });
+      if (query && !extractWarehouseRecords(remote).length) {
+        remote = await client.listStock({ pageNo:page,pageSize:size,wareHouse:config.warehouseCode,name:query });
+      }
+      records = extractWarehouseRecords(remote).map(item => ({
+        remoteId:String(item.id || item.sysCode || ''),sku:String(item.sku || ''),name:String(item.name || item.productName || ''),
+        image:String(item.image || ''),warehouseCode:String(item.wareHouse || config.warehouseCode || ''),
+        availableQuantity:Number(item.availableNum || 0),remainingQuantity:Number(item.remainNum || 0),
+        frozenQuantity:Number(item.frozenNum || 0),onTheWayQuantity:Number(item.onTheWayNum || 0),
+        remoteStatus:String(item.status ?? ''),provider:'yeeke'
+      }));
+    } else {
+      remote = await client.listStock({ pageNumber:page,pageSize:size,stockPlusDeliveryId:Number(config.storeAddressId),
+        itemNo:query || undefined });
+      if (query && !extractWarehouseRecords(remote).length) {
+        remote = await client.listStock({ pageNumber:page,pageSize:size,stockPlusDeliveryId:Number(config.storeAddressId),stockName:query });
+      }
+      records = extractWarehouseRecords(remote).map(item => ({
+        remoteId:String(item.stockPlusId || ''),remoteInboundNo:String(item.trackingNumber || ''),sku:String(item.itemNo || ''),
+        name:String(item.stockName || item.skuName || ''),image:String(item.skuImage || ''),warehouseCode:String(item.stockPlusDeliveryId || ''),
+        availableQuantity:Number(item.trackingAmount || 0),remainingQuantity:Number(item.skuNum || 0),frozenQuantity:0,onTheWayQuantity:Number(item.arrivedStore) === 1 ? 0 : Number(item.skuNum || 0),
+        remoteStatus:String(item.status ?? ''),arrivedStore:Number(item.arrivedStore || 0),provider:'shopeex'
+      }));
+    }
+    res.json({ code:0,data:{ provider:connector.provider,warehouseId:connector.id,warehouseName:connector.name,page,size,records } });
+  } catch (error) {
+    console.error('[WarehouseInventory] stock query failed:',error.response?.data || error.message);
+    res.status(502).json({ code:502,message:`仓库库存查询失败：${error.response?.data?.message || error.message}` });
+  }
+});
+
+app.get('/api/admin/warehouse-inbounds', requireOrderAccess, async (req,res) => {
+  try {
+    const values = [req.authUser.username];
+    const where = ['w.owner_username=$1'];
+    if (req.query.warehouseId) { values.push(req.query.warehouseId); where.push(`w.warehouse_id=$${values.length}`); }
+    if (req.query.status) { values.push(String(req.query.status)); where.push(`w.status=$${values.length}`); }
+    values.push(Math.min(100,Math.max(1,Math.floor(Number(req.query.size) || 50))));
+    const { rows } = await pool.query(`SELECT w.id,w.warehouse_id AS "warehouseId",c.name AS "warehouseName",
+      w.provider,w.local_inbound_no AS "localInboundNo",w.remote_id AS "remoteId",w.remote_inbound_no AS "remoteInboundNo",
+      w.tracking_number AS "trackingNumber",w.carrier_name AS "carrierName",w.status,w.remote_status AS "remoteStatus",
+      w.requested_quantity AS "requestedQuantity",w.received_quantity AS "receivedQuantity",w.product_count AS "productCount",
+      w.error_message AS "errorMessage",w.last_synced_at AS "lastSyncedAt",w.created_at AS "createdAt"
+      FROM warehouse_inbounds w LEFT JOIN erp_connectors c ON c.id=w.warehouse_id
+      WHERE ${where.join(' AND ')} ORDER BY w.created_at DESC LIMIT $${values.length}`,values);
+    const data = [];
+    for (const row of rows) data.push(await warehouseInboundWithItems(req.authUser.username,row.id));
+    res.json({ code:0,data });
+  } catch (error) {
+    res.status(500).json({ code:500,message:`入库记录读取失败：${error.message}` });
+  }
+});
+
+app.post('/api/admin/warehouse-inbounds', requireOrderAccess, async (req,res) => {
+  try {
+  const connector = await getSharedInventoryConnector(req.body?.warehouseId);
+  if (!connector) return res.status(404).json({ code:404,message:'仓库不存在或未启用库存接口' });
+  const trackingNumber = String(req.body?.trackingNumber || '').trim();
+  const items = (Array.isArray(req.body?.items) ? req.body.items : []).slice(0,50).map(item => ({
+    sku:String(item?.sku || '').trim().slice(0,300),productName:String(item?.productName || item?.name || '').trim().slice(0,500),
+    image:String(item?.image || '').trim().slice(0,2000),remoteProductCode:String(item?.remoteProductCode || item?.sysCode || '').trim().slice(0,200),
+    quantity:Math.floor(Number(item?.quantity)),purchasePrice:Number(item?.purchasePrice),weight:Number(item?.weight)
+  }));
+  if (!trackingNumber) return res.status(400).json({ code:400,message:'请填写发往仓库的国内快递单号' });
+  if (!items.length || items.some(item => !item.sku || !item.productName || !Number.isInteger(item.quantity) || item.quantity < 1)) {
+    return res.status(400).json({ code:400,message:'每个入库商品都必须填写 SKU、商品名称和大于 0 的整数数量' });
+  }
+  if (new Set(items.map(item => item.sku.toUpperCase())).size !== items.length) {
+    return res.status(400).json({ code:400,message:'同一入库批次不能重复填写相同 SKU，请合并数量后提交' });
+  }
+  const identity = await getOrderExternalUserId(req.authUser.username);
+  const localNo = localInboundNumber(identity);
+  const requestedQuantity = items.reduce((total,item) => total + item.quantity,0);
+  const requestSnapshot = {
+    warehouseId:Number(connector.id),trackingNumber,carrierCode:String(req.body?.carrierCode || '').trim(),
+    carrierName:String(req.body?.carrierName || '').trim(),transportType:String(req.body?.transportType ?? ''),
+    expectedDate:String(req.body?.expectedDate || '').trim(),note:String(req.body?.note || '').trim(),items
+  };
+  const created = await pool.query(`INSERT INTO warehouse_inbounds(owner_username,warehouse_id,provider,local_inbound_no,
+    tracking_number,carrier_code,carrier_name,transport_type,expected_date,note,status,requested_quantity,product_count,request_data)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,'')::date,$10,'creating',$11,$12,$13::jsonb) RETURNING id`,
+  [req.authUser.username,connector.id,connector.provider,localNo,trackingNumber,requestSnapshot.carrierCode,
+    requestSnapshot.carrierName,requestSnapshot.transportType,requestSnapshot.expectedDate,requestSnapshot.note.slice(0,2000),
+    requestedQuantity,items.length,JSON.stringify(requestSnapshot)]);
+  const inboundId = created.rows[0].id;
+  for (const item of items) {
+    await pool.query(`INSERT INTO warehouse_inbound_items(inbound_id,sku,product_name,image,remote_product_id,quantity)
+      VALUES($1,$2,$3,$4,$5,$6)`,[inboundId,item.sku,item.productName,item.image,item.remoteProductCode,item.quantity]);
+  }
+  try {
+    const { client,config } = await createInventoryProviderClient(connector);
+    const remoteItems = [];
+    if (connector.provider === 'yeeke') {
+      for (const item of items) {
+        let sysCode = item.remoteProductCode;
+        if (!sysCode) {
+          const found = extractWarehouseRecords(await client.listLocalProducts({ pageNo:1,pageSize:50,sku:item.sku }))
+            .find(product => String(product.sku || product.variationSku || '').trim() === item.sku);
+          sysCode = String(found?.sysCode || '');
+        }
+        if (!sysCode) {
+          const product = await client.createLocalProduct({ name:item.productName,sku:item.sku,productType:'0',
+            image:item.image || undefined,note:`山月ERP ${identity} ${localNo}`.trim() });
+          sysCode = String(product?.sysCode || '');
+        }
+        if (!sysCode) throw new Error(`商品 ${item.sku} 未取得 Yeeke 商品编码`);
+        item.remoteProductCode = sysCode;
+        remoteItems.push({ sku:item.sku,sysCode,quantity:item.quantity });
+        await pool.query('UPDATE warehouse_inbound_items SET remote_product_id=$1,updated_at=NOW() WHERE inbound_id=$2 AND sku=$3',
+          [sysCode,inboundId,item.sku]);
+      }
+      const payload = buildYeekeInboundPayload({ ...requestSnapshot,items,warehouseCode:config.warehouseCode,localInboundNo:localNo });
+      const remote = await client.createOrUpdateInbound(payload);
+      const remoteId = String(remote?.id || '');
+      const remoteNo = String(remote?.storageBillCode || remote?.sotrageBillCode || '');
+      await pool.query(`UPDATE warehouse_inbounds SET remote_id=$1,remote_inbound_no=$2,status='submitted',remote_status='0',
+        response_data=$3::jsonb,last_synced_at=NOW(),updated_at=NOW() WHERE id=$4`,
+      [remoteId,remoteNo,JSON.stringify({ created:remote,items:remoteItems }),inboundId]);
+    } else {
+      for (const item of items) {
+        const payload = buildShopeexStockPayload({ storeAddressId:config.storeAddressId,item,userIdentity:identity,
+          localInboundNo:localNo,trackingNumber,note:requestSnapshot.note });
+        const createdStock = await client.addOrUpdateStock(payload);
+        const listed = extractWarehouseRecords(await client.listStock({ pageNumber:1,pageSize:100,
+          stockPlusDeliveryId:Number(config.storeAddressId),itemNo:item.sku,stockName:item.productName }));
+        const match = listed.find(stock => String(stock.anotherName || '') === localNo)
+          || listed.find(stock => String(stock.itemNo || '') === item.sku && Number(stock.stockPlusDeliveryId) === Number(config.storeAddressId));
+        const normalized = normalizeShopeexStock(match || {});
+        remoteItems.push({ sku:item.sku,created:createdStock,stock:match || null,...normalized });
+        await pool.query(`UPDATE warehouse_inbound_items SET remote_product_id=$1,received_quantity=$2,remote_status=$3,
+          response_data=$4::jsonb,updated_at=NOW() WHERE inbound_id=$5 AND sku=$6`,
+        [normalized.remoteId,normalized.receivedQuantity,normalized.remoteStatus,JSON.stringify({ created:createdStock,stock:match || null }),inboundId,item.sku]);
+      }
+      const remoteNos = remoteItems.map(item => item.remoteInboundNo).filter(Boolean);
+      const remoteIds = remoteItems.map(item => item.remoteId).filter(Boolean);
+      const received = remoteItems.reduce((total,item) => total + Number(item.receivedQuantity || 0),0);
+      const remoteStatus = remoteItems.some(item => item.remoteStatus === '-1') ? '-1'
+        : (remoteItems.length && remoteItems.every(item => item.remoteStatus === '2') ? '2' : '0');
+      await pool.query(`UPDATE warehouse_inbounds SET remote_id=$1,remote_inbound_no=$2,status=$3,remote_status=$4,
+        received_quantity=$5,response_data=$6::jsonb,last_synced_at=NOW(),updated_at=NOW() WHERE id=$7`,
+      [remoteIds.join(','),remoteNos.join(','),normalizedInboundStatus('shopeex',remoteStatus,received,requestedQuantity),remoteStatus,
+        received,JSON.stringify({ items:remoteItems }),inboundId]);
+    }
+    const result = await warehouseInboundWithItems(req.authUser.username,inboundId);
+    res.json({ code:0,data:result,message:`入库已提交：${result.remoteInboundNo || result.localInboundNo}` });
+  } catch (error) {
+    const reason = String(error.response?.data?.message || error.message || '仓库入库提交失败').slice(0,2000);
+    await pool.query("UPDATE warehouse_inbounds SET status='failed',error_message=$1,response_data=$2::jsonb,updated_at=NOW() WHERE id=$3",
+      [reason,JSON.stringify(error.response?.data || { message:reason }),inboundId]);
+    res.status(502).json({ code:502,message:`入库 ${localNo} 提交失败：${reason}`,data:{ id:inboundId,localInboundNo:localNo } });
+  }
+  } catch (error) {
+    console.error('[WarehouseInventory] inbound create failed:',error.message);
+    if (!res.headersSent) res.status(500).json({ code:500,message:`入库记录创建失败：${error.message}` });
+  }
+});
+
+app.post('/api/admin/warehouse-inbounds/:id/sync', requireOrderAccess, async (req,res) => {
+  try {
+  const inbound = await warehouseInboundWithItems(req.authUser.username,req.params.id);
+  if (!inbound) return res.status(404).json({ code:404,message:'入库记录不存在或不属于当前用户' });
+  const connector = await getSharedInventoryConnector(inbound.warehouseId);
+  if (!connector) return res.status(404).json({ code:404,message:'原仓库已停用，无法同步' });
+    const { client,config } = await createInventoryProviderClient(connector);
+    let remoteStatus = inbound.remoteStatus;
+    let received = 0;
+    let responseData = {};
+    if (inbound.provider === 'yeeke') {
+      const remote = await client.listInbounds({ pageNo:1,pageSize:20,storageBillCode:inbound.remoteInboundNo || undefined,
+        trackingNo:inbound.trackingNumber,storeStatus:'9' });
+      const record = extractWarehouseRecords(remote).find(item => String(item.storageBillCode || item.sotrageBillCode || '') === String(inbound.remoteInboundNo || ''))
+        || extractWarehouseRecords(remote)[0];
+      if (!record) throw new Error('Yeeke 暂未查询到该入库单');
+      const normalized = normalizeYeekeInbound(record);
+      remoteStatus = normalized.remoteStatus;
+      received = normalized.receivedQuantity;
+      responseData = normalized.raw;
+      for (const item of inbound.items) {
+        const remoteItem = (Array.isArray(record.skuItems) ? record.skuItems : []).find(entry =>
+          String(entry.sysCode || '') === String(item.remoteProductId || '') || String(entry.variationSku || '') === item.sku);
+        await pool.query(`UPDATE warehouse_inbound_items SET received_quantity=$1,remote_status=$2,response_data=$3::jsonb,updated_at=NOW() WHERE id=$4`,
+        [Number(remoteItem?.abroadReceiveNum || remoteItem?.domesticReceiveNum || 0),String(remoteItem?.status ?? ''),JSON.stringify(remoteItem || {}),item.id]);
+      }
+    } else {
+      const remoteItems = [];
+      for (const item of inbound.items) {
+        const remote = await client.listStock({ pageNumber:1,pageSize:100,stockPlusDeliveryId:Number(config.storeAddressId),itemNo:item.sku });
+        const records = extractWarehouseRecords(remote);
+        const record = records.find(entry => String(entry.stockPlusId || '') === String(item.remoteProductId || ''))
+          || records.find(entry => String(entry.anotherName || '') === inbound.localInboundNo) || records[0];
+        if (!record) continue;
+        const normalized = normalizeShopeexStock(record);
+        remoteItems.push(normalized);
+        await pool.query(`UPDATE warehouse_inbound_items SET remote_product_id=$1,received_quantity=$2,remote_status=$3,response_data=$4::jsonb,updated_at=NOW() WHERE id=$5`,
+        [normalized.remoteId,normalized.receivedQuantity,normalized.remoteStatus,JSON.stringify(record),item.id]);
+      }
+      received = remoteItems.reduce((total,item) => total + Number(item.receivedQuantity || 0),0);
+      remoteStatus = remoteItems.some(item => item.remoteStatus === '-1') ? '-1'
+        : (remoteItems.length === inbound.items.length && remoteItems.every(item => item.remoteStatus === '2') ? '2' : '0');
+      responseData = { items:remoteItems.map(item => item.raw) };
+    }
+    const status = normalizedInboundStatus(inbound.provider,remoteStatus,received,Number(inbound.requestedQuantity));
+    await pool.query(`UPDATE warehouse_inbounds SET status=$1,remote_status=$2,received_quantity=$3,response_data=$4::jsonb,
+      error_message=NULL,last_synced_at=NOW(),updated_at=NOW() WHERE id=$5 AND owner_username=$6`,
+    [status,String(remoteStatus ?? ''),received,JSON.stringify(responseData),inbound.id,req.authUser.username]);
+    res.json({ code:0,data:await warehouseInboundWithItems(req.authUser.username,inbound.id),message:'入库状态已同步' });
+  } catch (error) {
+    const reason = String(error.response?.data?.message || error.message || '状态同步失败');
+    res.status(502).json({ code:502,message:`入库状态同步失败：${reason}` });
+  }
+});
 
 function shopeexRemoteOrderIdFromResponse(responseText) {
   try {

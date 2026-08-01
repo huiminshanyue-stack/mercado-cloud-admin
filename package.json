@@ -24,6 +24,8 @@
     "test:wechat-official": "node scripts/test-wechat-official-account.js",
     "test:yeeke": "node scripts/test-yeeke-client.js",
     "test:shopeex": "node scripts/test-shopeex-client.js",
+    "test:warehouse-inventory": "node scripts/test-warehouse-inventory.js",
+    "test:warehouse-inventory-policy": "node scripts/test-warehouse-inventory-policy.js",
     "test:shopeex-logistics": "node scripts/test-shopeex-logistics.js",
     "test:order-label": "node scripts/test-order-label-policy.js",
     "test:marketing-api": "node scripts/test-marketing-api-policy.js"

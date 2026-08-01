@@ -20,6 +20,8 @@ async function run() {
     if (url.endsWith('/kjxUser/list')) return { status: 200, data: { code: 1000, data: { userInfo: { userId: 7 } }, message: '' } };
     if (url.endsWith('/uploadbase64/pdf')) return { status: 200, data: { code: 1000, data: { fileUrl: 'https://static.example/label.pdf' }, message: '' } };
     if (url.endsWith('/batch/add')) return { status: 200, data: { code: 1000, data: { kjxOrderIds: 'KJX-1' }, message: '' } };
+    if (url.endsWith('/kjxStock/list')) return { status: 200, data: { code: 1000, data: { list: [{ stockPlusId: 9, itemNo: 'SKU-1' }] }, message: '' } };
+    if (url.endsWith('/kjxStock/user/addOrUpdate')) return { status: 200, data: { code: 1000, data: null, message: '操作成功！' } };
     throw new Error(`unexpected URL ${url}`);
   } };
   const client = createShopeexClient({ appKey: 'app-key', appSecret: 'secret' }, request);
@@ -31,6 +33,11 @@ async function run() {
   assert.strictEqual(uploaded.fileUrl, 'https://static.example/label.pdf');
   const created = await client.createAndPackage({ orderSn: '200001' });
   assert.strictEqual(created.kjxOrderIds, 'KJX-1');
+  const stock = await client.listStock({ pageNumber: 1, pageSize: 20, itemNo: 'SKU-1' });
+  assert.strictEqual(stock.list[0].stockPlusId, 9);
+  await client.addOrUpdateStock({ stockType: 2, stockPlusDeliveryId: 180, skuNum: 3, itemNoList: ['SKU-1'] });
+  assert.ok(calls[5].url.endsWith('/kjxStock/user/addOrUpdate'));
+  assert.strictEqual(calls[5].body.requestBody.stockPlusDeliveryId, 180);
   const addresses = [
     { storeAddressId: 180, storeName: '浙江 义乌仓', status: 1 },
     { storeAddressId: 1396, storeName: '广东 东莞仓', status: 1 }

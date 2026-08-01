@@ -49,6 +49,45 @@ function createYeekeClient(config, request = axios) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/otherService/list', { accessToken, timestamp: Date.now() });
     },
+    async listStock(filters = {}) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/stock/list', {
+        pageNo: 1,
+        pageSize: 50,
+        ...filters,
+        accessToken,
+        timestamp: Date.now()
+      });
+    },
+    async listLocalProducts(filters = {}) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/userLocalProduct/list', {
+        pageNo: 1,
+        pageSize: 50,
+        ...filters,
+        accessToken,
+        timestamp: Date.now()
+      });
+    },
+    async createLocalProduct(product) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/product/add', { ...product, accessToken, timestamp: Date.now() });
+    },
+    async createOrUpdateInbound(inbound) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/storage/add', { ...inbound, accessToken, timestamp: Date.now() });
+    },
+    async listInbounds(filters = {}) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/storage/list', {
+        pageNo: 1,
+        pageSize: 20,
+        storageType: '0',
+        ...filters,
+        accessToken,
+        timestamp: Date.now()
+      });
+    },
     async createOrderV2(order) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/order/create/v2', { ...order, accessToken, timestamp: Date.now() });

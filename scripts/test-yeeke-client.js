@@ -27,6 +27,11 @@ async function run() {
       if (url.endsWith('/auth')) return { status: 200, data: { code: '0', message: '成功', data: { accessToken: 'token', userCode: 'u1' } } };
       if (url.endsWith('/ware/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ wareHouse: 'th', wareName: '东莞仓' }] } };
       if (url.endsWith('/otherService/list')) return { status: 200, data: { code: '0', message: '成功', data: [{ id: 'service-1', name: '打包', price: 1 }] } };
+      if (url.endsWith('/stock/list')) return { status: 200, data: { code: '0', message: '成功', data: { records: [{ sysCode: 'P1', availableNum: 8 }] } } };
+      if (url.endsWith('/userLocalProduct/list')) return { status: 200, data: { code: '0', message: '成功', data: { records: [{ sysCode: 'P1', sku: 'SKU-1' }] } } };
+      if (url.endsWith('/product/add')) return { status: 200, data: { code: '0', message: '成功', data: { id: '1', sysCode: 'P1' } } };
+      if (url.endsWith('/storage/add')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'S1', storageBillCode: 'RK1' } } };
+      if (url.endsWith('/storage/list')) return { status: 200, data: { code: '0', message: '成功', data: { records: [{ id: 'S1', storageBillCode: 'RK1' }] } } };
       if (url.endsWith('/order/create/v2')) return { status: 200, data: { code: '0', message: '成功', data: { id: 'Y1' } } };
       if (url.endsWith('/order/list') && JSON.parse(envelope.data).ordersn === 'ORIGINAL-1') return { status: 200, data: { code: '0', message: '成功', data: { records: [{ ordersn: 'ORIGINAL-1', dgStatus: '3', expressList: [{ id:'EXP-1',itemId:'ITEM-1',trackingNo:'OLD123',sendQuantity:2,status:'0' }] }] } } };
       if (url.endsWith('/order/list')) return { status: 200, data: { code: '0', message: '成功', data: { records: [{ ordersn: '200001', dgStatus: '3' }] } } };
@@ -56,6 +61,18 @@ async function run() {
   await client.updateOrderStatus({ ordersn: '200001', status: 'cancelled' });
   assert.strictEqual(calls[6].body.status, 'cancelled');
   assert.ok(calls[6].url.endsWith('/status/update'));
+  const stock = await client.listStock({ wareHouse: 'th' });
+  assert.strictEqual(stock.records[0].availableNum, 8);
+  assert.strictEqual(calls[7].body.pageSize, 50);
+  const products = await client.listLocalProducts({ sku: 'SKU-1' });
+  assert.strictEqual(products.records[0].sysCode, 'P1');
+  const product = await client.createLocalProduct({ name: '商品', sku: 'SKU-1', productType: '0' });
+  assert.strictEqual(product.sysCode, 'P1');
+  const inbound = await client.createOrUpdateInbound({ wareHouse: 'th', storageType: '0', trackingNo: 'YT1', boxItems: [] });
+  assert.strictEqual(inbound.storageBillCode, 'RK1');
+  const inbounds = await client.listInbounds({ storageBillCode: 'RK1' });
+  assert.strictEqual(inbounds.records[0].id, 'S1');
+  assert.strictEqual(calls[11].body.storageType, '0');
 
   const expressUpdate = await replaceYeekeDomesticExpress(client,{
     ordersn:'ORIGINAL-1',warehouseCode:'th',previousTrackingNo:'OLD123',trackingNo:'NEW456',
@@ -63,15 +80,15 @@ async function run() {
   });
   assert.strictEqual(expressUpdate.newOrderCreated,false);
   assert.deepStrictEqual(expressUpdate.deletedExpressIds,['EXP-1']);
-  assert.ok(calls[8].url.endsWith('/deliveryinfo/delete'));
-  assert.strictEqual(calls[8].body.expressId,'EXP-1');
-  assert.ok(calls[9].url.endsWith('/express/add'));
-  assert.strictEqual(calls[9].body.ordersn,'ORIGINAL-1');
-  assert.strictEqual(calls[9].body.trackingNo,'NEW456');
-  assert.strictEqual(calls[9].body.itemId,'ITEM-1');
-  assert.strictEqual(calls[9].body.goodsNum,2);
-  assert.strictEqual(calls[9].body.expressCode,'zt');
-  assert.strictEqual(calls[9].body.desp,'更正快递号');
+  assert.ok(calls[13].url.endsWith('/deliveryinfo/delete'));
+  assert.strictEqual(calls[13].body.expressId,'EXP-1');
+  assert.ok(calls[14].url.endsWith('/express/add'));
+  assert.strictEqual(calls[14].body.ordersn,'ORIGINAL-1');
+  assert.strictEqual(calls[14].body.trackingNo,'NEW456');
+  assert.strictEqual(calls[14].body.itemId,'ITEM-1');
+  assert.strictEqual(calls[14].body.goodsNum,2);
+  assert.strictEqual(calls[14].body.expressCode,'zt');
+  assert.strictEqual(calls[14].body.desp,'更正快递号');
   let receivedDeleteCalled = false;
   await assert.rejects(() => replaceYeekeDomesticExpress({
     listOrders:async()=>({ records:[{ ordersn:'RECEIVED-1',expressList:[{ id:'EXP-2',trackingNo:'OLD',sendQuantity:1,status:'1' }] }] }),

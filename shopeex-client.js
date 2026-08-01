@@ -78,6 +78,8 @@ function createShopeexClient(config = {}, request = axios) {
     listWarehouseAddresses: () => call('/api/kjxStoreAddress/list', {}),
     listWarehouses: () => call('/api/kjxStoreInfo/list', {}),
     listServices: () => call('/api/kjxStoreCharge/list', {}),
+    listStock: payload => call('/api/kjxStock/list', payload || {}),
+    addOrUpdateStock: payload => call('/api/kjxStock/user/addOrUpdate', payload || {}),
     uploadPdf: base64Content => call('/api/upload/uploadbase64/pdf', { base64Content }),
     createAndPackage: payload => call('/api/batch/add', payload),
     listPendingOrderIds: payload => call('/api/order/idsList', payload),
