@@ -29,6 +29,11 @@ const {
   yeekeOrderReturnReason,
   replaceYeekeDomesticExpress
 } = require('./yeeke-client');
+const {
+  DEFAULT_SHOPEEX_BASE_URL,
+  createShopeexClient,
+  buildShopeexOrderPayload
+} = require('./shopeex-client');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
@@ -429,6 +434,7 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE fulfillment_services ADD COLUMN IF NOT EXISTS external_price NUMERIC(12,2)');
   await pool.query('ALTER TABLE fulfillment_services ADD COLUMN IF NOT EXISTS connector_id BIGINT REFERENCES erp_connectors(id) ON DELETE CASCADE');
   await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_services_yeeke_code ON fulfillment_services(owner_username,connector_id,code) WHERE source='yeeke'");
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_services_shopeex_code ON fulfillment_services(owner_username,connector_id,code) WHERE source='shopeex'");
   await pool.query(`CREATE TABLE IF NOT EXISTS logistics_companies (
     id BIGSERIAL PRIMARY KEY, owner_username VARCHAR(120) NOT NULL,
     name VARCHAR(120) NOT NULL, code VARCHAR(100), enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -3173,7 +3179,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-07-31.31',
+    version: '2026-08-01.01',
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -3229,6 +3235,13 @@ app.get('/api/health/order-management', (req, res) => {
     miniProgramFulfillmentSubmit: true,
     yeekeOriginalOrderExpressUpdate: true,
     yeekeOriginalOrderExpressUpdateFlow: ['order/list','deliveryinfo/delete','express/add'],
+    shopeexKjxOrderCreateAndPackage: true,
+    shopeexKjxApiBaseUrl: DEFAULT_SHOPEEX_BASE_URL,
+    shopeexKjxAuth: 'appKey+md5-base64-sign+openId',
+    shopeexKjxMercadoPlatformId: 48,
+    shopeexKjxPdfUpload: true,
+    shopeexKjxValueAddedServiceSync: true,
+    shopeexKjxWarehouseAddressValidation: true,
     fulfillmentExpressUpdateCreatesNewOrder: false,
     fulfillmentSubmittedOrderGroup: true,
     fulfillmentWarehouseFilter: true,
@@ -4110,8 +4123,11 @@ async function getOrderListData(authUser,query = {}) {
       ORDER BY f.order_id,f.updated_at DESC`,[displayIds,req.authUser.username]);
     const submissionMap = new Map(submissionRows.rows.map(row => {
       let warehouseCode = '';
-      if (row.provider === 'yeeke' && row.provider_config) {
-        try { warehouseCode = String(JSON.parse(decryptErpCredential(row.provider_config)).warehouseCode || ''); } catch (_) { /* 仅返回安全仓库代码 */ }
+      if (row.provider_config) {
+        try {
+          const config = JSON.parse(decryptErpCredential(row.provider_config));
+          warehouseCode = String(row.provider === 'shopeex' ? (config.storeAddressId || '') : (config.warehouseCode || ''));
+        } catch (_) { /* 仅返回安全仓库代码 */ }
       }
       return [String(row.order_id),{
         id:row.id,orderId:row.order_id,warehouseId:row.warehouse_id,warehouseName:row.warehouse_name || '',warehouseCode,
@@ -7033,8 +7049,11 @@ async function getFulfillmentOptionsData() {
   ]);
   const connectors = connectorResult.rows.map(({ provider_config:providerConfig, ...row }) => {
     let warehouseCode = '';
-    if (row.provider === 'yeeke' && providerConfig) {
-      try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不暴露损坏的配置 */ }
+    if (providerConfig) {
+      try {
+        const config = JSON.parse(decryptErpCredential(providerConfig));
+        warehouseCode = String(row.provider === 'shopeex' ? (config.storeAddressId || '') : (config.warehouseCode || ''));
+      } catch (_) { /* 不暴露损坏的配置 */ }
     }
     return { ...row,warehouseCode };
   });
@@ -7058,6 +7077,38 @@ function getYeekeConnectorConfig(connector) {
     throw new Error('Yeeke 连接器配置不完整');
   }
   return config;
+}
+
+function getShopeexConnectorConfig(connector) {
+  const encrypted = connector.provider_config || connector.auth_value;
+  if (!encrypted) throw new Error('Shopeex/KJX 连接器未配置凭证');
+  let config;
+  try { config = JSON.parse(decryptErpCredential(encrypted)); } catch (_) { throw new Error('Shopeex/KJX 连接器凭证格式无效'); }
+  if (!config.appKey || !config.appSecret || !config.openId || !Number(config.storeAddressId)) {
+    throw new Error('Shopeex/KJX 连接器配置不完整');
+  }
+  return config;
+}
+
+function shopeexRemoteOrderIdFromResponse(responseText) {
+  try {
+    const parsed = typeof responseText === 'string' ? JSON.parse(responseText) : (responseText || {});
+    return String(parsed?.pushed?.kjxOrderIds || parsed?.kjxOrderIds || parsed?.result?.kjxOrderIds || '');
+  } catch (_) { return ''; }
+}
+
+async function cancelShopeexSubmission(connector, responseText) {
+  const remoteOrderId = shopeexRemoteOrderIdFromResponse(responseText);
+  if (!remoteOrderId) throw new Error('旧 Shopeex/KJX 订单缺少 kjxOrderIds，无法自动取消打包');
+  const config = getShopeexConnectorConfig(connector);
+  const client = createShopeexClient(config);
+  let details = await client.getPackagedOrderDetails([remoteOrderId]);
+  if (!Array.isArray(details) || !details.length) details = await client.getOrderDetails([remoteOrderId]);
+  const detail = Array.isArray(details) ? details[0] : null;
+  const packageId = String(detail?.kjxPackageId || detail?.kjxOrderPackage?.kjxPackageId || '');
+  if (!packageId) throw new Error('旧 Shopeex/KJX 订单尚未生成包裹ID，无法自动取消打包');
+  await client.cancelPackage(packageId);
+  return { remoteOrderId,packageId };
 }
 
 async function getOrderExternalUserId(username) {
@@ -7103,6 +7154,33 @@ async function syncYeekeServicesForConnector(ownerUsername, connector) {
     await pool.query("UPDATE fulfillment_services SET enabled=FALSE WHERE owner_username=$1 AND connector_id=$2 AND source='yeeke'",[ownerUsername,connector.id]);
   }
   return remoteServices.filter(service => service?.id && service?.name);
+}
+
+async function syncShopeexServicesForConnector(ownerUsername, connector) {
+  const config = getShopeexConnectorConfig(connector);
+  const client = createShopeexClient(config);
+  const remote = await client.listServices();
+  const remoteServices = Array.isArray(remote?.kjxStoreChargeList) ? remote.kjxStoreChargeList : [];
+  const codes = [];
+  for (const service of remoteServices) {
+    const code = String(service?.kjxStoreChargeIds || service?.kjxStoreChargeId || '').trim();
+    const name = String(service?.chargeTitle || '').trim();
+    if (!code || !name || Number(service?.chargeStatus) === 0) continue;
+    const score = Number(service?.score);
+    const price = Number.isFinite(score) ? Number((score * 0.1).toFixed(2)) : null;
+    codes.push(code);
+    await pool.query(`INSERT INTO fulfillment_services(owner_username,name,code,description,source,external_price,connector_id,enabled)
+      VALUES($1,$2,$3,$4,'shopeex',$5,$6,TRUE)
+      ON CONFLICT(owner_username,connector_id,code) WHERE source='shopeex'
+      DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,external_price=EXCLUDED.external_price,enabled=TRUE`,
+    [ownerUsername,name.slice(0,120),code.slice(0,100),String(service?.chargeDesp || `Shopeex/KJX 附加服务，${score || 0} 积分`).slice(0,500),price,connector.id]);
+  }
+  if (codes.length) {
+    await pool.query(`UPDATE fulfillment_services SET enabled=FALSE WHERE owner_username=$1 AND connector_id=$2 AND source='shopeex' AND NOT(code=ANY($3::varchar[]))`,[ownerUsername,connector.id,codes]);
+  } else {
+    await pool.query("UPDATE fulfillment_services SET enabled=FALSE WHERE owner_username=$1 AND connector_id=$2 AND source='shopeex'",[ownerUsername,connector.id]);
+  }
+  return remoteServices.filter(service => service?.chargeTitle && (service?.kjxStoreChargeIds || service?.kjxStoreChargeId));
 }
 
 async function resolveOfficialLabelPdfForPush(authUser, orderRows) {
@@ -7166,6 +7244,31 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
       }
       throw createError;
     }
+  }
+  if (String(connector.provider || 'generic') === 'shopeex') {
+    const config = getShopeexConnectorConfig(connector);
+    const client = options.shopeexClient || createShopeexClient(config);
+    if (!options.pdfString) throw new Error('官方面单尚未申请成功，请先点击订单上的“申请面单”查看原因，面单成功后重新推送');
+    const uploaded = await client.uploadPdf(`data/application/pdf/base64/${options.pdfString}`);
+    const airwayBillUrl = String(uploaded?.fileUrl || '');
+    if (!airwayBillUrl) throw new Error('Shopeex/KJX 面单上传成功但未返回 fileUrl');
+    const payload = buildShopeexOrderPayload({
+      row: Array.isArray(row) ? row[0] : row,
+      rows: Array.isArray(row) ? row : undefined,
+      displayOrderId: options.displayOrderId,
+      providerOrderNumber: options.providerOrderNumber,
+      externalUserId: options.externalUserId,
+      airwayBillUrl,
+      serviceCodes: options.serviceCodes,
+      storeAddressId: config.storeAddressId,
+      carrier: options.carrier,
+      carrierCode: options.carrierCode,
+      trackingNumber: options.trackingNumber,
+      shippingQuantity: options.shippingQuantity,
+      shippingRemark: options.shippingRemark
+    });
+    const created = await client.createAndPackage(payload);
+    return { ...created, orderSn:payload.orderSn,airwayBillUrl };
   }
   const headers = { 'Content-Type': 'application/json' };
   if (connector.auth_header && connector.auth_value) headers[connector.auth_header] = decryptErpCredential(connector.auth_value);
@@ -7404,19 +7507,22 @@ async function handleFulfillmentSubmit(req, res) {
     JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE c.id=$1 AND c.enabled=TRUE`, [warehouseId]);
   if (!connectorResult.rows[0]) return res.status(404).json({ code: 404, message: '仓库不存在或已停用' });
-  const carrierResult = await pool.query(`SELECT lc.id FROM logistics_companies lc
+  const carrierResult = await pool.query(`SELECT lc.id,lc.code FROM logistics_companies lc
     JOIN users u ON u.username=lc.owner_username AND u.role='admin'
     WHERE lc.name=$1 AND lc.enabled=TRUE`,[carrier]);
   if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
   const serviceResult = serviceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.external_price,fs.connector_id FROM fulfillment_services fs
     JOIN users u ON u.username=fs.owner_username AND u.role='admin'
-    WHERE fs.enabled=TRUE AND fs.id=ANY($1::bigint[]) AND (fs.source<>'yeeke' OR fs.connector_id=$2)`, [serviceIds,warehouseId]) : { rows: [] };
+    WHERE fs.enabled=TRUE AND fs.id=ANY($1::bigint[]) AND (fs.source='manual' OR fs.connector_id=$2)`, [serviceIds,warehouseId]) : { rows: [] };
   const warehouse = connectorResult.rows[0];
   const warehouseFee = feeAmount(warehouse.unit_price);
   const serviceFee = Number(serviceResult.rows.reduce((sum,service) => sum + feeAmount(service.external_price),0).toFixed(2));
   const chargeAmount = Number((warehouseFee + serviceFee).toFixed(2));
-  const serviceCodes = String(warehouse.provider || 'generic') === 'yeeke'
-    ? serviceResult.rows.filter(service => service.source === 'yeeke').map(service => String(service.code || '')).filter(Boolean) : [];
+  const provider = String(warehouse.provider || 'generic');
+  const serviceCodes = ['yeeke','shopeex'].includes(provider)
+    ? serviceResult.rows.filter(service => service.source === provider).map(service => String(service.code || '')).filter(Boolean) : [];
+  const carrierCode = String(carrierResult.rows[0]?.code || '').trim();
+  if (provider === 'shopeex' && !carrierCode) return res.status(400).json({ code:400,message:'该国内物流公司缺少 Shopeex/KJX 快递代码，请管理员先在物流公司管理中填写代码' });
   const externalUserId = await getOrderExternalUserId(req.authUser.username);
   let yeekeClient = null;
   if (String(warehouse.provider || 'generic') === 'yeeke') {
@@ -7462,8 +7568,8 @@ async function handleFulfillmentSubmit(req, res) {
       results.push({ orderId:displayOrderId,success:false,message:'只有已成功提交的订单可以二次推单' });
       continue;
     }
-    if (isResubmit && (String(warehouse.provider || '') !== 'yeeke' || (!returnedResubmit && String(existing?.old_provider || '') !== 'yeeke'))) {
-      results.push({ orderId:displayOrderId,success:false,message:'二次推单目前只支持 Yeeke 仓库' });
+    if (isResubmit && (!['yeeke','shopeex'].includes(String(warehouse.provider || '')) || (!returnedResubmit && !['yeeke','shopeex'].includes(String(existing?.old_provider || ''))))) {
+      results.push({ orderId:displayOrderId,success:false,message:'二次推单只支持 Yeeke 或 Shopeex/KJX 官方仓库' });
       continue;
     }
     const providerOrderNumber = isResubmit ? buildYeekeResubmitOrderNumber(displayOrderId) : displayOrderId;
@@ -7472,10 +7578,10 @@ async function handleFulfillmentSubmit(req, res) {
       carrier,tracking_number:trackingNumber,shipping_quantity:shippingQuantity,shipping_remark:shippingRemark,
       value_added_services:serviceResult.rows,orders:orderResult.rows.map(row => row.raw_data) };
     try {
-      const pdfString = String(warehouse.provider || 'generic') === 'yeeke'
+      const pdfString = ['yeeke','shopeex'].includes(String(warehouse.provider || 'generic'))
         ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
       const pushed = await sendOrderToConnector(warehouse, orderResult.rows, {
-        displayOrderId,providerOrderNumber,externalUserId,carrier,trackingNumber,shippingQuantity,shippingRemark,pdfString,serviceCodes,payload
+        displayOrderId,providerOrderNumber,externalUserId,carrier,carrierCode,trackingNumber,shippingQuantity,shippingRemark,pdfString,serviceCodes,payload
       }, yeekeClient);
       const billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`;
       if (isResubmit) {
@@ -7490,12 +7596,16 @@ async function handleFulfillmentSubmit(req, res) {
         let cancellationWarning = '';
         if (!returnedResubmit) {
           try {
-            const oldConfig = getYeekeConnectorConfig({ provider_config:existing.old_provider_config });
-            const oldClient = createYeekeClient(oldConfig);
-            await oldClient.authorize(oldConfig.userName,oldConfig.password);
-            await oldClient.updateOrderStatus({ ordersn:existing.provider_order_number || displayOrderId,status:'cancelled' });
+            if (String(existing.old_provider || '') === 'shopeex') {
+              await cancelShopeexSubmission({ provider_config:existing.old_provider_config },existing.response_text);
+            } else {
+              const oldConfig = getYeekeConnectorConfig({ provider_config:existing.old_provider_config });
+              const oldClient = createYeekeClient(oldConfig);
+              await oldClient.authorize(oldConfig.userName,oldConfig.password);
+              await oldClient.updateOrderStatus({ ordersn:existing.provider_order_number || displayOrderId,status:'cancelled' });
+            }
           } catch (cancelError) {
-            cancellationWarning = `新仓库推单成功，但旧仓库订单取消失败，请在 Yeeke 后台取消旧单：${cancelError.response?.data?.message || cancelError.message}`;
+            cancellationWarning = `新仓库推单成功，但旧仓库订单取消失败，请在原仓库后台取消旧单：${cancelError.response?.data?.message || cancelError.message}`;
           }
         }
         await pool.query('UPDATE fulfillment_submissions SET response_text=$1,updated_at=NOW() WHERE id=$2 AND owner_username=$3',
@@ -7639,8 +7749,11 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
     WHERE ${where.join(' AND ')} ORDER BY f.updated_at DESC LIMIT 500`, params);
   const data = rows.map(({ provider_config: providerConfig, ...row }) => {
     let warehouseCode = '';
-    if (row.provider === 'yeeke' && providerConfig) {
-      try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不暴露损坏或不可解密的仓库配置 */ }
+    if (providerConfig) {
+      try {
+        const config = JSON.parse(decryptErpCredential(providerConfig));
+        warehouseCode = String(row.provider === 'shopeex' ? (config.storeAddressId || '') : (config.warehouseCode || ''));
+      } catch (_) { /* 不暴露损坏或不可解密的仓库配置 */ }
     }
     return { ...row, warehouseCode };
   });
@@ -7668,7 +7781,8 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
   let retryWarehouseFee = null,retryServiceFee = null,retryChargeAmount = null;
   try {
     let responseData;
-    if (String(submission.provider || 'generic') === 'yeeke') {
+    if (['yeeke','shopeex'].includes(String(submission.provider || 'generic'))) {
+      const retryProvider = String(submission.provider);
       const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [submission.order_id,req.authUser.username]);
       if (!orderResult.rows[0]) return res.status(404).json({ code: 404, message: '订单不存在' });
       const eligibility = fulfillmentSubmissionEligibility(orderResult.rows);
@@ -7678,8 +7792,16 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       const retryServiceIds = (Array.isArray(submission.service_ids) ? submission.service_ids : []).map(Number).filter(Number.isFinite);
       const retryServices = retryServiceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.external_price FROM fulfillment_services fs
         JOIN users u ON u.username=fs.owner_username AND u.role='admin'
-        WHERE fs.connector_id=$2 AND fs.source='yeeke' AND fs.enabled=TRUE AND fs.id=ANY($1::bigint[])`,[retryServiceIds,submission.warehouse_id]) : { rows:[] };
+        WHERE fs.connector_id=$2 AND fs.source=$3 AND fs.enabled=TRUE AND fs.id=ANY($1::bigint[])`,[retryServiceIds,submission.warehouse_id,retryProvider]) : { rows:[] };
       const serviceCodes = retryServices.rows.map(service => String(service.code || '')).filter(Boolean);
+      let carrierCode = '';
+      if (retryProvider === 'shopeex') {
+        const carrierCodeResult = await pool.query(`SELECT lc.code FROM logistics_companies lc
+          JOIN users u ON u.username=lc.owner_username AND u.role='admin'
+          WHERE lc.name=$1 AND lc.enabled=TRUE LIMIT 1`,[submission.carrier]);
+        carrierCode = String(carrierCodeResult.rows[0]?.code || '').trim();
+        if (!carrierCode) return res.status(400).json({ code:400,message:'该国内物流公司缺少 Shopeex/KJX 快递代码，请管理员先补充代码' });
+      }
       retryWarehouseFee = feeAmount(submission.unit_price);
       retryServiceFee = Number(retryServices.rows.reduce((sum,service) => sum + feeAmount(service.external_price),0).toFixed(2));
       retryChargeAmount = Number((retryWarehouseFee + retryServiceFee).toFixed(2));
@@ -7688,6 +7810,7 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
         providerOrderNumber: submission.provider_order_number || submission.order_id,
         externalUserId,
         carrier: submission.carrier,
+        carrierCode,
         trackingNumber: submission.tracking_number,
         shippingQuantity: submission.shipping_quantity,
         shippingRemark: submission.shipping_remark,
@@ -7724,8 +7847,11 @@ app.get('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
     WHERE c.enabled=TRUE ORDER BY c.id DESC`);
   const data = rows.map(({ provider_config: providerConfig, ...row }) => {
     let warehouseCode = '';
-    if (row.provider === 'yeeke' && providerConfig) {
-      try { warehouseCode = String(JSON.parse(decryptErpCredential(providerConfig)).warehouseCode || ''); } catch (_) { /* 不向前端暴露损坏的凭据内容 */ }
+    if (providerConfig) {
+      try {
+        const config = JSON.parse(decryptErpCredential(providerConfig));
+        warehouseCode = String(row.provider === 'shopeex' ? (config.storeAddressId || '') : (config.warehouseCode || ''));
+      } catch (_) { /* 不向前端暴露损坏的凭据内容 */ }
     }
     return { ...row, hasProviderConfig: Boolean(providerConfig), warehouseCode };
   });
@@ -7735,7 +7861,8 @@ app.get('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
 app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
   const { name, endpoint, authHeader, authValue } = req.body || {};
   const unitPrice = feeAmount(req.body?.unitPrice);
-  const provider = String(req.body?.provider || 'generic').trim().toLowerCase() === 'yeeke' ? 'yeeke' : 'generic';
+  const requestedProvider = String(req.body?.provider || 'generic').trim().toLowerCase();
+  const provider = ['yeeke','shopeex'].includes(requestedProvider) ? requestedProvider : 'generic';
   if (!name) return res.status(400).json({ code: 400, message: '缺少连接名称' });
   let target;
   let providerConfig = '';
@@ -7760,15 +7887,46 @@ app.post('/api/admin/erp-connectors', requireAdmin, async (req, res) => {
       return res.status(502).json({ code: 502, message: `Yeeke 配置验证失败: ${error.response?.data?.message || error.message}` });
     }
     try { providerConfig = encryptErpCredential(JSON.stringify(config)); } catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
+  } else if (provider === 'shopeex') {
+    const config = {
+      baseUrl: String(req.body?.baseUrl || DEFAULT_SHOPEEX_BASE_URL).trim(),
+      appKey: String(req.body?.appKey || '').trim(),
+      appSecret: String(req.body?.appSecret || '').trim(),
+      openId: String(req.body?.openId || '').trim(),
+      accessUrl: String(req.body?.accessUrl || '').trim(),
+      userName: String(req.body?.userName || '').trim(),
+      password: String(req.body?.password || ''),
+      storeAddressId: Number(req.body?.storeAddressId),
+      storeName: ''
+    };
+    if (!config.appKey || !config.appSecret || !config.storeAddressId || (!config.openId && (!config.accessUrl || !config.userName || !config.password))) {
+      return res.status(400).json({ code:400,message:'Shopeex/KJX 配置不完整：请填写 key、secret、仓库地址ID，并填写 openId 或仓库登录信息' });
+    }
+    try { target = new URL(`${config.baseUrl.replace(/\/+$/, '')}/api/batch/add`); } catch { return res.status(400).json({ code:400,message:'Shopeex/KJX 地址格式错误' }); }
+    if (target.hostname !== 'openapi-v3.shopeex.cn') return res.status(400).json({ code:400,message:'Shopeex/KJX 生产连接只允许 openapi-v3.shopeex.cn' });
+    try {
+      const client = createShopeexClient(config);
+      if (!config.openId) {
+        await client.authorize(config.accessUrl,config.userName,config.password);
+        config.openId = client.getOpenId();
+      }
+      const addresses = await client.listWarehouseAddresses();
+      const selected = Array.isArray(addresses) ? addresses.find(item => Number(item?.storeAddressId) === config.storeAddressId) : null;
+      if (!selected) return res.status(400).json({ code:400,message:'Shopeex/KJX 账号下不存在所填仓库地址ID' });
+      config.storeName = String(selected.storeName || selected.desp || '');
+    } catch (error) {
+      return res.status(502).json({ code:502,message:`Shopeex/KJX 配置验证失败: ${error.response?.data?.message || error.message}` });
+    }
+    try { providerConfig = encryptErpCredential(JSON.stringify(config)); } catch (e) { return res.status(503).json({ code:503,message:e.message }); }
   } else {
     if (!endpoint) return res.status(400).json({ code: 400, message: '缺少推单地址' });
     try { target = new URL(endpoint); } catch { return res.status(400).json({ code: 400, message: '推单地址格式错误' }); }
   }
   if (target.protocol !== 'https:' || /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(target.hostname)) return res.status(400).json({ code: 400, message: '只允许公网 HTTPS 推单地址' });
   let encryptedAuth;
-  try { encryptedAuth = provider === 'yeeke' ? '' : encryptErpCredential(String(authValue || '').slice(0,2000)); }
+  try { encryptedAuth = provider !== 'generic' ? '' : encryptErpCredential(String(authValue || '').slice(0,2000)); }
   catch (e) { return res.status(503).json({ code: 503, message: e.message }); }
-  const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value,provider,provider_config,unit_price) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, provider === 'yeeke' ? 'yeeke' : String(authHeader || '').slice(0,120), encryptedAuth, provider, providerConfig,unitPrice]);
+  const { rows } = await pool.query('INSERT INTO erp_connectors(owner_username,name,endpoint,auth_header,auth_value,provider,provider_config,unit_price) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id', [req.authUser.username,String(name).slice(0,120), target.href, provider !== 'generic' ? provider : String(authHeader || '').slice(0,120), encryptedAuth, provider, providerConfig,unitPrice]);
   res.json({ code: 0, data: { id: rows[0].id } });
 });
 
@@ -7785,12 +7943,16 @@ app.post('/api/admin/erp-connectors/:id/sync-services', requireAdmin, async (req
     WHERE id=$1 AND owner_username=$2 AND enabled=TRUE`,[req.params.id,req.authUser.username]);
   const connector = rows[0];
   if (!connector) return res.status(404).json({ code:404,message:'仓库连接不存在或不属于当前用户' });
-  if (String(connector.provider || '') !== 'yeeke') return res.status(400).json({ code:400,message:'只有 Yeeke 连接支持同步官方增值服务' });
+  const provider = String(connector.provider || '');
+  if (!['yeeke','shopeex'].includes(provider)) return res.status(400).json({ code:400,message:'当前连接不支持同步官方增值服务' });
   try {
-    const services = await syncYeekeServicesForConnector(req.authUser.username,connector);
-    res.json({ code:0,data:{ count:services.length,services },message:`已同步 ${services.length} 项 Yeeke 增值服务` });
+    const services = provider === 'yeeke'
+      ? await syncYeekeServicesForConnector(req.authUser.username,connector)
+      : await syncShopeexServicesForConnector(req.authUser.username,connector);
+    const providerName = provider === 'yeeke' ? 'Yeeke' : 'Shopeex/KJX';
+    res.json({ code:0,data:{ count:services.length,services },message:`已同步 ${services.length} 项 ${providerName} 增值服务` });
   } catch (error) {
-    res.status(502).json({ code:502,message:`Yeeke 增值服务同步失败：${error.response?.data?.message || error.message}` });
+    res.status(502).json({ code:502,message:`官方增值服务同步失败：${error.response?.data?.message || error.message}` });
   }
 });
 

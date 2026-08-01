@@ -45,6 +45,7 @@ const returnSyncSource = serverSource.slice(
   serverSource.indexOf('function startYeekeSubmissionStatusSync')
 );
 const yeekeSource = fs.readFileSync(path.join(__dirname, '..', 'yeeke-client.js'), 'utf8');
+const shopeexSource = fs.readFileSync(path.join(__dirname, '..', 'shopeex-client.js'), 'utf8');
 const miniDetailSource = fs.readFileSync(path.join(__dirname, '..', 'order-miniprogram', 'miniprogram', 'pages', 'order-detail', 'index.ts'), 'utf8');
 const miniDetailTemplate = fs.readFileSync(path.join(__dirname, '..', 'order-miniprogram', 'miniprogram', 'pages', 'order-detail', 'index.wxml'), 'utf8');
 const publicIndex = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
@@ -91,6 +92,12 @@ assert.ok(serverSource.includes('发货数量必须是 1 至') && serverSource.i
 assert.ok(yeekeSource.includes('erpOrdersn: identity') && yeekeSource.includes('erpOrderSn: identity') && yeekeSource.includes('shopID: identity') && yeekeSource.includes('sysUserNote: externalUserId ? identity') && !yeekeSource.includes('shopId: identity') && yeekeSource.includes('`山月ERP ${identity}`'), 'Yeeke identity must use third-party, system-note, and shopID fields without populating shopName');
 assert.ok(yeekeSource.includes('trackingNo: officialTrackingNumber') && yeekeSource.includes('expressInfos: domesticTrackingNumber'), 'international and domestic tracking numbers must use separate Yeeke fields');
 assert.ok(yeekeSource.includes('sendQuantity') && yeekeSource.includes('note: domesticRemark'), 'Yeeke courier details must include shipping quantity and remark');
+assert.ok(serverSource.includes("['yeeke','shopeex'].includes(requestedProvider)") && serverSource.includes("provider === 'shopeex'"), 'administrator connectors must support Shopeex/KJX without changing Yeeke');
+assert.ok(shopeexSource.includes("crypto.createHash('md5')") && shopeexSource.includes("Buffer.from(digest, 'utf8').toString('base64')"), 'Shopeex/KJX requests must use the documented MD5 then Base64 signature');
+assert.ok(shopeexSource.includes("headers.openId = openId") && shopeexSource.includes("call('/api/kjxUser/authLogin'"), 'Shopeex/KJX must authenticate and send openId in request headers');
+assert.ok(shopeexSource.includes("call('/api/upload/uploadbase64/pdf'") && shopeexSource.includes("call('/api/batch/add'"), 'Shopeex/KJX fulfillment must upload the official PDF and submit order plus package');
+assert.ok(shopeexSource.includes('kjxPlatformId: SHOPEEX_MERCADO_PLATFORM_ID') && shopeexSource.includes('kjxCountryId: SHOPEEX_COUNTRY_IDS'), 'Shopeex/KJX payload must map Mercado and country identifiers');
+assert.ok(shopeexSource.includes('batchItemLogisticsDTOs') && shopeexSource.includes('kjxStoreChargeIdList') && shopeexSource.includes('山月ERP ${identity}'), 'Shopeex/KJX payload must include domestic courier, services, and user identity');
 assert.ok(yeekeSource.includes("call('/deliveryinfo/delete'") && yeekeSource.includes("call('/express/add'"), 'Yeeke original-order courier updates must use the documented delete and add endpoints');
 assert.ok(yeekeSource.includes('newOrderCreated: false') && yeekeSource.includes('replaceYeekeDomesticExpress'), 'courier correction must explicitly preserve the original Yeeke order');
 assert.ok(serverSource.includes("app.post('/api/admin/fulfillment/update-express', requireOrderAccess"), 'order users must have a protected original-order courier correction route');
