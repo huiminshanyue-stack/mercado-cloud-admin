@@ -87,6 +87,9 @@ function createShopeexClient(config = {}, request = axios) {
     listPackagedOrderIds: payload => call('/api/order/user/idsPackageList', payload),
     getOrderDetails: ids => call('/api/order/orderList', { idss: (Array.isArray(ids) ? ids : [ids]).map(String) }),
     getPackagedOrderDetails: ids => call('/api/order/user/orderPackageList', { idss: (Array.isArray(ids) ? ids : [ids]).map(String) }),
+    updateOrderStatus: (kjxOrderIds, kjxOrderStatusId) => call('/api/order/update/order/status', {
+      kjxOrderIds: String(kjxOrderIds || ''), kjxOrderStatusId: Number(kjxOrderStatusId)
+    }),
     cancelPackage: kjxPackageIds => call('/api/packaged/packageCancel', { kjxPackageIds: String(kjxPackageIds || '') }),
     addPackageRemark: (kjxOrderIds, packageDesp, packageImages = []) => call('/api/packaged/addPackageDesp', {
       kjxOrderIds: String(kjxOrderIds || ''), packageDesp: String(packageDesp || ''), packageImages

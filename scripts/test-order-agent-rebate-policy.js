@@ -18,7 +18,8 @@ assert.ok(serverSource.includes("agent.username=customer.created_by AND agent.ro
 assert.ok(serverSource.includes("rule.enabled=TRUE AND rule.amount>0"), 'only an enabled positive fixed rebate rule may create a rebate');
 assert.ok(serverSource.includes("'fulfillment_order',rule.amount,'pending'"), 'successful fulfillment must use only the configured fixed per-order amount');
 assert.ok(!serverSource.slice(serverSource.indexOf('async function recordFulfillmentAgentRebate'), serverSource.indexOf('async function reverseFulfillmentAgentRebate')).includes('serviceFee'), 'value-added service fees must not enter agent rebate calculation');
-assert.ok(serverSource.includes('submissionSeq:Number(existing.resubmit_count || 0) + 1'), 'each successful resubmission must create a separately keyed rebate');
+assert.ok(serverSource.includes('submissionSeq:nextSubmissionSeq,warehouseId'), 'each successful resubmission must create a separately keyed rebate');
+assert.ok(serverSource.includes('if (activeSwitch) {') && serverSource.includes('reason:`订单换仓至 ${warehouse.name}`'), 'warehouse switches must reverse the previous rebate before creating the replacement rebate');
 assert.ok(serverSource.includes('submissionSeq:0,warehouseId'), 'the initial successful submission must create the first rebate entry');
 assert.ok(serverSource.includes("'fulfillment_return_reversal'"), 'warehouse returns must create a reversal ledger entry');
 assert.ok(serverSource.includes('-Math.abs(Number(original.amount || 0))'), 'the reversal entry must negate the original fixed rebate');

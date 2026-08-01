@@ -111,6 +111,10 @@ function createYeekeClient(config, request = axios) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/status/update', { ...order, accessToken, timestamp: Date.now() });
     },
+    async cancelOrder(ordersn) {
+      if (!accessToken) throw new Error('Yeeke 尚未授权');
+      return call('/order/status', { ordersn: String(ordersn || ''), status: '7', accessToken, timestamp: Date.now() });
+    },
     async deleteDeliveryInfo(expressId) {
       if (!accessToken) throw new Error('Yeeke 尚未授权');
       return call('/deliveryinfo/delete', { expressId: String(expressId), accessToken, timestamp: Date.now() });

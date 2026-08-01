@@ -22,6 +22,8 @@ async function run() {
     if (url.endsWith('/batch/add')) return { status: 200, data: { code: 1000, data: { kjxOrderIds: 'KJX-1' }, message: '' } };
     if (url.endsWith('/kjxStock/list')) return { status: 200, data: { code: 1000, data: { list: [{ stockPlusId: 9, itemNo: 'SKU-1' }] }, message: '' } };
     if (url.endsWith('/kjxStock/user/addOrUpdate')) return { status: 200, data: { code: 1000, data: null, message: '操作成功！' } };
+    if (url.endsWith('/order/update/order/status')) return { status: 200, data: { code: 1000, data: null, message: '操作成功！' } };
+    if (url.endsWith('/packaged/addPackageDesp')) return { status: 200, data: { code: 1000, data: null, message: '操作成功！' } };
     throw new Error(`unexpected URL ${url}`);
   } };
   const client = createShopeexClient({ appKey: 'app-key', appSecret: 'secret' }, request);
@@ -38,6 +40,12 @@ async function run() {
   await client.addOrUpdateStock({ stockType: 2, stockPlusDeliveryId: 180, skuNum: 3, itemNoList: ['SKU-1'] });
   assert.ok(calls[5].url.endsWith('/kjxStock/user/addOrUpdate'));
   assert.strictEqual(calls[5].body.requestBody.stockPlusDeliveryId, 180);
+  await client.updateOrderStatus('KJX-1',7);
+  assert.ok(calls[6].url.endsWith('/order/update/order/status'));
+  assert.strictEqual(calls[6].body.requestBody.kjxOrderIds,'KJX-1');
+  assert.strictEqual(calls[6].body.requestBody.kjxOrderStatusId,7);
+  await client.addPackageRemark('KJX-1','山月ERP换仓');
+  assert.ok(calls[7].url.endsWith('/packaged/addPackageDesp'));
   const addresses = [
     { storeAddressId: 180, storeName: '浙江 义乌仓', status: 1 },
     { storeAddressId: 1396, storeName: '广东 东莞仓', status: 1 }

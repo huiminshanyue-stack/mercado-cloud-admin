@@ -1,6 +1,7 @@
 const express = require('express');
 const { canAccessOrderManagement, formatWarehouseAddressForUser } = require('./order-warehouse-policy');
 const { fulfillmentSubmissionEligibility } = require('./order-fulfillment-policy');
+const { calculateFulfillmentBillingTransition } = require('./fulfillment-billing');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -555,6 +556,23 @@ async function initOrderManagementTables() {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_order ON fulfillment_submissions(owner_username,order_id)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_warehouse ON fulfillment_submissions(owner_username,warehouse_id)');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_submissions_billing_key ON fulfillment_submissions(owner_username,billing_key) WHERE billing_key IS NOT NULL');
+  await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_billing_events (
+    id BIGSERIAL PRIMARY KEY,
+    owner_username VARCHAR(120) NOT NULL,
+    order_id VARCHAR(80) NOT NULL,
+    fulfillment_submission_id BIGINT,
+    submission_seq INTEGER NOT NULL DEFAULT 0,
+    event_type VARCHAR(40) NOT NULL,
+    amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    previous_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    final_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+    status VARCHAR(30) NOT NULL DEFAULT 'reserved',
+    event_key VARCHAR(300) NOT NULL UNIQUE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_billing_events_owner_order ON fulfillment_billing_events(owner_username,order_id,created_at DESC)');
   await pool.query(`CREATE TABLE IF NOT EXISTS fulfillment_agent_rebate_rules (
     agent_username VARCHAR(120) PRIMARY KEY,
     amount NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -3249,7 +3267,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.03',
+    version: '2026-08-02.04',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
     orderLabelOwnershipVerification: 'official-shipment-sender-api',
@@ -3265,6 +3283,9 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentBillingIntegration: 'reserved-for-www.shanyue.site',
     fulfillmentBillingMutatesLocalBalance: false,
     fulfillmentBillingIdempotency: 'username+display-order-id',
+    fulfillmentBillingEvents: true,
+    fulfillmentWarehouseSwitchBilling: 'final-total-difference',
+    fulfillmentWarehouseSwitchSamePriceCharge: false,
     fulfillmentChargeIncludes: ['warehouse_unit_price','value_added_services'],
     sharedAdminWarehouseCatalog: true,
     warehouseInventoryManagement: true,
@@ -3289,6 +3310,7 @@ app.get('/api/health/order-management', (req, res) => {
     fulfillmentResubmit: true,
     fulfillmentResubmitAllowsSameWarehouse: true,
     fulfillmentResubmitCancelsPrevious: true,
+    fulfillmentResubmitCancelsPreviousBeforePush: true,
     fulfillmentReturnClearsWarehouse: true,
     fulfillmentReturnMarker: true,
     yeekeReturnLookupFallbackWithoutWarehouse: true,
@@ -3302,7 +3324,7 @@ app.get('/api/health/order-management', (req, res) => {
     batchLabelPrintScope: 'current-user-ready-to-ship-orders',
     batchLabelPrintOutput: 'single-merged-pdf',
     fulfillmentFailureActionFeedback: true,
-    fulfillmentFailedSubmissionRetryButton: true,
+    fulfillmentFailedSubmissionCanChangeWarehouse: true,
     fulfillmentSubmissionAllowedShipmentStatus: 'ready_to_ship',
     fulfillmentSubmissionTerminalStatusBlocked: true,
     domesticLogisticsTracking: true,
@@ -7642,18 +7664,25 @@ function shopeexRemoteOrderIdFromResponse(responseText) {
   } catch (_) { return ''; }
 }
 
-async function cancelShopeexSubmission(connector, responseText) {
+async function cancelShopeexSubmission(connector, responseText, remark = '') {
   const remoteOrderId = shopeexRemoteOrderIdFromResponse(responseText);
-  if (!remoteOrderId) throw new Error('旧 Shopeex/KJX 订单缺少 kjxOrderIds，无法自动取消打包');
+  if (!remoteOrderId) throw new Error('旧 Shopeex/KJX 订单缺少 kjxOrderIds，无法自动撤单');
   const config = getShopeexConnectorConfig(connector);
   const client = createShopeexClient(config);
-  let details = await client.getPackagedOrderDetails([remoteOrderId]);
+  let remarkWarning = '';
+  if (remark) {
+    try { await client.addPackageRemark(remoteOrderId,String(remark).slice(0,500)); }
+    catch (error) { remarkWarning = String(error.response?.data?.message || error.message || error); }
+  }
+  let details = [];
+  try { details = await client.getPackagedOrderDetails([remoteOrderId]); }
+  catch (_) { details = []; }
   if (!Array.isArray(details) || !details.length) details = await client.getOrderDetails([remoteOrderId]);
   const detail = Array.isArray(details) ? details[0] : null;
   const packageId = String(detail?.kjxPackageId || detail?.kjxOrderPackage?.kjxPackageId || '');
-  if (!packageId) throw new Error('旧 Shopeex/KJX 订单尚未生成包裹ID，无法自动取消打包');
-  await client.cancelPackage(packageId);
-  return { remoteOrderId,packageId };
+  if (packageId) await client.cancelPackage(packageId);
+  else await client.updateOrderStatus(remoteOrderId,7);
+  return { remoteOrderId,packageId,cancelMethod:packageId ? 'package_cancel' : 'order_status_7',remarkWarning };
 }
 
 async function getOrderExternalUserId(username) {
@@ -7842,6 +7871,7 @@ async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,for
     params.push(Math.min(100,Math.max(1,Number(limit) || 50)));
     const staleFilter = force ? '' : " AND (f.remote_checked_at IS NULL OR f.remote_checked_at<NOW()-INTERVAL '2 minutes')";
     const { rows } = await pool.query(`SELECT f.id,f.owner_username,f.order_id,f.provider_order_number,f.warehouse_id,f.resubmit_count,
+      f.warehouse_fee,f.service_fee,f.charge_amount,f.billing_key,
       c.provider_config FROM fulfillment_submissions f
       JOIN erp_connectors c ON c.id=f.warehouse_id
       WHERE f.status='success' AND c.provider='yeeke'${ownerFilter}${staleFilter}
@@ -7887,6 +7917,21 @@ async function syncYeekeSubmissionStatuses(ownerUsername = null,{ limit = 50,for
           if (updateResult.rowCount) {
             returned++;
             try {
+              const transition = calculateFulfillmentBillingTransition({
+                type:'reversal',previousWarehouseFee:submission.warehouse_fee,previousServiceFee:submission.service_fee
+              });
+              await recordFulfillmentBillingEvent({
+                ownerUsername:submission.owner_username,orderId:submission.order_id,submissionId:submission.id,
+                submissionSeq:Number(submission.resubmit_count || 0),
+                eventKey:`${submission.billing_key || `fulfillment:${submission.owner_username}:${submission.order_id}`}:return:${Number(submission.resubmit_count || 0)}`,
+                transition,metadata:{ reason,source:'warehouse_status_sync' }
+              });
+              await pool.query(`UPDATE fulfillment_submissions SET billing_status=$1 WHERE id=$2 AND owner_username=$3`,
+                [transition.status,submission.id,submission.owner_username]);
+            } catch (billingError) {
+              console.error('[Fulfillment billing] return reversal failed:',billingError.message);
+            }
+            try {
               await reverseFulfillmentAgentRebate({ submissionId:submission.id,
                 submissionSeq:Number(submission.resubmit_count || 0),reason });
             } catch (rebateError) {
@@ -7925,6 +7970,22 @@ function startYeekeSubmissionStatusSync() {
   setTimeout(tick,20000).unref?.();
   yeekeSubmissionStatusSyncTimer = setInterval(tick,2*60*1000);
   yeekeSubmissionStatusSyncTimer.unref?.();
+}
+
+async function recordFulfillmentBillingEvent({ ownerUsername,orderId,submissionId,submissionSeq = 0,eventKey,transition,metadata = {} }) {
+  const { rows } = await pool.query(`INSERT INTO fulfillment_billing_events(
+      owner_username,order_id,fulfillment_submission_id,submission_seq,event_type,amount,
+      previous_amount,final_amount,status,event_key,metadata)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
+    ON CONFLICT(event_key) DO UPDATE SET updated_at=NOW()
+    RETURNING id,event_type AS "eventType",amount::float AS adjustment,
+      previous_amount::float AS "previousTotal",final_amount::float AS "finalTotal",
+      status,event_key AS "idempotencyKey",created_at AS "createdAt"`,[
+    ownerUsername,String(orderId),submissionId || null,Math.max(0,Number(submissionSeq) || 0),
+    transition.type,transition.adjustment,transition.previousTotal,transition.finalTotal,
+    transition.status,eventKey,JSON.stringify(metadata || {})
+  ]);
+  return { ...rows[0],direction:transition.direction };
 }
 
 async function recordFulfillmentAgentRebate({ ownerUsername,orderId,submissionId,submissionSeq = 0,warehouseId = null }) {
@@ -8141,17 +8202,19 @@ async function handleFulfillmentSubmit(req, res) {
       WHERE f.owner_username=$2 AND f.order_id=$1`,[displayOrderId,req.authUser.username]);
     const existing = existingResult.rows[0] || null;
     const requestedResubmit = requestedResubmits.has(displayOrderId);
+    const failedReplacement = Boolean(existing && existing.status === 'failed' && requestedResubmit);
     const returnedResubmit = Boolean(existing && existing.status === 'returned');
+    const activeSwitch = Boolean(existing && existing.status === 'success' && requestedResubmit);
     const isResubmit = requestedResubmit || returnedResubmit;
     if (existing && existing.status !== 'returned' && !requestedResubmit) {
       results.push({ orderId:displayOrderId,success:false,message:existing.status === 'failed' ? '该订单上次提交失败，请使用重试推单' : '该订单已经提交代贴单，如需更换仓库请使用重新提交' });
       continue;
     }
-    if (requestedResubmit && (!existing || existing.status !== 'success')) {
-      results.push({ orderId:displayOrderId,success:false,message:'只有已成功提交的订单可以二次推单' });
+    if (requestedResubmit && (!existing || !['success','failed'].includes(existing.status))) {
+      results.push({ orderId:displayOrderId,success:false,message:'只有已成功提交或上次提交失败的订单可以重新选择仓库' });
       continue;
     }
-    if (isResubmit && (!['yeeke','shopeex'].includes(String(warehouse.provider || '')) || (!returnedResubmit && !['yeeke','shopeex'].includes(String(existing?.old_provider || ''))))) {
+    if (isResubmit && (!['yeeke','shopeex'].includes(String(warehouse.provider || '')) || (activeSwitch && !['yeeke','shopeex'].includes(String(existing?.old_provider || ''))))) {
       results.push({ orderId:displayOrderId,success:false,message:'二次推单只支持 Yeeke 或 Shopeex/KJX 官方仓库' });
       continue;
     }
@@ -8165,59 +8228,86 @@ async function handleFulfillmentSubmit(req, res) {
       const stock = fulfillableStockRows.find(item => item.remoteProductId === allocation.remoteProductId);
       if (stock) stock.availableQuantity -= allocation.quantity;
     }
+    let oldWarehouseCancelled = false;
+    let previousOrderCancellation = null;
     try {
       const pdfString = ['yeeke','shopeex'].includes(String(warehouse.provider || 'generic'))
         ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
+      if (activeSwitch) {
+        if (String(existing.old_provider || '') === 'shopeex') {
+          previousOrderCancellation = await cancelShopeexSubmission(
+            { provider_config:existing.old_provider_config },existing.response_text,
+            `山月ERP换仓：订单将迁移至【${warehouse.name}】，请停止处理旧单。用户：${externalUserId || req.authUser.username}；原订单：${displayOrderId}`
+          );
+        } else {
+          const oldConfig = getYeekeConnectorConfig({ provider_config:existing.old_provider_config });
+          const oldClient = createYeekeClient(oldConfig);
+          await oldClient.authorize(oldConfig.userName,oldConfig.password);
+          await oldClient.cancelOrder(existing.provider_order_number || displayOrderId);
+          previousOrderCancellation = { ordersn:existing.provider_order_number || displayOrderId,cancelMethod:'order_status_7' };
+        }
+        oldWarehouseCancelled = true;
+      }
       const pushed = await sendOrderToConnector(warehouse, orderResult.rows, {
         displayOrderId,providerOrderNumber,externalUserId,carrier,carrierCode,trackingNumber,shippingQuantity,shippingRemark,
         fulfillmentMode,stockAllocations,pdfString,serviceCodes,payload
       }, yeekeClient);
       const billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`;
+      const nextSubmissionSeq = isResubmit ? Number(existing.resubmit_count || 0) + 1 : 0;
+      const billingTransition = calculateFulfillmentBillingTransition({
+        type:activeSwitch ? 'switch' : 'initial',
+        previousWarehouseFee:activeSwitch ? existing.warehouse_fee : 0,
+        previousServiceFee:activeSwitch ? existing.service_fee : 0,
+        finalWarehouseFee:warehouseFee,finalServiceFee:serviceFee
+      });
+      const billingEventKey = activeSwitch
+        ? `${billingKey}:switch:${nextSubmissionSeq}`
+        : `${billingKey}:${isResubmit ? 'resubmit' : 'initial'}:${nextSubmissionSeq}`;
       if (isResubmit) {
         await pool.query(`UPDATE fulfillment_submissions SET warehouse_id=$1,carrier=$2,tracking_number=$3,shipping_quantity=$4,shipping_remark=$5,service_ids=$6::jsonb,
           previous_provider_order_number=provider_order_number,provider_order_number=$7,status='success',request_data=$8::jsonb,response_text=$9,
           failure_reason=NULL,warehouse_fee=$10,service_fee=$11,charge_amount=$12,
-          billing_status=CASE WHEN billing_status='charged' THEN 'charged' ELSE 'reserved' END,
-          billing_key=COALESCE(billing_key,$13),resubmit_count=resubmit_count+1,last_resubmitted_at=NOW(),
+          billing_status=$13,billing_key=COALESCE(billing_key,$14),resubmit_count=resubmit_count+1,last_resubmitted_at=NOW(),
             remote_returned=FALSE,remote_status=NULL,remote_message=NULL,remote_checked_at=NULL,returned_at=NULL,
-            fulfillment_mode=$16,stock_allocations=$17::jsonb,updated_at=NOW()
-          WHERE id=$14 AND owner_username=$15`,[warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,
-          JSON.stringify(payload),JSON.stringify({ pushed }).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey,existing.id,req.authUser.username,
-          fulfillmentMode,JSON.stringify(stockAllocations)]);
-        let cancellationWarning = '';
-        if (!returnedResubmit) {
-          try {
-            if (String(existing.old_provider || '') === 'shopeex') {
-              await cancelShopeexSubmission({ provider_config:existing.old_provider_config },existing.response_text);
-            } else {
-              const oldConfig = getYeekeConnectorConfig({ provider_config:existing.old_provider_config });
-              const oldClient = createYeekeClient(oldConfig);
-              await oldClient.authorize(oldConfig.userName,oldConfig.password);
-              await oldClient.updateOrderStatus({ ordersn:existing.provider_order_number || displayOrderId,status:'cancelled' });
-            }
-          } catch (cancelError) {
-            cancellationWarning = `新仓库推单成功，但旧仓库订单取消失败，请在原仓库后台取消旧单：${cancelError.response?.data?.message || cancelError.message}`;
-          }
-        }
+            fulfillment_mode=$17,stock_allocations=$18::jsonb,updated_at=NOW()
+          WHERE id=$15 AND owner_username=$16`,[warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,
+          JSON.stringify(payload),JSON.stringify({ pushed,previousOrderCancellation }).slice(0,5000),warehouseFee,serviceFee,chargeAmount,
+          billingTransition.status,billingKey,existing.id,req.authUser.username,fulfillmentMode,JSON.stringify(stockAllocations)]);
         await pool.query('UPDATE fulfillment_submissions SET response_text=$1,updated_at=NOW() WHERE id=$2 AND owner_username=$3',
-        [JSON.stringify({ pushed,previousOrderCancellation: cancellationWarning ? { success:false,message:cancellationWarning } : { success:true } }).slice(0,5000),existing.id,req.authUser.username]);
+        [JSON.stringify({ pushed,previousOrderCancellation }).slice(0,5000),existing.id,req.authUser.username]);
         let rebate = null;
         let rebateWarning = '';
         try {
+          if (activeSwitch) {
+            await reverseFulfillmentAgentRebate({ submissionId:existing.id,
+              submissionSeq:Number(existing.resubmit_count || 0),reason:`订单换仓至 ${warehouse.name}` });
+          }
           rebate = await recordFulfillmentAgentRebate({ ownerUsername:req.authUser.username,orderId:displayOrderId,
-            submissionId:existing.id,submissionSeq:Number(existing.resubmit_count || 0) + 1,warehouseId });
+            submissionId:existing.id,submissionSeq:nextSubmissionSeq,warehouseId });
         } catch (rebateError) {
           rebateWarning = `代贴单已成功，但代理返利流水写入失败：${rebateError.message}`;
           console.error('[Fulfillment rebate] record failed:',rebateError.message);
         }
-        results.push({ orderId:displayOrderId,success:true,resubmitted:true,providerOrderNumber,warning:cancellationWarning,
-          rebate,rebateWarning,
-          billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
+        let billing,billingWarning = '';
+        try {
+          billing = await recordFulfillmentBillingEvent({
+            ownerUsername:req.authUser.username,orderId:displayOrderId,submissionId:existing.id,
+            submissionSeq:nextSubmissionSeq,eventKey:billingEventKey,transition:billingTransition,
+            metadata:{ previousWarehouseId:existing.warehouse_id,finalWarehouseId:warehouseId,
+              previousWarehouseFee:Number(existing.warehouse_fee || 0),previousServiceFee:Number(existing.service_fee || 0),
+              finalWarehouseFee:warehouseFee,finalServiceFee:serviceFee,failedReplacement,returnedResubmit }
+          });
+        } catch (billingError) {
+          billingWarning = `代贴单已成功，但换仓差价流水写入失败：${billingError.message}`;
+          console.error('[Fulfillment billing] record failed:',billingError.message);
+        }
+        results.push({ orderId:displayOrderId,success:true,resubmitted:true,providerOrderNumber,
+          rebate,rebateWarning,billing,billingWarning });
       } else {
         const insertedSubmission = await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at,fulfillment_mode,stock_allocations)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'success',$10::jsonb,$11,NULL,$12,$13,$14,'reserved',$15,FALSE,NULL,NULL,NULL,$16,$17::jsonb)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'success',$10::jsonb,$11,NULL,$12,$13,$14,$15,$16,FALSE,NULL,NULL,NULL,$17,$18::jsonb)
           RETURNING id`,
-        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey,fulfillmentMode,JSON.stringify(stockAllocations)],
+        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingTransition.status,billingKey,fulfillmentMode,JSON.stringify(stockAllocations)],
         );
         let rebate = null;
         let rebateWarning = '';
@@ -8228,8 +8318,18 @@ async function handleFulfillmentSubmit(req, res) {
           rebateWarning = `代贴单已成功，但代理返利流水写入失败：${rebateError.message}`;
           console.error('[Fulfillment rebate] record failed:',rebateError.message);
         }
-        results.push({ orderId:displayOrderId,success:true,providerOrderNumber,rebate,rebateWarning,
-          billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
+        let billing,billingWarning = '';
+        try {
+          billing = await recordFulfillmentBillingEvent({
+            ownerUsername:req.authUser.username,orderId:displayOrderId,submissionId:insertedSubmission.rows[0]?.id,
+            submissionSeq:0,eventKey:billingEventKey,transition:billingTransition,
+            metadata:{ finalWarehouseId:warehouseId,finalWarehouseFee:warehouseFee,finalServiceFee:serviceFee }
+          });
+        } catch (billingError) {
+          billingWarning = `代贴单已成功，但计费流水写入失败：${billingError.message}`;
+          console.error('[Fulfillment billing] record failed:',billingError.message);
+        }
+        results.push({ orderId:displayOrderId,success:true,providerOrderNumber,rebate,rebateWarning,billing,billingWarning });
       }
     } catch (error) {
       for (const allocation of stockAllocations) {
@@ -8237,7 +8337,42 @@ async function handleFulfillmentSubmit(req, res) {
         if (stock) stock.availableQuantity += allocation.quantity;
       }
       const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
-      if (!isResubmit) {
+      if (activeSwitch && oldWarehouseCancelled) {
+        const reversal = calculateFulfillmentBillingTransition({
+          type:'reversal',previousWarehouseFee:existing.warehouse_fee,previousServiceFee:existing.service_fee
+        });
+        const switchFailureReason = `旧仓订单已撤销，但新仓推送失败；原仓费用已生成退款预留，请重新选择仓库：${failureReason}`;
+        await pool.query(`UPDATE fulfillment_submissions SET status='returned',warehouse_id=NULL,remote_returned=TRUE,
+          remote_status='warehouse_switch_failed',remote_message=$1,failure_reason=$1,returned_at=NOW(),
+          billing_status=$2,updated_at=NOW() WHERE id=$3 AND owner_username=$4`,
+        [switchFailureReason,reversal.status,existing.id,req.authUser.username]);
+        try {
+          await recordFulfillmentBillingEvent({
+            ownerUsername:req.authUser.username,orderId:displayOrderId,submissionId:existing.id,
+            submissionSeq:Number(existing.resubmit_count || 0),
+            eventKey:`${existing.billing_key || `fulfillment:${req.authUser.username}:${displayOrderId}`}:switch-failed-return:${Number(existing.resubmit_count || 0)}`,
+            transition:reversal,metadata:{ reason:switchFailureReason,previousWarehouseId:existing.warehouse_id }
+          });
+          await reverseFulfillmentAgentRebate({ submissionId:existing.id,
+            submissionSeq:Number(existing.resubmit_count || 0),reason:switchFailureReason });
+        } catch (ledgerError) {
+          console.error('[Fulfillment switch] reversal ledger failed:',ledgerError.message);
+        }
+        results.push({ orderId:displayOrderId,success:false,message:switchFailureReason });
+        continue;
+      }
+      if (failedReplacement) {
+        await pool.query(`UPDATE fulfillment_submissions SET warehouse_id=$1,carrier=$2,tracking_number=$3,
+          shipping_quantity=$4,shipping_remark=$5,service_ids=$6::jsonb,provider_order_number=$7,
+          request_data=$8::jsonb,response_text=$9,failure_reason=$10,retry_count=retry_count+1,
+          warehouse_fee=$11,service_fee=$12,charge_amount=0,billing_status='no_charge',
+          fulfillment_mode=$13,stock_allocations=$14::jsonb,updated_at=NOW()
+          WHERE id=$15 AND owner_username=$16`,[
+          warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,
+          JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason,
+          warehouseFee,serviceFee,fulfillmentMode,JSON.stringify(stockAllocations),existing.id,req.authUser.username
+        ]);
+      } else if (!isResubmit) {
         await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,retry_count,fulfillment_mode,stock_allocations)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'failed',$10::jsonb,$11,$12,1,$13,$14::jsonb)`,
         [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason,fulfillmentMode,JSON.stringify(stockAllocations)]);
@@ -8374,6 +8509,7 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
     WHERE f.id=$1 AND f.owner_username=$2`, [req.params.id,req.authUser.username]);
   const submission = rows[0];
   if (!submission) return res.status(404).json({ code: 404, message: '代贴单提交记录不存在' });
+  if (submission.status !== 'failed') return res.status(409).json({ code:409,message:'只有提交失败的代贴单可以原仓重试' });
   let retryWarehouseFee = null,retryServiceFee = null,retryChargeAmount = null;
   try {
     let responseData;
@@ -8428,17 +8564,35 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
       const response = await axios.post(submission.endpoint, submission.request_data, { headers, timeout: 30000, maxRedirects: 0 });
       responseData = response.data;
     }
+    const retryBillingKey = `fulfillment:${req.authUser.username}:${submission.order_id}`;
+    const retryBillingTransition = retryChargeAmount == null ? null : calculateFulfillmentBillingTransition({
+      type:'initial',finalWarehouseFee:retryWarehouseFee,finalServiceFee:retryServiceFee
+    });
     await pool.query(`UPDATE fulfillment_submissions SET status='success',response_text=$1,failure_reason=NULL,
       charge_amount=CASE WHEN $2::numeric IS NULL THEN charge_amount ELSE $2 END,
       warehouse_fee=CASE WHEN $3::numeric IS NULL THEN warehouse_fee ELSE $3 END,
       service_fee=CASE WHEN $4::numeric IS NULL THEN service_fee ELSE $4 END,
-      billing_status=CASE WHEN billing_status='charged' THEN 'charged' ELSE 'reserved' END,
+      billing_status=CASE WHEN $6::text IS NULL THEN billing_status ELSE $6 END,
       billing_key=COALESCE(billing_key,$5),
       remote_returned=FALSE,remote_status=NULL,remote_message=NULL,returned_at=NULL,
-      retry_count=retry_count+1,updated_at=NOW() WHERE id=$6 AND owner_username=$7`,
+      retry_count=retry_count+1,updated_at=NOW() WHERE id=$7 AND owner_username=$8`,
     [JSON.stringify(responseData).slice(0,5000),retryChargeAmount,retryWarehouseFee,retryServiceFee,
-      `fulfillment:${req.authUser.username}:${submission.order_id}`,submission.id,req.authUser.username]);
-    res.json({ code: 0, message: '重试成功' });
+      retryBillingKey,retryBillingTransition?.status || null,submission.id,req.authUser.username]);
+    let billing = null,billingWarning = '';
+    if (retryBillingTransition) {
+      try {
+        billing = await recordFulfillmentBillingEvent({
+          ownerUsername:req.authUser.username,orderId:submission.order_id,submissionId:submission.id,
+          submissionSeq:Number(submission.resubmit_count || 0),
+          eventKey:`${retryBillingKey}:retry:${Number(submission.retry_count || 0) + 1}`,
+          transition:retryBillingTransition,metadata:{ warehouseId:submission.warehouse_id,retry:true }
+        });
+      } catch (billingError) {
+        billingWarning = `重试成功，但计费流水写入失败：${billingError.message}`;
+        console.error('[Fulfillment billing] retry record failed:',billingError.message);
+      }
+    }
+    res.json({ code: 0, data:{ billing,billingWarning },message: billingWarning || '重试成功' });
   } catch (error) {
     const reason = String(error.response?.data?.message || error.message || '重试失败').slice(0,2000);
     await pool.query(`UPDATE fulfillment_submissions SET status='failed',response_text=$1,failure_reason=$2,retry_count=retry_count+1,updated_at=NOW() WHERE id=$3 AND owner_username=$4`, [JSON.stringify(error.response?.data || error.message).slice(0,5000),reason,submission.id,req.authUser.username]);

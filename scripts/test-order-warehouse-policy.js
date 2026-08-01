@@ -113,7 +113,10 @@ assert.ok(serverSource.includes('previousTrackingNo:previousTrackingNumber') && 
 assert.ok(serverSource.includes('官方面单未申请成功，请先点击订单上的“申请面单”查看原因'), 'official label failures must tell the user how to recover');
 assert.ok(serverSource.includes('const requestedResubmits = new Set'), 'resubmission must require an explicit order id list');
 assert.ok(!serverSource.includes('requestedResubmit && Number(existing.warehouse_id) === warehouseId'), 'resubmission must allow the current warehouse to be selected again');
-assert.ok(serverSource.includes("updateOrderStatus({ ordersn:existing.provider_order_number || displayOrderId,status:'cancelled' })"), 'a successful resubmission must push the Mercado cancellation status to the previous Yeeke order');
+assert.ok(serverSource.includes('oldClient.cancelOrder(existing.provider_order_number || displayOrderId)'), 'a warehouse switch must cancel the previous Yeeke order with the official cancellation endpoint');
+const submitHandlerSource = serverSource.slice(serverSource.indexOf('async function handleFulfillmentSubmit'),serverSource.indexOf("app.post('/api/admin/fulfillment/submit'"));
+assert.ok(submitHandlerSource.indexOf('await oldClient.cancelOrder') < submitHandlerSource.indexOf('const pushed = await sendOrderToConnector'), 'the old warehouse must be cancelled before creating the replacement order');
+assert.ok(serverSource.includes("['success','failed'].includes(existing.status)"), 'a failed first submission must allow a different warehouse to be selected without charging');
 assert.ok(serverSource.includes('previous_provider_order_number=provider_order_number'), 'the previous provider order number must be retained for audit');
 assert.ok(serverSource.includes('resubmit_count=resubmit_count+1'), 'each successful resubmission must be counted');
 assert.ok(serverSource.includes('if (!isResubmit) {'), 'a failed resubmission must not overwrite the currently successful submission');
@@ -126,7 +129,9 @@ assert.ok(!returnSyncSource.includes("JOIN users administrator ON administrator.
 assert.ok(returnSyncSource.includes('if (!record && entry.config.warehouseCode)') && returnSyncSource.includes('listOrders({ ordersn:providerOrderNumber,pageNo:1,pageSize:20 })'), 'returned orders missing from the original warehouse view must be retried without a warehouse filter');
 assert.ok(serverSource.includes("app.put('/api/admin/erp-connectors/:id/price', requireAdmin"), 'warehouse unit prices must stay admin-only');
 assert.ok(serverSource.includes('billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`'), 'production billing integration must have an idempotent per-user order key');
-assert.ok(serverSource.includes("billing_status='charged'"), 'reserved billing events must preserve an externally completed charge');
+assert.ok(serverSource.includes('CREATE TABLE IF NOT EXISTS fulfillment_billing_events'), 'warehouse billing adjustments must use an immutable integration ledger');
+assert.ok(serverSource.includes("type:activeSwitch ? 'switch' : 'initial'") && serverSource.includes('previousWarehouseFee:activeSwitch ? existing.warehouse_fee : 0'), 'warehouse switches must settle only the final total difference');
+assert.ok(serverSource.includes('fulfillmentWarehouseSwitchSamePriceCharge: false'), 'same-price warehouse switches must explicitly avoid charging');
 assert.ok(!serverSource.includes('replacementProviderOrderNumber'), 'legacy replacement-order code must stay removed');
 assert.ok(!serverSource.includes('wallet_transactions'), 'the test deployment must not create a local wallet ledger');
 assert.ok(!serverSource.includes("/recharge'"), 'the test deployment must not expose a recharge endpoint');
@@ -140,7 +145,7 @@ assert.ok(orderFrontendSource.includes('仓库：'), 'submitted warehouse data m
 assert.ok(orderFrontendSource.includes('国内快递单号：'), 'domestic tracking data must render on the main order card');
 assert.ok(orderFrontendSource.includes('提交代贴单时间：'), 'fulfillment submission time must render on the main order card');
 assert.ok(orderFrontendSource.includes('代贴单提交失败') && orderFrontendSource.includes('已提交代贴单'), 'the submit action must switch to its attached submission state');
-assert.ok(orderFrontendSource.includes('代贴单提交失败，点击重新推送'), 'failed submissions must expose a clickable retry action');
+assert.ok(orderFrontendSource.includes('代贴单提交失败，点击重新选择仓库'), 'failed submissions must allow selecting another warehouse');
 assert.ok(orderFrontendSource.includes('仅待发货可提交'), 'terminal and non-ready orders must show that fulfillment is unavailable');
 assert.ok(orderFrontendSource.includes('缺少国内快递单号，请填写后再推送'), 'the submit dialog must validate domestic tracking numbers before calling the API');
 assert.ok(orderFrontendSource.includes('尚未生成官方面单，请先同步订单状态并点击“申请面单”'), 'orders without a shipment label must receive actionable feedback');
@@ -166,7 +171,7 @@ assert.ok(serverSource.includes("orderManagementMenuRoles: ['admin','agent']"), 
 assert.ok(/admin","agent"\]\.includes\(/.test(rootAssetSource), 'the production root bundle must hide order management from ordinary users');
 assert.ok(serverSource.includes("warehouseConfigurationTabRole: 'admin'"), 'warehouse configuration tab metadata must stay administrator-only');
 assert.ok(serverSource.includes("warehouseConfigurationReadRole: 'admin'") && serverSource.includes('fulfillmentOptionsExcludeCredentials: true'), 'configuration reads must stay admin-only while safe options exclude credentials');
-assert.ok(orderFrontendSource.includes('二次推单会在所选仓库创建新订单') && orderFrontendSource.includes('可以继续选择当前仓库'), 'the UI must explain the second-push and same-warehouse flow');
+assert.ok(orderFrontendSource.includes('只补扣或退回最终总价差额') && orderFrontendSource.includes('价格相同不扣费'), 'the UI must explain final-price differential billing');
 assert.ok(/\.order-card\[[^\]]+\]\{[^}]*font-size:12px/.test(orderStyleSource), 'all order cards must use the compact 12px base font');
 assert.ok(orderStyleSource.includes('flex-wrap:nowrap'), 'the order header must not wrap and clip the warehouse label');
 assert.ok(orderStyleSource.includes('grid-template-columns:minmax(0,1fr) auto'), 'the fulfillment summary must use the compact two-column layout');
