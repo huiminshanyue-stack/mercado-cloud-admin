@@ -24,6 +24,7 @@
     "test:wechat-official": "node scripts/test-wechat-official-account.js",
     "test:yeeke": "node scripts/test-yeeke-client.js",
     "test:shopeex": "node scripts/test-shopeex-client.js",
+    "test:shopeex-logistics": "node scripts/test-shopeex-logistics.js",
     "test:marketing-api": "node scripts/test-marketing-api-policy.js"
   },
   "dependencies": {

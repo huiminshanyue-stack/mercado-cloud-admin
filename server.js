@@ -36,6 +36,12 @@ const {
   normalizeShopeexAccessUrl,
   selectShopeexWarehouseAddress
 } = require('./shopeex-client');
+const {
+  SHOPEEX_LOGISTICS_CATALOG_SIZE,
+  findShopeexLogisticsByCode,
+  resolveShopeexLogisticsCode,
+  listShopeexLogisticsCatalog
+} = require('./shopeex-logistics');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
 const { createMercadoLibreWebhookService,touchOrderRealtimeState,getOrderRealtimeState } = require('./mercadolibre-webhook');
 const { createOfficialAccountService } = require('./wechat-official-account');
@@ -3181,7 +3187,10 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-01.04',
+    version: '2026-08-01.05',
+    shopeexKjxCourierCatalogSize: SHOPEEX_LOGISTICS_CATALOG_SIZE,
+    shopeexKjxCourierCodeScope: 'shopeex-only',
+    yeekeCourierCodeRequired: false,
     compactOrderTiming: '12px',
     yeekeOrderNoteFormat: '山月ERP SY00000',
     yeekeReturnStatusPolling: true,
@@ -6939,8 +6948,23 @@ async function ensureDefaultLogisticsCompanies() {
   const adminOwner = await pool.query("SELECT username FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1");
   const existing = await pool.query(`SELECT COUNT(*)::int AS count FROM logistics_companies lc
     JOIN users u ON u.username=lc.owner_username AND u.role='admin'`);
-  if (!existing.rows[0].count && adminOwner.rows[0]) for (const name of defaults) await pool.query('INSERT INTO logistics_companies(owner_username,name) VALUES($1,$2) ON CONFLICT(owner_username,name) DO NOTHING',[adminOwner.rows[0].username,name]);
+  if (!existing.rows[0].count && adminOwner.rows[0]) for (const name of defaults) await pool.query(
+    'INSERT INTO logistics_companies(owner_username,name,code) VALUES($1,$2,$3) ON CONFLICT(owner_username,name) DO NOTHING',
+    [adminOwner.rows[0].username,name,resolveShopeexLogisticsCode(name)]
+  );
+  const { rows } = await pool.query(`SELECT lc.id,lc.name,lc.code FROM logistics_companies lc
+    JOIN users u ON u.username=lc.owner_username AND u.role='admin' WHERE lc.enabled=TRUE`);
+  for (const row of rows) {
+    if (String(row.code || '').trim()) continue;
+    const resolvedCode = resolveShopeexLogisticsCode(row.name);
+    if (resolvedCode) await pool.query(`UPDATE logistics_companies SET code=$2
+      WHERE id=$1 AND COALESCE(code,'')=''`,[row.id,resolvedCode]);
+  }
 }
+
+app.get('/api/admin/shopeex-logistics-catalog', requireAdmin, (req, res) => {
+  res.json({ code:0,count:SHOPEEX_LOGISTICS_CATALOG_SIZE,data:listShopeexLogisticsCatalog() });
+});
 
 app.get('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
   await ensureDefaultLogisticsCompanies();
@@ -6950,7 +6974,8 @@ app.get('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
 });
 
 app.post('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
-  const name = String(req.body?.name || '').trim(), code = String(req.body?.code || '').trim();
+  const name = String(req.body?.name || '').trim();
+  const code = resolveShopeexLogisticsCode(name,String(req.body?.code || '').trim());
   if (!name) return res.status(400).json({ code: 400, message: '物流公司名称不能为空' });
   const { rows } = await pool.query(`INSERT INTO logistics_companies(owner_username,name,code) VALUES($1,$2,$3)
     ON CONFLICT(owner_username,name) DO UPDATE SET code=EXCLUDED.code,enabled=TRUE RETURNING id`,[req.authUser.username,name.slice(0,120),code.slice(0,100)]);
@@ -6958,7 +6983,8 @@ app.post('/api/admin/logistics-companies', requireAdmin, async (req, res) => {
 });
 
 app.put('/api/admin/logistics-companies/:id', requireAdmin, async (req, res) => {
-  const name = String(req.body?.name || '').trim(), code = String(req.body?.code || '').trim();
+  const name = String(req.body?.name || '').trim();
+  const code = resolveShopeexLogisticsCode(name,String(req.body?.code || '').trim());
   if (!name) return res.status(400).json({ code: 400, message: '物流公司名称不能为空' });
   const { rows } = await pool.query(`UPDATE logistics_companies lc SET name=$2,code=$3,enabled=TRUE
     FROM users u WHERE lc.id=$1 AND u.username=lc.owner_username AND u.role='admin'
@@ -7072,7 +7098,12 @@ async function getFulfillmentOptionsData() {
     }
     return { ...row,warehouseCode };
   });
-  return { connectors,services:serviceResult.rows,carriers:carrierResult.rows };
+  return {
+    connectors,
+    services:serviceResult.rows,
+    carriers:carrierResult.rows,
+    shopeexCarriers:listShopeexLogisticsCatalog()
+  };
 }
 
 app.get('/api/admin/fulfillment-options', requireOrderAccess, async (req, res) => {
@@ -7522,21 +7553,30 @@ async function handleFulfillmentSubmit(req, res) {
     JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE c.id=$1 AND c.enabled=TRUE`, [warehouseId]);
   if (!connectorResult.rows[0]) return res.status(404).json({ code: 404, message: '仓库不存在或已停用' });
+  const warehouse = connectorResult.rows[0];
+  const provider = String(warehouse.provider || 'generic');
   const carrierResult = await pool.query(`SELECT lc.id,lc.code FROM logistics_companies lc
     JOIN users u ON u.username=lc.owner_username AND u.role='admin'
     WHERE lc.name=$1 AND lc.enabled=TRUE`,[carrier]);
-  if (!carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
+  if (provider !== 'shopeex' && !carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
   const serviceResult = serviceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.external_price,fs.connector_id FROM fulfillment_services fs
     JOIN users u ON u.username=fs.owner_username AND u.role='admin'
     WHERE fs.enabled=TRUE AND fs.id=ANY($1::bigint[]) AND (fs.source='manual' OR fs.connector_id=$2)`, [serviceIds,warehouseId]) : { rows: [] };
-  const warehouse = connectorResult.rows[0];
   const warehouseFee = feeAmount(warehouse.unit_price);
   const serviceFee = Number(serviceResult.rows.reduce((sum,service) => sum + feeAmount(service.external_price),0).toFixed(2));
   const chargeAmount = Number((warehouseFee + serviceFee).toFixed(2));
-  const provider = String(warehouse.provider || 'generic');
   const serviceCodes = ['yeeke','shopeex'].includes(provider)
     ? serviceResult.rows.filter(service => service.source === provider).map(service => String(service.code || '')).filter(Boolean) : [];
-  const carrierCode = String(carrierResult.rows[0]?.code || '').trim();
+  const requestedCarrierCode = String(req.body?.carrierCode || '').trim();
+  const requestedCatalogCarrier = provider === 'shopeex' && requestedCarrierCode
+    ? findShopeexLogisticsByCode(requestedCarrierCode)
+    : null;
+  if (provider === 'shopeex' && requestedCarrierCode && (!requestedCatalogCarrier || requestedCatalogCarrier.name !== carrier)) {
+    return res.status(400).json({ code:400,message:'Shopeex/KJX 快递公司与快递代码不匹配，请重新选择' });
+  }
+  const carrierCode = provider === 'shopeex'
+    ? (requestedCatalogCarrier?.code || resolveShopeexLogisticsCode(carrier,carrierResult.rows[0]?.code))
+    : '';
   if (provider === 'shopeex' && !carrierCode) return res.status(400).json({ code:400,message:`国内物流公司“${carrier}”缺少 Shopeex/KJX 快递代码，请管理员在“仓库与增值服务 → 物流公司管理”中补充代码` });
   const externalUserId = await getOrderExternalUserId(req.authUser.username);
   let yeekeClient = null;
@@ -7590,7 +7630,7 @@ async function handleFulfillmentSubmit(req, res) {
     const providerOrderNumber = isResubmit ? buildYeekeResubmitOrderNumber(displayOrderId) : displayOrderId;
     const payload = { source:'shanyue-erp',action:isResubmit ? 'fulfillment_resubmit' : 'fulfillment_label',order_id:displayOrderId,
       provider_order_number:providerOrderNumber,previous_provider_order_number:existing?.provider_order_number || null,
-      carrier,tracking_number:trackingNumber,shipping_quantity:shippingQuantity,shipping_remark:shippingRemark,
+      carrier,carrier_code:carrierCode,tracking_number:trackingNumber,shipping_quantity:shippingQuantity,shipping_remark:shippingRemark,
       value_added_services:serviceResult.rows,orders:orderResult.rows.map(row => row.raw_data) };
     try {
       const pdfString = ['yeeke','shopeex'].includes(String(warehouse.provider || 'generic'))
@@ -7814,7 +7854,8 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
         const carrierCodeResult = await pool.query(`SELECT lc.code FROM logistics_companies lc
           JOIN users u ON u.username=lc.owner_username AND u.role='admin'
           WHERE lc.name=$1 AND lc.enabled=TRUE LIMIT 1`,[submission.carrier]);
-        carrierCode = String(carrierCodeResult.rows[0]?.code || '').trim();
+        carrierCode = resolveShopeexLogisticsCode(submission.carrier,
+          submission.request_data?.carrier_code || carrierCodeResult.rows[0]?.code);
         if (!carrierCode) return res.status(400).json({ code:400,message:`国内物流公司“${submission.carrier}”缺少 Shopeex/KJX 快递代码，请管理员在“仓库与增值服务 → 物流公司管理”中补充代码后重试` });
       }
       retryWarehouseFee = feeAmount(submission.unit_price);

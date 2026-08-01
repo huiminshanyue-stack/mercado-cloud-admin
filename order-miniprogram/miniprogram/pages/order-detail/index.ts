@@ -5,7 +5,7 @@ Page({
   data:{
     loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false,
     fulfillmentOptionsLoading:false,fulfillmentSubmitting:false,fulfillmentExpressEditing:false,fulfillmentExpressUpdating:false,
-    warehouses:[] as any[],carriers:[] as any[],warehouseNames:[] as string[],carrierNames:[] as string[],
+    warehouses:[] as any[],carriers:[] as any[],allCarriers:[] as any[],shopeexCarriers:[] as any[],warehouseNames:[] as string[],carrierNames:[] as string[],
     warehouseIndex:0,carrierIndex:0,
     fulfillmentForm:{ trackingNumber:'',quantity:'1',remark:'' }
   },
@@ -74,18 +74,29 @@ Page({
     try {
       const data=await request<any>({ path:'/api/miniprogram/v1/fulfillment-options' });
       const warehouses=(data.connectors || []).filter((item:any)=>item.enabled !== false);
-      const carriers=(data.carriers || []).filter((item:any)=>item.enabled !== false);
+      const allCarriers=(data.carriers || []).filter((item:any)=>item.enabled !== false);
+      const shopeexCarriers=(data.shopeexCarriers || []).filter((item:any)=>item.code && item.name);
       this.setData({
-        warehouses,carriers,
+        warehouses,allCarriers,shopeexCarriers,
         warehouseNames:warehouses.map((item:any)=>item.warehouseCode ? `${item.name}（${item.warehouseCode}）` : item.name),
-        carrierNames:carriers.map((item:any)=>item.name),
-        warehouseIndex:0,carrierIndex:0
+        warehouseIndex:0
       });
+      this.refreshCarrierChoices(0);
     } catch (error) { showError(error); }
     finally { this.setData({ fulfillmentOptionsLoading:false }); }
   },
   onWarehouseChange(event:WechatMiniprogram.PickerChange) {
-    this.setData({ warehouseIndex:Number(event.detail.value || 0) });
+    const warehouseIndex=Number(event.detail.value || 0);
+    this.setData({ warehouseIndex },()=>this.refreshCarrierChoices(warehouseIndex));
+  },
+  refreshCarrierChoices(warehouseIndex:number) {
+    const warehouse=this.data.warehouses[warehouseIndex];
+    const carriers=warehouse?.provider === 'shopeex' ? this.data.shopeexCarriers : this.data.allCarriers;
+    this.setData({
+      carriers,
+      carrierNames:carriers.map((item:any)=>warehouse?.provider === 'shopeex' ? `${item.name}（${item.code}）` : item.name),
+      carrierIndex:0
+    });
   },
   onCarrierChange(event:WechatMiniprogram.PickerChange) {
     this.setData({ carrierIndex:Number(event.detail.value || 0) });
@@ -123,7 +134,8 @@ Page({
       await request<any>({
         path:'/api/miniprogram/v1/fulfillment/submit',method:'POST',timeout:60000,
         data:{
-          orderIds:[orderId],warehouseId:warehouse.id,carrier:carrier.name,serviceIds:[],
+          orderIds:[orderId],warehouseId:warehouse.id,carrier:carrier.name,
+          carrierCode:warehouse.provider === 'shopeex' ? String(carrier.code || '') : '',serviceIds:[],
           trackingByOrder:{ [orderId]:trackingNumber },
           quantityByOrder:{ [orderId]:quantity },
           remarkByOrder:{ [orderId]:remark }

@@ -66,6 +66,7 @@ for (const route of [
   "app.get('/api/admin/fulfillment-services', requireAdmin",
   "app.post('/api/admin/fulfillment-services', requireAdmin",
   "app.delete('/api/admin/fulfillment-services/:id', requireAdmin",
+  "app.get('/api/admin/shopeex-logistics-catalog', requireAdmin",
   "app.get('/api/admin/logistics-companies', requireAdmin",
   "app.post('/api/admin/logistics-companies', requireAdmin",
   "app.put('/api/admin/logistics-companies/:id', requireAdmin",
@@ -95,6 +96,11 @@ assert.ok(yeekeSource.includes('erpOrdersn: identity') && yeekeSource.includes('
 assert.ok(yeekeSource.includes('trackingNo: officialTrackingNumber') && yeekeSource.includes('expressInfos: domesticTrackingNumber'), 'international and domestic tracking numbers must use separate Yeeke fields');
 assert.ok(yeekeSource.includes('sendQuantity') && yeekeSource.includes('note: domesticRemark'), 'Yeeke courier details must include shipping quantity and remark');
 assert.ok(serverSource.includes("['yeeke','shopeex'].includes(requestedProvider)") && serverSource.includes("provider === 'shopeex'"), 'administrator connectors must support Shopeex/KJX without changing Yeeke');
+assert.ok(serverSource.includes("const carrierCode = provider === 'shopeex'") && serverSource.includes("    : '';"), 'courier codes must be resolved only for Shopeex/KJX submissions');
+assert.ok(!yeekeSource.includes('carrierCode'), 'Yeeke payloads must remain independent from Shopeex/KJX courier codes');
+assert.ok(serverSource.includes('shopeexKjxCourierCatalogSize: SHOPEEX_LOGISTICS_CATALOG_SIZE') && serverSource.includes("shopeexKjxCourierCodeScope: 'shopeex-only'") && serverSource.includes('yeekeCourierCodeRequired: false'), 'health metadata must expose the complete isolated Shopeex/KJX courier catalog');
+assert.ok(serverSource.includes('shopeexCarriers:listShopeexLogisticsCatalog()'), 'all Shopeex/KJX carriers must be available in fulfillment options');
+assert.ok(serverSource.includes("provider !== 'shopeex' && !carrierResult.rows[0]") && serverSource.includes('requestedCatalogCarrier.name !== carrier'), 'Shopeex catalog carriers must bypass the generic Yeeke list but still validate name/code pairs');
 assert.ok(shopeexSource.includes("crypto.createHash('md5')") && shopeexSource.includes("Buffer.from(digest, 'utf8').toString('base64')"), 'Shopeex/KJX requests must use the documented MD5 then Base64 signature');
 assert.ok(shopeexSource.includes("headers.openId = openId") && shopeexSource.includes("call('/api/kjxUser/authLogin'"), 'Shopeex/KJX must authenticate and send openId in request headers');
 assert.ok(shopeexSource.includes("call('/api/upload/uploadbase64/pdf'") && shopeexSource.includes("call('/api/batch/add'"), 'Shopeex/KJX fulfillment must upload the official PDF and submit order plus package');
@@ -151,6 +157,8 @@ assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.inclu
 assert.ok(orderFrontendSource.includes('仓库收货地址') && orderFrontendSource.includes('recipientDisplay') && orderFrontendSource.includes('addressDisplay'), 'the workbench must render user-specific shared warehouse addresses');
 assert.ok(orderFrontendSource.includes('未填写（无法提交 Shopeex/KJX）') && orderFrontendSource.includes('设置 Shopeex/KJX 快递代码'), 'administrators must be able to see and edit missing Shopeex courier codes');
 assert.ok(orderFrontendSource.includes('/api/admin/warehouse-addresses'), 'the workbench must load and manage warehouse addresses through the protected API');
+assert.ok(orderFrontendSource.includes('/api/admin/shopeex-logistics-catalog') && orderFrontendSource.includes('Shopeex/KJX') && orderFrontendSource.includes('Yeeke'), 'the administrator UI must load the complete Shopeex/KJX catalog and explain Yeeke isolation');
+assert.ok(orderFrontendSource.includes('shopeexCarriers') && orderFrontendSource.includes('carrierCode') && orderFrontendSource.includes('搜索快递名称或 ID'), 'fulfillment carrier choices must switch to the full coded catalog only for Shopeex/KJX warehouses');
 assert.ok(orderFrontendSource.includes('/api/admin/fulfillment-options'), 'non-admin users must load only safe fulfillment choices');
 assert.ok(orderFrontendSource.includes('仓库地址') && orderFrontendSource.includes('warehouse-addresses'), 'warehouse addresses must have a standalone tab visible to order users');
 assert.ok(serverSource.includes("warehouseAddressTabRoles: ['admin','agent','user']"), 'warehouse address tab metadata must allow all order roles');
@@ -166,6 +174,7 @@ assert.ok(orderStyleSource.includes('flex-wrap:wrap') && orderStyleSource.includ
 assert.ok(miniDetailSource.includes('/api/miniprogram/v1/fulfillment-options') && miniDetailSource.includes('/api/miniprogram/v1/fulfillment/submit'), 'the mini-program order detail must use the protected fulfillment APIs');
 assert.ok(miniDetailSource.includes('/api/miniprogram/v1/fulfillment/update-express'), 'the mini-program must update courier details on the original Yeeke order');
 assert.ok(miniDetailSource.includes('quantityByOrder') && miniDetailSource.includes('remarkByOrder'), 'the mini-program must submit quantity and courier remarks');
+assert.ok(miniDetailSource.includes('shopeexCarriers') && miniDetailSource.includes("warehouse?.provider === 'shopeex'") && miniDetailSource.includes('carrierCode:'), 'the mini-program must use coded Shopeex carriers without changing the generic Yeeke list');
 for (const label of ['选择仓库','快递公司','国内快递单号','发货数量','备注','提交代贴单']) {
   assert.ok(miniDetailTemplate.includes(label), `the mini-program fulfillment form must include ${label}`);
 }
