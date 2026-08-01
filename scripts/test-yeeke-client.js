@@ -160,6 +160,15 @@ async function run() {
   assert.ok(payload.erpOrdersn.length <= 32);
   assert.ok(Number.isFinite(payload.shipByDate));
 
+  const stockPayload = buildYeekeOrderPayload({
+    row: { ml_order_id:'STOCK-1',items:[{ item:{ title:'Stock item',seller_custom_field:'SKU-STOCK' },quantity:2 }] },
+    warehouseCode:'th',externalUserId:'SY12345',fulfillmentMode:'stock',shippingQuantity:2,
+    stockAllocations:[{ sku:'SKU-STOCK',remoteProductId:'L00000004721',quantity:2 }]
+  });
+  assert.deepStrictEqual(stockPayload.orderItems[0].expressInfos,[]);
+  assert.deepStrictEqual(stockPayload.orderItems[0].stockInfos,[{ sysCode:'L00000004721',num:2 }]);
+  assert.strictEqual(stockPayload.autoRelateStock,0);
+
   const replacementPayload = buildYeekeOrderPayload({
     row: { ml_order_id: '200001', items: [{ item: { title: 'Item' }, quantity: 1 }] },
     displayOrderId: '200001', providerOrderNumber: '200001-R123456', warehouseCode: 'th', externalUserId: 'SY12345'

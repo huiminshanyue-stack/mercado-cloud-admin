@@ -7,6 +7,82 @@ function compactObject(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== ''));
 }
 
+function normalizeStockAllocations(value) {
+  return (Array.isArray(value) ? value : []).map(item => ({
+    sku: String(item?.sku || '').trim(),
+    remoteProductId: String(item?.remoteProductId || item?.stockId || item?.sysCode || '').trim(),
+    quantity: positiveInteger(item?.quantity)
+  })).filter(item => item.sku && item.remoteProductId && item.quantity > 0);
+}
+
+function createStockAllocationPool(value) {
+  const pool = new Map();
+  for (const item of normalizeStockAllocations(value)) {
+    const key = item.sku.toUpperCase();
+    if (!pool.has(key)) pool.set(key, []);
+    pool.get(key).push({ ...item,remaining:item.quantity });
+  }
+  return pool;
+}
+
+function takeStockAllocations(pool, sku, maximumQuantity) {
+  const entries = pool.get(String(sku || '').trim().toUpperCase()) || [];
+  let remaining = positiveInteger(maximumQuantity);
+  const allocations = [];
+  for (const entry of entries) {
+    if (remaining <= 0) break;
+    const quantity = Math.min(remaining,entry.remaining);
+    if (quantity > 0) allocations.push({ remoteProductId:entry.remoteProductId,quantity });
+    entry.remaining -= quantity;
+    remaining -= quantity;
+  }
+  return allocations;
+}
+
+function fulfillmentOrderSkuQuantities(orderRows) {
+  const quantities = new Map();
+  for (const row of (Array.isArray(orderRows) ? orderRows : [orderRows])) {
+    const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
+    const items = Array.isArray(row?.items) && row.items.length ? row.items
+      : (Array.isArray(raw.order_items) ? raw.order_items : (Array.isArray(raw.items) ? raw.items : []));
+    for (const entry of items) {
+      const item = entry?.item && typeof entry.item === 'object' ? entry.item : entry;
+      const sku = String(item?.seller_custom_field || item?.variation_sku || item?.seller_sku || item?.sku || entry?.seller_sku || entry?.sku || '').trim();
+      if (!sku) throw new Error('订单商品缺少 SKU，无法安全匹配仓库库存，请先补充商品 SKU');
+      const quantity = positiveInteger(entry?.quantity || item?.quantity,1);
+      quantities.set(sku.toUpperCase(),(quantities.get(sku.toUpperCase()) || 0) + quantity);
+    }
+  }
+  return quantities;
+}
+
+function validateFulfillmentStockAllocations(orderRows, requested, availableRows) {
+  const allocations = normalizeStockAllocations(requested);
+  if (!allocations.length) throw new Error('请选择已经成功入库的商品库存');
+  const ordered = fulfillmentOrderSkuQuantities(orderRows);
+  const available = new Map((availableRows || []).map(item => [String(item.remoteProductId),item]));
+  const allocatedBySku = new Map(),allocatedByStock = new Map();
+  for (const allocation of allocations) {
+    const stock = available.get(allocation.remoteProductId);
+    if (!stock) throw new Error(`库存 ${allocation.remoteProductId} 不属于当前用户、尚未成功入库或已经没有可用数量`);
+    if (String(stock.sku).toUpperCase() !== allocation.sku.toUpperCase()) throw new Error(`库存 ${stock.sku} 与订单 SKU ${allocation.sku} 不匹配`);
+    const skuKey = allocation.sku.toUpperCase();
+    allocatedBySku.set(skuKey,(allocatedBySku.get(skuKey) || 0) + allocation.quantity);
+    allocatedByStock.set(allocation.remoteProductId,(allocatedByStock.get(allocation.remoteProductId) || 0) + allocation.quantity);
+  }
+  for (const [sku,quantity] of ordered) {
+    const allocated = allocatedBySku.get(sku) || 0;
+    if (!allocated) throw new Error(`订单 SKU ${sku} 尚未选择已入库库存`);
+    if (allocated > quantity) throw new Error(`订单 SKU ${sku} 库存发货数量 ${allocated} 超过订单数量 ${quantity}`);
+  }
+  for (const sku of allocatedBySku.keys()) if (!ordered.has(sku)) throw new Error(`选择的库存 SKU ${sku} 不在当前订单中`);
+  for (const [stockId,quantity] of allocatedByStock) {
+    const stock = available.get(stockId);
+    if (quantity > Number(stock.availableQuantity || 0)) throw new Error(`库存 ${stock.sku} 仅剩 ${stock.availableQuantity} 件可发，不能提交 ${quantity} 件`);
+  }
+  return allocations.map(allocation => ({ ...allocation,productName:available.get(allocation.remoteProductId)?.productName || '' }));
+}
+
 function extractRecords(data) {
   if (Array.isArray(data)) return data;
   for (const key of ['records', 'list', 'rows', 'dataList']) {
@@ -26,6 +102,7 @@ function buildYeekeInboundPayload(input = {}) {
   const warehouseCode = String(input.warehouseCode || '').trim();
   const trackingNumber = String(input.trackingNumber || '').trim();
   const localInboundNo = String(input.localInboundNo || '').trim();
+  const identity = String(input.userIdentity || '').trim();
   const items = (Array.isArray(input.items) ? input.items : []).map((item) => {
     const sysCode = String(item.sysCode || item.remoteProductCode || '').trim();
     const variationSku = String(item.variationSku || item.sku || '').trim();
@@ -43,7 +120,8 @@ function buildYeekeInboundPayload(input = {}) {
     trackingNo: trackingNumber,
     estimateDate: String(input.expectedDate || '').trim() || undefined,
     expressType: ['0', '1', '2'].includes(String(input.transportType)) ? String(input.transportType) : undefined,
-    expressNote: String(input.note || '').trim().slice(0, 500) || undefined,
+    expressNote: [identity && `山月ERP ${identity}`,localInboundNo && `入库批次 ${localInboundNo}`,
+      String(input.note || '').trim()].filter(Boolean).join('；').slice(0, 500) || undefined,
     expressCode: String(input.carrierCode || '').trim() || undefined,
     boxItems: [{
       trackingNo: trackingNumber,
@@ -118,6 +196,11 @@ function normalizeShopeexStock(record = {}) {
 
 module.exports = {
   positiveInteger,
+  normalizeStockAllocations,
+  createStockAllocationPool,
+  takeStockAllocations,
+  fulfillmentOrderSkuQuantities,
+  validateFulfillmentStockAllocations,
   extractRecords,
   buildYeekeInboundPayload,
   buildShopeexStockPayload,

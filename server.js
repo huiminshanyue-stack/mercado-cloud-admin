@@ -51,6 +51,8 @@ const {
 } = require('./shopeex-logistics');
 const {
   extractRecords: extractWarehouseRecords,
+  normalizeStockAllocations,
+  validateFulfillmentStockAllocations,
   buildYeekeInboundPayload,
   buildShopeexStockPayload,
   normalizeYeekeInbound,
@@ -546,6 +548,8 @@ async function initOrderManagementTables() {
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS last_resubmitted_at TIMESTAMPTZ');
   await pool.query('ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS shipping_quantity INTEGER NOT NULL DEFAULT 1');
   await pool.query("ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS shipping_remark TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS fulfillment_mode VARCHAR(20) NOT NULL DEFAULT 'express'");
+  await pool.query("ALTER TABLE fulfillment_submissions ADD COLUMN IF NOT EXISTS stock_allocations JSONB NOT NULL DEFAULT '[]'::jsonb");
   await pool.query(`UPDATE fulfillment_submissions SET provider_order_number=order_id
     WHERE provider_order_number IS NULL OR provider_order_number=''`);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_fulfillment_submissions_owner_order ON fulfillment_submissions(owner_username,order_id)');
@@ -3245,7 +3249,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-01.08',
+    version: '2026-08-02.01',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
     orderLabelOwnershipVerification: 'official-shipment-sender-api',
@@ -3269,6 +3273,12 @@ app.get('/api/health/order-management', (req, res) => {
     warehouseInboundReturnsRemoteNumberAndQuantities: true,
     yeekeOfficialInboundOrder: true,
     shopeexInventoryReviewInbound: true,
+    fulfillmentShippingModes: ['express','warehouse_stock'],
+    fulfillmentStockOnlyReceivedInventory: true,
+    fulfillmentStockUserOwnedOnly: true,
+    fulfillmentStockAvailabilityLimit: 'min(user_received_minus_allocated,remote_available)',
+    yeekeStockFulfillmentField: 'orderItems[].stockInfos[]',
+    shopeexStockFulfillmentLogisticsType: 3,
     warehouseConfigurationWriteRole: 'admin',
     orderManagementRoles: ['admin','agent','user'],
     orderManagementMenuRoles: ['admin','agent'],
@@ -4196,7 +4206,7 @@ async function getOrderListData(authUser,query = {}) {
   }
   if (packedRows.length) {
     const displayIds = packedRows.map(order => String(order.displayOrderId || order.packId || order.orderId));
-    const submissionRows = await pool.query(`SELECT DISTINCT ON (f.order_id) f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.shipping_quantity,f.shipping_remark,f.status,
+    const submissionRows = await pool.query(`SELECT DISTINCT ON (f.order_id) f.id,f.order_id,f.warehouse_id,f.carrier,f.tracking_number,f.shipping_quantity,f.shipping_remark,f.fulfillment_mode,f.stock_allocations,f.status,
       f.failure_reason,f.retry_count,f.provider_order_number,f.previous_provider_order_number,f.resubmit_count,f.last_resubmitted_at,
       f.warehouse_fee,f.service_fee,f.charge_amount,f.billing_status,f.billing_key,
       f.remote_status,f.remote_message,f.remote_checked_at,f.returned_at,f.created_at,f.updated_at,
@@ -4215,6 +4225,7 @@ async function getOrderListData(authUser,query = {}) {
       return [String(row.order_id),{
         id:row.id,orderId:row.order_id,warehouseId:row.warehouse_id,warehouseName:row.warehouse_name || '',warehouseCode,
         provider:row.provider || '',carrier:row.carrier,trackingNumber:row.tracking_number,
+        fulfillmentMode:row.fulfillment_mode || 'express',stockAllocations:normalizeStockAllocations(row.stock_allocations),
         shippingQuantity:Number(row.shipping_quantity || 1),shippingRemark:row.shipping_remark || '',status:row.status,
         failureReason:row.failure_reason || '',retryCount:row.retry_count || 0,providerOrderNumber:row.provider_order_number || row.order_id,
         previousProviderOrderNumber:row.previous_provider_order_number || '',resubmitCount:Number(row.resubmit_count || 0),lastResubmittedAt:row.last_resubmitted_at,
@@ -7311,6 +7322,58 @@ async function createInventoryProviderClient(connector) {
   throw new Error('当前仓库不支持库存管理接口');
 }
 
+async function getFulfillableWarehouseStock(ownerUsername, connector, { includeExhausted = false } = {}) {
+  const localResult = await pool.query(`SELECT i.remote_product_id AS "remoteProductId",i.sku,
+    MAX(i.product_name) AS "productName",MAX(i.image) AS image,
+    SUM(i.received_quantity)::int AS "receivedQuantity"
+    FROM warehouse_inbound_items i JOIN warehouse_inbounds w ON w.id=i.inbound_id
+    WHERE w.owner_username=$1 AND w.warehouse_id=$2 AND w.status='received'
+      AND i.received_quantity>0 AND NULLIF(i.remote_product_id,'') IS NOT NULL
+    GROUP BY i.remote_product_id,i.sku`,[ownerUsername,connector.id]);
+  if (!localResult.rows.length) return [];
+
+  const usedResult = await pool.query(`SELECT stock_allocations FROM fulfillment_submissions
+    WHERE owner_username=$1 AND warehouse_id=$2 AND fulfillment_mode='stock'
+      AND status='success' AND remote_returned=FALSE`,[ownerUsername,connector.id]);
+  const used = new Map();
+  for (const row of usedResult.rows) {
+    for (const allocation of normalizeStockAllocations(row.stock_allocations)) {
+      used.set(allocation.remoteProductId,(used.get(allocation.remoteProductId) || 0) + allocation.quantity);
+    }
+  }
+
+  const { client,config } = await createInventoryProviderClient(connector);
+  const remote = connector.provider === 'yeeke'
+    ? await client.listStock({ pageNo:1,pageSize:100,wareHouse:config.warehouseCode })
+    : await client.listStock({ pageNumber:1,pageSize:20,stockPlusDeliveryId:Number(config.storeAddressId),status:2,arrivedStore:1 });
+  const remoteRecords = extractWarehouseRecords(remote);
+  const remoteMap = new Map(remoteRecords.map(item => [String(connector.provider === 'yeeke' ? (item.sysCode || item.id || '') : (item.stockPlusId || '')),item]));
+
+  for (const local of localResult.rows) {
+    if (remoteMap.has(String(local.remoteProductId))) continue;
+    const targeted = connector.provider === 'yeeke'
+      ? await client.listStock({ pageNo:1,pageSize:20,wareHouse:config.warehouseCode,sysCode:String(local.remoteProductId) })
+      : await client.listStock({ pageNumber:1,pageSize:20,stockPlusDeliveryId:Number(config.storeAddressId),itemNo:String(local.sku),status:2,arrivedStore:1 });
+    const match = extractWarehouseRecords(targeted).find(item => String(connector.provider === 'yeeke'
+      ? (item.sysCode || item.id || '') : (item.stockPlusId || '')) === String(local.remoteProductId));
+    if (match) remoteMap.set(String(local.remoteProductId),match);
+  }
+
+  return localResult.rows.map(local => {
+    const remoteItem = remoteMap.get(String(local.remoteProductId)) || {};
+    const remoteAvailable = Math.max(0,Math.floor(Number(connector.provider === 'yeeke'
+      ? remoteItem.availableNum : remoteItem.trackingAmount) || 0));
+    const allocatedQuantity = used.get(String(local.remoteProductId)) || 0;
+    const localAvailable = Math.max(0,Number(local.receivedQuantity || 0) - allocatedQuantity);
+    return {
+      remoteProductId:String(local.remoteProductId),sku:String(local.sku || ''),productName:String(local.productName || ''),
+      image:String(local.image || remoteItem.image || remoteItem.skuImage || ''),provider:connector.provider,
+      receivedQuantity:Number(local.receivedQuantity || 0),allocatedQuantity,remoteAvailableQuantity:remoteAvailable,
+      availableQuantity:Math.min(localAvailable,remoteAvailable),remoteStatus:String(remoteItem.status ?? '')
+    };
+  }).filter(item => includeExhausted || item.availableQuantity > 0);
+}
+
 function localInboundNumber(identity) {
   const safeIdentity = String(identity || 'SY00000').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,15) || 'SY00000';
   return `IN-${safeIdentity}-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
@@ -7358,48 +7421,28 @@ app.get('/api/admin/warehouse-inventory/options', requireOrderAccess, async (req
   }
 });
 
-app.get('/api/admin/warehouse-inventory/stock', requireOrderAccess, async (req,res) => {
+async function handleFulfillableWarehouseStock(req,res) {
   try {
-  const connector = await getSharedInventoryConnector(req.query.warehouseId);
-  if (!connector) return res.status(404).json({ code:404,message:'仓库不存在或未启用库存接口' });
-    const { client,config } = await createInventoryProviderClient(connector);
-    const page = Math.max(1,Math.floor(Number(req.query.page) || 1));
-    const size = Math.min(100,Math.max(1,Math.floor(Number(req.query.size) || 30)));
+    const connector = await getSharedInventoryConnector(req.query.warehouseId);
+    if (!connector) return res.status(404).json({ code:404,message:'仓库不存在或未启用库存接口' });
     const query = String(req.query.query || '').trim();
-    let remote;
-    let records;
-    if (connector.provider === 'yeeke') {
-      remote = await client.listStock({ pageNo:page,pageSize:size,wareHouse:config.warehouseCode,
-        sku:query || undefined });
-      if (query && !extractWarehouseRecords(remote).length) {
-        remote = await client.listStock({ pageNo:page,pageSize:size,wareHouse:config.warehouseCode,name:query });
-      }
-      records = extractWarehouseRecords(remote).map(item => ({
-        remoteId:String(item.id || item.sysCode || ''),sku:String(item.sku || ''),name:String(item.name || item.productName || ''),
-        image:String(item.image || ''),warehouseCode:String(item.wareHouse || config.warehouseCode || ''),
-        availableQuantity:Number(item.availableNum || 0),remainingQuantity:Number(item.remainNum || 0),
-        frozenQuantity:Number(item.frozenNum || 0),onTheWayQuantity:Number(item.onTheWayNum || 0),
-        remoteStatus:String(item.status ?? ''),provider:'yeeke'
-      }));
-    } else {
-      remote = await client.listStock({ pageNumber:page,pageSize:size,stockPlusDeliveryId:Number(config.storeAddressId),
-        itemNo:query || undefined });
-      if (query && !extractWarehouseRecords(remote).length) {
-        remote = await client.listStock({ pageNumber:page,pageSize:size,stockPlusDeliveryId:Number(config.storeAddressId),stockName:query });
-      }
-      records = extractWarehouseRecords(remote).map(item => ({
-        remoteId:String(item.stockPlusId || ''),remoteInboundNo:String(item.trackingNumber || ''),sku:String(item.itemNo || ''),
-        name:String(item.stockName || item.skuName || ''),image:String(item.skuImage || ''),warehouseCode:String(item.stockPlusDeliveryId || ''),
-        availableQuantity:Number(item.trackingAmount || 0),remainingQuantity:Number(item.skuNum || 0),frozenQuantity:0,onTheWayQuantity:Number(item.arrivedStore) === 1 ? 0 : Number(item.skuNum || 0),
-        remoteStatus:String(item.status ?? ''),arrivedStore:Number(item.arrivedStore || 0),provider:'shopeex'
-      }));
+    let records = await getFulfillableWarehouseStock(req.authUser.username,connector,{ includeExhausted:req.query.includeExhausted === '1' });
+    if (query) {
+      const normalized = query.toLowerCase();
+      records = records.filter(item => item.sku.toLowerCase().includes(normalized) || item.productName.toLowerCase().includes(normalized));
     }
-    res.json({ code:0,data:{ provider:connector.provider,warehouseId:connector.id,warehouseName:connector.name,page,size,records } });
+    records = records.map(item => ({ ...item,remoteId:item.remoteProductId,name:item.productName,
+      remainingQuantity:item.receivedQuantity,frozenQuantity:item.allocatedQuantity,onTheWayQuantity:0 }));
+    res.json({ code:0,data:{ provider:connector.provider,warehouseId:connector.id,warehouseName:connector.name,
+      page:1,size:records.length,records } });
   } catch (error) {
     console.error('[WarehouseInventory] stock query failed:',error.response?.data || error.message);
     res.status(502).json({ code:502,message:`仓库库存查询失败：${error.response?.data?.message || error.message}` });
   }
-});
+}
+
+app.get('/api/admin/warehouse-inventory/stock', requireOrderAccess, handleFulfillableWarehouseStock);
+app.get('/api/admin/warehouse-inventory/fulfillable', requireOrderAccess, handleFulfillableWarehouseStock);
 
 app.get('/api/admin/warehouse-inbounds', requireOrderAccess, async (req,res) => {
   try {
@@ -7481,7 +7524,8 @@ app.post('/api/admin/warehouse-inbounds', requireOrderAccess, async (req,res) =>
         await pool.query('UPDATE warehouse_inbound_items SET remote_product_id=$1,updated_at=NOW() WHERE inbound_id=$2 AND sku=$3',
           [sysCode,inboundId,item.sku]);
       }
-      const payload = buildYeekeInboundPayload({ ...requestSnapshot,items,warehouseCode:config.warehouseCode,localInboundNo:localNo });
+      const payload = buildYeekeInboundPayload({ ...requestSnapshot,items,warehouseCode:config.warehouseCode,
+        localInboundNo:localNo,userIdentity:identity });
       const remote = await client.createOrUpdateInbound(payload);
       const remoteId = String(remote?.id || '');
       const remoteNo = String(remote?.storageBillCode || remote?.sotrageBillCode || '');
@@ -7493,7 +7537,7 @@ app.post('/api/admin/warehouse-inbounds', requireOrderAccess, async (req,res) =>
         const payload = buildShopeexStockPayload({ storeAddressId:config.storeAddressId,item,userIdentity:identity,
           localInboundNo:localNo,trackingNumber,note:requestSnapshot.note });
         const createdStock = await client.addOrUpdateStock(payload);
-        const listed = extractWarehouseRecords(await client.listStock({ pageNumber:1,pageSize:100,
+        const listed = extractWarehouseRecords(await client.listStock({ pageNumber:1,pageSize:20,
           stockPlusDeliveryId:Number(config.storeAddressId),itemNo:item.sku,stockName:item.productName }));
         const match = listed.find(stock => String(stock.anotherName || '') === localNo)
           || listed.find(stock => String(stock.itemNo || '') === item.sku && Number(stock.stockPlusDeliveryId) === Number(config.storeAddressId));
@@ -7556,7 +7600,7 @@ app.post('/api/admin/warehouse-inbounds/:id/sync', requireOrderAccess, async (re
     } else {
       const remoteItems = [];
       for (const item of inbound.items) {
-        const remote = await client.listStock({ pageNumber:1,pageSize:100,stockPlusDeliveryId:Number(config.storeAddressId),itemNo:item.sku });
+        const remote = await client.listStock({ pageNumber:1,pageSize:20,stockPlusDeliveryId:Number(config.storeAddressId),itemNo:item.sku });
         const records = extractWarehouseRecords(remote);
         const record = records.find(entry => String(entry.stockPlusId || '') === String(item.remoteProductId || ''))
           || records.find(entry => String(entry.anotherName || '') === inbound.localInboundNo) || records[0];
@@ -7722,7 +7766,9 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
       carrier: options.carrier,
       trackingNumber: options.trackingNumber,
       shippingQuantity: options.shippingQuantity,
-      shippingRemark: options.shippingRemark
+      shippingRemark: options.shippingRemark,
+      fulfillmentMode: options.fulfillmentMode,
+      stockAllocations: options.stockAllocations
     });
     try {
       return await client.createOrderV2(payload);
@@ -7756,7 +7802,9 @@ async function sendOrderToConnector(connector, row, options = {}, yeekeClient = 
       carrierCode: options.carrierCode,
       trackingNumber: options.trackingNumber,
       shippingQuantity: options.shippingQuantity,
-      shippingRemark: options.shippingRemark
+      shippingRemark: options.shippingRemark,
+      fulfillmentMode: options.fulfillmentMode,
+      stockAllocations: options.stockAllocations
     });
     const created = await client.createAndPackage(payload);
     return { ...created, orderSn:payload.orderSn,airwayBillUrl };
@@ -7986,24 +8034,30 @@ app.post('/api/admin/fulfillment-agent-rebates/:id/settle', requireAdmin, async 
 async function handleFulfillmentSubmit(req, res) {
   const orderIds = [...new Set((Array.isArray(req.body?.orderIds) ? req.body.orderIds : []).map(String).filter(Boolean))];
   const requestedResubmits = new Set((Array.isArray(req.body?.resubmitOrderIds) ? req.body.resubmitOrderIds : []).map(String).filter(Boolean));
-  const warehouseId = Number(req.body?.warehouseId), carrier = String(req.body?.carrier || '').trim();
+  const fulfillmentMode = req.body?.fulfillmentMode === 'stock' ? 'stock' : 'express';
+  const warehouseId = Number(req.body?.warehouseId);
+  const carrier = fulfillmentMode === 'stock' ? '仓库库存发货' : String(req.body?.carrier || '').trim();
   const trackingByOrder = req.body?.trackingByOrder || {};
   const quantityByOrder = req.body?.quantityByOrder || {};
+  const stockByOrder = req.body?.stockByOrder || {};
   const remarkByOrder = req.body?.remarkByOrder || {};
   const serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
   if (!orderIds.length) return res.status(400).json({ code: 400, message: '请先选择需要提交代贴单的订单' });
   if (!warehouseId) return res.status(400).json({ code: 400, message: '请选择要提交的仓库' });
-  if (!carrier) return res.status(400).json({ code: 400, message: '请选择国内物流公司' });
+  if (fulfillmentMode === 'express' && !carrier) return res.status(400).json({ code: 400, message: '请选择国内物流公司' });
   const connectorResult = await pool.query(`SELECT c.* FROM erp_connectors c
     JOIN users u ON u.username=c.owner_username AND u.role='admin'
     WHERE c.id=$1 AND c.enabled=TRUE`, [warehouseId]);
   if (!connectorResult.rows[0]) return res.status(404).json({ code: 404, message: '仓库不存在或已停用' });
   const warehouse = connectorResult.rows[0];
   const provider = String(warehouse.provider || 'generic');
-  const carrierResult = await pool.query(`SELECT lc.id,lc.code FROM logistics_companies lc
+  if (fulfillmentMode === 'stock' && !['yeeke','shopeex'].includes(provider)) {
+    return res.status(400).json({ code:400,message:'库存发货仅支持 Yeeke 或 Shopeex/KJX 官方仓库' });
+  }
+  const carrierResult = fulfillmentMode === 'express' ? await pool.query(`SELECT lc.id,lc.code FROM logistics_companies lc
     JOIN users u ON u.username=lc.owner_username AND u.role='admin'
-    WHERE lc.name=$1 AND lc.enabled=TRUE`,[carrier]);
-  if (provider !== 'shopeex' && !carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
+    WHERE lc.name=$1 AND lc.enabled=TRUE`,[carrier]) : { rows:[] };
+  if (fulfillmentMode === 'express' && provider !== 'shopeex' && !carrierResult.rows[0]) return res.status(404).json({ code: 404, message: '请选择管理员维护的物流公司' });
   const serviceResult = serviceIds.length ? await pool.query(`SELECT fs.id,fs.name,fs.code,fs.description,fs.source,fs.external_price,fs.connector_id FROM fulfillment_services fs
     JOIN users u ON u.username=fs.owner_username AND u.role='admin'
     WHERE fs.enabled=TRUE AND fs.id=ANY($1::bigint[]) AND (fs.source='manual' OR fs.connector_id=$2)`, [serviceIds,warehouseId]) : { rows: [] };
@@ -8012,17 +8066,17 @@ async function handleFulfillmentSubmit(req, res) {
   const chargeAmount = Number((warehouseFee + serviceFee).toFixed(2));
   const serviceCodes = ['yeeke','shopeex'].includes(provider)
     ? serviceResult.rows.filter(service => service.source === provider).map(service => String(service.code || '')).filter(Boolean) : [];
-  const requestedCarrierCode = String(req.body?.carrierCode || '').trim();
-  const requestedCatalogCarrier = provider === 'shopeex' && requestedCarrierCode
+  const requestedCarrierCode = fulfillmentMode === 'express' ? String(req.body?.carrierCode || '').trim() : '';
+  const requestedCatalogCarrier = fulfillmentMode === 'express' && provider === 'shopeex' && requestedCarrierCode
     ? findShopeexLogisticsByCode(requestedCarrierCode)
     : null;
-  if (provider === 'shopeex' && requestedCarrierCode && (!requestedCatalogCarrier || requestedCatalogCarrier.name !== carrier)) {
+  if (fulfillmentMode === 'express' && provider === 'shopeex' && requestedCarrierCode && (!requestedCatalogCarrier || requestedCatalogCarrier.name !== carrier)) {
     return res.status(400).json({ code:400,message:'Shopeex/KJX 快递公司与快递代码不匹配，请重新选择' });
   }
-  const carrierCode = provider === 'shopeex'
+  const carrierCode = fulfillmentMode === 'express' && provider === 'shopeex'
     ? (requestedCatalogCarrier?.code || resolveShopeexLogisticsCode(carrier,carrierResult.rows[0]?.code))
     : '';
-  if (provider === 'shopeex' && !carrierCode) return res.status(400).json({ code:400,message:`国内物流公司“${carrier}”缺少 Shopeex/KJX 快递代码，请管理员在“仓库与增值服务 → 物流公司管理”中补充代码` });
+  if (fulfillmentMode === 'express' && provider === 'shopeex' && !carrierCode) return res.status(400).json({ code:400,message:`国内物流公司“${carrier}”缺少 Shopeex/KJX 快递代码，请管理员在“仓库与增值服务 → 物流公司管理”中补充代码` });
   const externalUserId = await getOrderExternalUserId(req.authUser.username);
   let yeekeClient = null;
   if (String(warehouse.provider || 'generic') === 'yeeke') {
@@ -8034,16 +8088,36 @@ async function handleFulfillmentSubmit(req, res) {
       return res.status(502).json({ code: 502, message: `Yeeke 授权失败: ${error.response?.data?.message || error.message}` });
     }
   }
+  let fulfillableStockRows = [];
+  if (fulfillmentMode === 'stock') {
+    try {
+      fulfillableStockRows = await getFulfillableWarehouseStock(req.authUser.username,warehouse);
+    } catch (error) {
+      return res.status(502).json({ code:502,message:`可发库存读取失败：${error.response?.data?.message || error.message}` });
+    }
+    if (!fulfillableStockRows.length) return res.status(409).json({ code:409,message:'当前仓库没有属于该用户且已经成功入库的可发库存' });
+  }
   const results = [];
   for (const displayOrderId of orderIds) {
     const orderResult = await pool.query('SELECT * FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [displayOrderId,req.authUser.username]);
     if (!orderResult.rows.length) { results.push({ orderId: displayOrderId, success: false, message: '订单不存在' }); continue; }
     const eligibility = fulfillmentSubmissionEligibility(orderResult.rows);
     if (!eligibility.allowed) { results.push({ orderId:displayOrderId,success:false,message:eligibility.message }); continue; }
-    const trackingNumber = String(trackingByOrder[displayOrderId] || '').trim();
-    if (!trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少国内快递单号，请填写后重新推送' }); continue; }
+    const trackingNumber = fulfillmentMode === 'stock' ? '' : String(trackingByOrder[displayOrderId] || '').trim();
+    if (fulfillmentMode === 'express' && !trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少国内快递单号，请填写后重新推送' }); continue; }
     const maximumShippingQuantity = fulfillmentOrderQuantity(orderResult.rows);
-    const shippingQuantity = Math.floor(Number(quantityByOrder[displayOrderId] ?? maximumShippingQuantity));
+    let stockAllocations = [];
+    try {
+      stockAllocations = fulfillmentMode === 'stock'
+        ? validateFulfillmentStockAllocations(orderResult.rows,stockByOrder[displayOrderId],fulfillableStockRows)
+        : [];
+    } catch (error) {
+      results.push({ orderId:displayOrderId,success:false,message:error.message });
+      continue;
+    }
+    const shippingQuantity = fulfillmentMode === 'stock'
+      ? stockAllocations.reduce((total,item) => total + item.quantity,0)
+      : Math.floor(Number(quantityByOrder[displayOrderId] ?? maximumShippingQuantity));
     if (!Number.isFinite(shippingQuantity) || shippingQuantity < 1 || shippingQuantity > maximumShippingQuantity) {
       results.push({ orderId:displayOrderId,success:false,message:`发货数量必须是 1 至 ${maximumShippingQuantity} 的整数` });
       continue;
@@ -8075,13 +8149,19 @@ async function handleFulfillmentSubmit(req, res) {
     const providerOrderNumber = isResubmit ? buildYeekeResubmitOrderNumber(displayOrderId) : displayOrderId;
     const payload = { source:'shanyue-erp',action:isResubmit ? 'fulfillment_resubmit' : 'fulfillment_label',order_id:displayOrderId,
       provider_order_number:providerOrderNumber,previous_provider_order_number:existing?.provider_order_number || null,
+      fulfillment_mode:fulfillmentMode,stock_allocations:stockAllocations,
       carrier,carrier_code:carrierCode,tracking_number:trackingNumber,shipping_quantity:shippingQuantity,shipping_remark:shippingRemark,
       value_added_services:serviceResult.rows,orders:orderResult.rows.map(row => row.raw_data) };
+    for (const allocation of stockAllocations) {
+      const stock = fulfillableStockRows.find(item => item.remoteProductId === allocation.remoteProductId);
+      if (stock) stock.availableQuantity -= allocation.quantity;
+    }
     try {
       const pdfString = ['yeeke','shopeex'].includes(String(warehouse.provider || 'generic'))
         ? (await resolveOfficialLabelPdfForPush(req.authUser,orderResult.rows)).toString('base64') : '';
       const pushed = await sendOrderToConnector(warehouse, orderResult.rows, {
-        displayOrderId,providerOrderNumber,externalUserId,carrier,carrierCode,trackingNumber,shippingQuantity,shippingRemark,pdfString,serviceCodes,payload
+        displayOrderId,providerOrderNumber,externalUserId,carrier,carrierCode,trackingNumber,shippingQuantity,shippingRemark,
+        fulfillmentMode,stockAllocations,pdfString,serviceCodes,payload
       }, yeekeClient);
       const billingKey = `fulfillment:${req.authUser.username}:${displayOrderId}`;
       if (isResubmit) {
@@ -8090,9 +8170,11 @@ async function handleFulfillmentSubmit(req, res) {
           failure_reason=NULL,warehouse_fee=$10,service_fee=$11,charge_amount=$12,
           billing_status=CASE WHEN billing_status='charged' THEN 'charged' ELSE 'reserved' END,
           billing_key=COALESCE(billing_key,$13),resubmit_count=resubmit_count+1,last_resubmitted_at=NOW(),
-          remote_returned=FALSE,remote_status=NULL,remote_message=NULL,remote_checked_at=NULL,returned_at=NULL,updated_at=NOW()
+            remote_returned=FALSE,remote_status=NULL,remote_message=NULL,remote_checked_at=NULL,returned_at=NULL,
+            fulfillment_mode=$16,stock_allocations=$17::jsonb,updated_at=NOW()
           WHERE id=$14 AND owner_username=$15`,[warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,
-          JSON.stringify(payload),JSON.stringify({ pushed }).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey,existing.id,req.authUser.username]);
+          JSON.stringify(payload),JSON.stringify({ pushed }).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey,existing.id,req.authUser.username,
+          fulfillmentMode,JSON.stringify(stockAllocations)]);
         let cancellationWarning = '';
         if (!returnedResubmit) {
           try {
@@ -8123,10 +8205,10 @@ async function handleFulfillmentSubmit(req, res) {
           rebate,rebateWarning,
           billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
       } else {
-        const insertedSubmission = await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'success',$10::jsonb,$11,NULL,$12,$13,$14,'reserved',$15,FALSE,NULL,NULL,NULL)
+        const insertedSubmission = await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,warehouse_fee,service_fee,charge_amount,billing_status,billing_key,remote_returned,remote_status,remote_message,returned_at,fulfillment_mode,stock_allocations)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'success',$10::jsonb,$11,NULL,$12,$13,$14,'reserved',$15,FALSE,NULL,NULL,NULL,$16,$17::jsonb)
           RETURNING id`,
-        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey],
+        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(pushed).slice(0,5000),warehouseFee,serviceFee,chargeAmount,billingKey,fulfillmentMode,JSON.stringify(stockAllocations)],
         );
         let rebate = null;
         let rebateWarning = '';
@@ -8141,11 +8223,15 @@ async function handleFulfillmentSubmit(req, res) {
           billing:{ status:'reserved',idempotencyKey:billingKey,warehouseFee,serviceFee,total:chargeAmount } });
       }
     } catch (error) {
+      for (const allocation of stockAllocations) {
+        const stock = fulfillableStockRows.find(item => item.remoteProductId === allocation.remoteProductId);
+        if (stock) stock.availableQuantity += allocation.quantity;
+      }
       const failureReason = String(error.response?.data?.message || error.message || '提交失败').slice(0,2000);
       if (!isResubmit) {
-        await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,retry_count)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'failed',$10::jsonb,$11,$12,1)`,
-        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason]);
+        await pool.query(`INSERT INTO fulfillment_submissions(owner_username,order_id,warehouse_id,carrier,tracking_number,shipping_quantity,shipping_remark,service_ids,provider_order_number,status,request_data,response_text,failure_reason,retry_count,fulfillment_mode,stock_allocations)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,'failed',$10::jsonb,$11,$12,1,$13,$14::jsonb)`,
+        [req.authUser.username,displayOrderId,warehouseId,carrier,trackingNumber,shippingQuantity,shippingRemark,JSON.stringify(serviceIds),providerOrderNumber,JSON.stringify(payload),JSON.stringify(error.response?.data || error.message).slice(0,5000),failureReason,fulfillmentMode,JSON.stringify(stockAllocations)]);
       }
       results.push({ orderId: displayOrderId, success: false, message: error.response?.data?.message || error.message });
     }
@@ -8176,6 +8262,7 @@ async function handleFulfillmentExpressUpdate(req, res) {
   const submission = rows[0];
   if (!submission) return res.status(404).json({ code:404,message:'未找到该订单的代贴单提交记录' });
   if (submission.status !== 'success') return res.status(400).json({ code:400,message:'只有已经成功提交的代贴单才能修改国内快递号' });
+  if (submission.fulfillment_mode === 'stock') return res.status(400).json({ code:400,message:'库存发货没有国内快递号，不能使用快递号修改功能' });
   if (String(submission.provider || '') !== 'yeeke') return res.status(400).json({ code:400,message:'当前仓库不支持原单修改国内快递号' });
   if (!submission.enabled) return res.status(400).json({ code:400,message:'该仓库连接已经停用，无法同步修改' });
   const previousTrackingNumber = String(submission.tracking_number || '').trim();
@@ -8239,7 +8326,7 @@ app.get('/api/admin/fulfillment/submissions', requireOrderAccess, async (req, re
     where.push(`f.warehouse_id=$${params.length}`);
   }
   const { rows } = await pool.query(`SELECT f.id,f.order_id AS "orderId",f.warehouse_id AS "warehouseId",f.provider_order_number AS "providerOrderNumber",f.carrier,f.tracking_number AS "trackingNumber",
-    f.shipping_quantity AS "shippingQuantity",f.shipping_remark AS "shippingRemark",f.status,
+    f.shipping_quantity AS "shippingQuantity",f.shipping_remark AS "shippingRemark",f.fulfillment_mode AS "fulfillmentMode",f.stock_allocations AS "stockAllocations",f.status,
     f.failure_reason AS "failureReason",f.retry_count AS "retryCount",f.warehouse_fee AS "warehouseFee",
     f.service_fee AS "serviceFee",f.charge_amount AS "chargeAmount",f.billing_status AS "billingStatus",f.billing_key AS "billingKey",
     f.remote_status AS "remoteStatus",f.remote_message AS "remoteMessage",f.remote_checked_at AS "remoteCheckedAt",
@@ -8294,8 +8381,14 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
         JOIN users u ON u.username=fs.owner_username AND u.role='admin'
         WHERE fs.connector_id=$2 AND fs.source=$3 AND fs.enabled=TRUE AND fs.id=ANY($1::bigint[])`,[retryServiceIds,submission.warehouse_id,retryProvider]) : { rows:[] };
       const serviceCodes = retryServices.rows.map(service => String(service.code || '')).filter(Boolean);
+      const retryMode = submission.fulfillment_mode === 'stock' ? 'stock' : 'express';
+      let retryStockAllocations = [];
+      if (retryMode === 'stock') {
+        const availableStock = await getFulfillableWarehouseStock(req.authUser.username,{ ...submission,id:submission.warehouse_id });
+        retryStockAllocations = validateFulfillmentStockAllocations(orderResult.rows,submission.stock_allocations,availableStock);
+      }
       let carrierCode = '';
-      if (retryProvider === 'shopeex') {
+      if (retryMode === 'express' && retryProvider === 'shopeex') {
         const carrierCodeResult = await pool.query(`SELECT lc.code FROM logistics_companies lc
           JOIN users u ON u.username=lc.owner_username AND u.role='admin'
           WHERE lc.name=$1 AND lc.enabled=TRUE LIMIT 1`,[submission.carrier]);
@@ -8315,6 +8408,8 @@ app.post('/api/admin/fulfillment/submissions/:id/retry', requireOrderAccess, asy
         trackingNumber: submission.tracking_number,
         shippingQuantity: submission.shipping_quantity,
         shippingRemark: submission.shipping_remark,
+        fulfillmentMode: retryMode,
+        stockAllocations: retryStockAllocations,
         pdfString,
         serviceCodes
       });

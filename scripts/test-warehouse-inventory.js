@@ -2,18 +2,52 @@ const assert = require('assert');
 const {
   buildYeekeInboundPayload,
   buildShopeexStockPayload,
+  normalizeStockAllocations,
+  createStockAllocationPool,
+  takeStockAllocations,
+  validateFulfillmentStockAllocations,
   normalizeYeekeInbound,
   normalizeShopeexStock
 } = require('../warehouse-inventory');
 
+assert.deepStrictEqual(normalizeStockAllocations([{ sku:' SKU-1 ',stockId:'S1',quantity:'2' },{ sku:'',stockId:'S2',quantity:1 }]),
+  [{ sku:'SKU-1',remoteProductId:'S1',quantity:2 }]);
+const allocationPool = createStockAllocationPool([{ sku:'SKU-1',remoteProductId:'S1',quantity:2 },{ sku:'SKU-1',remoteProductId:'S2',quantity:1 }]);
+assert.deepStrictEqual(takeStockAllocations(allocationPool,'sku-1',3),[
+  { remoteProductId:'S1',quantity:2 },{ remoteProductId:'S2',quantity:1 }
+]);
+const validAllocation = validateFulfillmentStockAllocations(
+  [{ items:[{ item:{ seller_custom_field:'SKU-1' },quantity:3 }] }],
+  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',quantity:2 }],
+  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',productName:'商品一',availableQuantity:2 }]
+);
+assert.strictEqual(validAllocation[0].productName,'商品一');
+assert.throws(() => validateFulfillmentStockAllocations(
+  [{ items:[{ item:{ seller_custom_field:'SKU-1' },quantity:3 }] }],
+  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',quantity:3 }],
+  [{ sku:'SKU-1',remoteProductId:'REMOTE-1',availableQuantity:2 }]
+),/仅剩 2 件可发/);
+assert.throws(() => validateFulfillmentStockAllocations(
+  [{ items:[{ item:{ seller_custom_field:'SKU-1' },quantity:1 }] }],
+  [{ sku:'SKU-2',remoteProductId:'REMOTE-2',quantity:1 }],
+  [{ sku:'SKU-2',remoteProductId:'REMOTE-2',availableQuantity:1 }]
+),/SKU SKU-1 尚未选择/);
+assert.throws(() => validateFulfillmentStockAllocations(
+  [{ items:[{ item:{ seller_custom_field:'SAME-SKU' },quantity:1 }] }],
+  [{ sku:'SAME-SKU',remoteProductId:'OTHER-USER-STOCK',quantity:1 }],
+  [{ sku:'SAME-SKU',remoteProductId:'CURRENT-USER-STOCK',availableQuantity:5 }]
+),/不属于当前用户/);
+
 const yeeke = buildYeekeInboundPayload({
   warehouseCode: 'th', localInboundNo: 'IN-SY12345-1', trackingNumber: 'YT100',
-  carrierCode: 'yt', transportType: 0, expectedDate: '2026-08-05', note: '整箱入库',
+  userIdentity: 'SY12345', carrierCode: 'yt', transportType: 0, expectedDate: '2026-08-05', note: '整箱入库',
   items: [{ sysCode: 'P100', sku: 'SKU-1', quantity: 3 }, { sku: 'SKU-2', quantity: 2 }]
 });
 assert.strictEqual(yeeke.storageType, '0');
 assert.strictEqual(yeeke.boxItems[0].goodsQuantity, 5);
 assert.strictEqual(yeeke.boxItems[0].skuQuantity, 2);
+assert.ok(yeeke.expressNote.includes('山月ERP SY12345'));
+assert.ok(yeeke.expressNote.includes('IN-SY12345-1'));
 assert.deepStrictEqual(yeeke.boxItems[0].productItems[0], { sysCode: 'P100', num: 3 });
 assert.deepStrictEqual(yeeke.boxItems[0].productItems[1], { variationSku: 'SKU-2', num: 2 });
 

@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const axios = require('axios');
+const { createStockAllocationPool,takeStockAllocations } = require('./warehouse-inventory');
 
 const YEEKE_API_PREFIX = '/agent-foreign/erp/api';
 const DEFAULT_YEEKE_BASE_URL = 'https://mi.yeeke.com';
@@ -263,7 +264,7 @@ async function replaceYeekeDomesticExpress(client, options = {}) {
   };
 }
 
-function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, shippingQuantity, shippingRemark, displayOrderId, providerOrderNumber, externalUserId, pdfString, serviceCodes }) {
+function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNumber, shippingQuantity, shippingRemark, displayOrderId, providerOrderNumber, externalUserId, pdfString, serviceCodes, fulfillmentMode = 'express', stockAllocations = [] }) {
   const sourceRows = (Array.isArray(rows) && rows.length ? rows : [row]).filter(Boolean);
   row = sourceRows[0] || {};
   const raw = row?.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
@@ -283,12 +284,16 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
   );
   const domesticTrackingNumber = String(trackingNumber || '').trim();
   const domesticRemark = String(shippingRemark || '').trim().slice(0, 500);
+  const stockMode = fulfillmentMode === 'stock';
+  const stockPool = createStockAllocationPool(stockAllocations);
   const orderItems = sourceItems.map((entry) => {
     const item = entry?.item && typeof entry.item === 'object' ? entry.item : entry;
     const quantity = Math.max(1, Math.floor(Number(entry?.quantity || item?.quantity || 1)));
     const sendQuantity = Math.min(quantity, remainingShippingQuantity);
     remainingShippingQuantity = Math.max(0, remainingShippingQuantity - sendQuantity);
     const sku = item?.seller_custom_field || item?.variation_sku || item?.seller_sku || item?.sku || '';
+    const itemStockAllocations = stockMode ? takeStockAllocations(stockPool,sku,quantity) : [];
+    if (stockMode && !itemStockAllocations.length) throw new Error(`Yeeke 库存发货未匹配到 SKU ${sku || '（空）'} 的可用库存`);
     const imageUrl = item?.secure_thumbnail || item?.thumbnail || item?.picture_url || item?.pictures?.[0]?.secure_url || item?.pictures?.[0]?.url || '';
     return {
       itemName: String(item?.title || item?.itemName || item?.name || 'Mercado Libre 商品').slice(0, 500),
@@ -297,13 +302,13 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
       variationSku: sku ? String(sku).slice(0, 200) : undefined,
       variationName: item?.variation_name ? String(item.variation_name).slice(0, 200) : undefined,
       productEnName: item?.title ? String(item.title).slice(0, 500) : undefined,
-      expressInfos: domesticTrackingNumber && sendQuantity > 0 ? [{
+      expressInfos: !stockMode && domesticTrackingNumber && sendQuantity > 0 ? [{
         trackingNo: domesticTrackingNumber,
         sendQuantity,
         expressCode: yeekeExpressCode(carrier),
         note: domesticRemark || undefined
       }] : [],
-      stockInfos: [],
+      stockInfos: itemStockAllocations.map(allocation => ({ sysCode:allocation.remoteProductId,num:allocation.quantity })),
       distributionProducts: []
     };
   });

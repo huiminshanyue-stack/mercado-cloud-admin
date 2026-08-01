@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const axios = require('axios');
+const { createStockAllocationPool,takeStockAllocations } = require('./warehouse-inventory');
 
 const DEFAULT_SHOPEEX_BASE_URL = 'https://openapi-v3.shopeex.cn';
 const SHOPEEX_MERCADO_PLATFORM_ID = 48;
@@ -117,7 +118,7 @@ function itemImage(item = {}) {
 
 function buildShopeexOrderPayload({ row, rows, displayOrderId, providerOrderNumber, externalUserId,
   airwayBillUrl, serviceCodes = [], storeAddressId, carrier, carrierCode, trackingNumber,
-  shippingQuantity, shippingRemark } = {}) {
+  shippingQuantity, shippingRemark, fulfillmentMode = 'express', stockAllocations = [] } = {}) {
   const sourceRows = (Array.isArray(rows) && rows.length ? rows : [row]).filter(Boolean);
   if (!sourceRows.length) throw new Error('Shopeex/KJX 推单缺少订单数据');
   const primary = sourceRows[0];
@@ -127,7 +128,9 @@ function buildShopeexOrderPayload({ row, rows, displayOrderId, providerOrderNumb
   const domesticTrackingNumber = String(trackingNumber || '').trim();
   const domesticCarrier = String(carrier || '').trim();
   const domesticCarrierCode = String(carrierCode || '').trim();
-  if (!domesticTrackingNumber || !domesticCarrier || !domesticCarrierCode) throw new Error('Shopeex/KJX 推单需要国内快递公司、快递代码和快递单号');
+  const stockMode = fulfillmentMode === 'stock';
+  if (!stockMode && (!domesticTrackingNumber || !domesticCarrier || !domesticCarrierCode)) throw new Error('Shopeex/KJX 推单需要国内快递公司、快递代码和快递单号');
+  const stockPool = createStockAllocationPool(stockAllocations);
 
   const officialTrackingNumber = String(sourceRows.map(sourceRow => {
     const raw = sourceRow.raw_data && typeof sourceRow.raw_data === 'object' ? sourceRow.raw_data : {};
@@ -152,13 +155,20 @@ function buildShopeexOrderPayload({ row, rows, displayOrderId, providerOrderNumb
       const orderedQuantity = Math.max(1, Math.floor(Number(entry?.quantity || item?.quantity || 1)));
       const quantity = Math.min(orderedQuantity, remainingQuantity);
       remainingQuantity -= quantity;
+      const sku = String(item?.seller_custom_field || item?.seller_sku || entry?.seller_sku || entry?.sku || '').slice(0,200);
+      const itemStockAllocations = stockMode ? takeStockAllocations(stockPool,sku,quantity) : [];
+      if (stockMode && !itemStockAllocations.length) throw new Error(`Shopeex/KJX 库存发货未匹配到 SKU ${sku || '（空）'} 的可用库存`);
       orderItems.push(compactObject({
         skuImages: itemImage(item),
         itemName: String(item?.title || entry?.title || 'Mercado Libre 商品').slice(0,500),
         variationQuantityPurchased: quantity,
-        variationSku: String(item?.seller_custom_field || item?.seller_sku || entry?.seller_sku || entry?.sku || '').slice(0,200),
+        variationSku: sku,
         variationName: String(entry?.variation_name || item?.variation_name || '').slice(0,500),
-        batchItemLogisticsDTOs: [{
+        batchItemLogisticsDTOs: stockMode ? itemStockAllocations.map(allocation => ({
+          logisticsNo: allocation.remoteProductId,
+          logisticsType: 3,
+          stockCount: allocation.quantity
+        })) : [{
           logisticsCorp: domesticCarrier,
           logisticsShortCorp: domesticCarrierCode,
           logisticsNo: domesticTrackingNumber,

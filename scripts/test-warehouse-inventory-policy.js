@@ -4,6 +4,7 @@ const path = require('path');
 
 const server = fs.readFileSync(path.join(__dirname,'..','server.js'),'utf8');
 const frontend = fs.readFileSync(path.join(__dirname,'..','..','frontend','src','components','WarehouseInventoryManagement.vue'),'utf8');
+const orderFrontend = fs.readFileSync(path.join(__dirname,'..','..','frontend','src','components','OrderManagement.vue'),'utf8');
 
 assert.ok(server.includes('CREATE TABLE IF NOT EXISTS warehouse_inbounds'), 'warehouse inbound ledger must exist');
 assert.ok(server.includes('CREATE TABLE IF NOT EXISTS warehouse_inbound_items'), 'warehouse inbound items must exist');
@@ -13,8 +14,21 @@ assert.ok(server.includes('w.owner_username=$1 AND w.id=$2'), 'inbound detail mu
 assert.ok(server.includes("['yeeke','shopeex']"), 'only supported official warehouse providers may be used');
 assert.ok(server.includes('client.createOrUpdateInbound(payload)'), 'Yeeke official inbound endpoint must be called');
 assert.ok(server.includes('client.addOrUpdateStock(payload)'), 'Shopeex official stock creation endpoint must be called');
+assert.ok(server.includes("fulfillment_mode VARCHAR(20) NOT NULL DEFAULT 'express'"), 'fulfillment mode must be persisted');
+assert.ok(server.includes("stock_allocations JSONB NOT NULL DEFAULT '[]'::jsonb"), 'stock allocations must be persisted');
+assert.ok(server.includes("w.owner_username=$1 AND w.warehouse_id=$2 AND w.status='received'"), 'only the current user successfully received inventory may be shipped');
+assert.ok(server.includes("pageNumber:1,pageSize:20,stockPlusDeliveryId"), 'Shopeex stock queries must respect the official maximum page size of 20');
+assert.ok(!server.includes('pageNumber:1,pageSize:100'), 'no Shopeex stock query may exceed 20 records per page');
+assert.ok(server.includes("app.get('/api/admin/warehouse-inventory/fulfillable', requireOrderAccess"), 'fulfillable stock endpoint must require order access');
+assert.ok(server.includes('validateFulfillmentStockAllocations(orderResult.rows,stockByOrder[displayOrderId],fulfillableStockRows)'), 'stock fulfillment must validate allocations server-side');
+assert.ok(server.includes("fulfillmentMode === 'stock' ? ''"), 'stock fulfillment must not require a fake domestic tracking number');
 assert.ok(frontend.includes('山月入库批次'), 'frontend must display the local inbound number');
 assert.ok(frontend.includes('仓库入库/库存编号'), 'frontend must display remote inbound or stock number');
 assert.ok(frontend.includes('申报 {{ s.row.requestedQuantity }} / 实收 {{ s.row.receivedQuantity }}'), 'frontend must display requested and received quantities');
+assert.ok(!frontend.includes('Yeeke 使用正式入库单'), 'inventory users must not see warehouse interface implementation details');
+assert.ok(!frontend.includes('providerLabel'), 'warehouse selectors must only display the configured warehouse name');
+assert.ok(orderFrontend.includes('仓库库存发货'), 'fulfillment dialog must offer warehouse stock fulfillment');
+assert.ok(orderFrontend.includes('/api/admin/warehouse-inventory/fulfillable'), 'fulfillment dialog must load user-owned fulfillable stock');
+assert.ok(orderFrontend.includes('stockByOrder'), 'selected stock allocations must be submitted to the server');
 
 console.log('Warehouse inventory policy tests passed');
