@@ -3268,6 +3268,7 @@ function extractReputationInfo(rawData) {
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
     version: '2026-08-02.04',
+    deployedCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || '',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
     orderLabelOwnershipVerification: 'official-shipment-sender-api',
