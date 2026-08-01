@@ -26,6 +26,11 @@ assert.ok(serverSource.includes("app.get('/api/admin/orders/:orderId/label', req
 assert.ok(serverSource.includes('batchLabelPrint: true'), 'health metadata must expose batch label printing');
 assert.ok(serverSource.includes("batchLabelPrintScope: 'current-user-ready-to-ship-orders'"), 'health metadata must describe batch scope');
 assert.ok(serverSource.includes("batchLabelPrintOutput: 'single-merged-pdf'"), 'health metadata must describe the merged PDF output');
+assert.ok(serverSource.includes("orderLabelAuthorizationScope: 'per-order-store'") && serverSource.includes('orderLabelCrossStorePrintAttempts: false'), 'multi-store label printing must isolate authorization per order');
+assert.ok((serverSource.match(/resolveOfficialLabelStoreContext\(/g) || []).length >= 3, 'label download and warehouse push must share the order-scoped authorization resolver');
+assert.ok(serverSource.includes('verifiedOrderOwnership') && serverSource.includes('https://api.mercadolibre.com/orders/'), 'store ownership must be verified through the official order API');
+assert.ok(serverSource.includes('audit.attemptedStoreUserIds = [context.sellerId]'), 'only the resolved order store may attempt official label printing');
+assert.ok(!serverSource.includes('labelAttemptCount'), 'the legacy all-store print loop must be removed');
 
 const currentBuiltSource = builtSources.find((source) => source.includes('批量打印面单')) || '';
 assert.ok(currentBuiltSource, 'deployed order bundle must contain batch label printing');

@@ -17,6 +17,11 @@ const { isFulfillmentFinished, shouldCreateNewOrderAlert, shouldCreateCancellati
   shouldCreateShippedAlert } = require('./order-alert-policy');
 const { orderSyncPageDecision,resolveRequestedOrderScope } = require('./order-sync-policy');
 const { resolveOfficialHandlingDeadline } = require('./order-deadline-policy');
+const {
+  orderLabelExpectedStoreIds,
+  orderLabelOrderIds,
+  orderLabelAuthorizationCandidates
+} = require('./order-label-policy');
 const { normalizeOrderItems } = require('./order-items');
 const { normalizeSummaryPeriod,buildOrderWorkbenchSummary } = require('./order-workbench-summary');
 const {
@@ -3187,7 +3192,11 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-01.05',
+    version: '2026-08-01.06',
+    multiStoreLabelOperations: true,
+    orderLabelAuthorizationScope: 'per-order-store',
+    orderLabelOwnershipVerification: 'official-order-api',
+    orderLabelCrossStorePrintAttempts: false,
     shopeexKjxCourierCatalogSize: SHOPEEX_LOGISTICS_CATALOG_SIZE,
     shopeexKjxCourierCodeScope: 'shopeex-only',
     yeekeCourierCodeRequired: false,
@@ -6369,7 +6378,7 @@ async function saveOfficialShippingLabel(ownerUsername,shipmentId,orderId,storeU
 }
 
 async function fetchOfficialLabelPdf(accessToken,shipmentId) {
-  let lastError;
+  const errors = [];
   for (const request of officialLabelRequests(shipmentId)) {
     try {
       const response = await axios.get(request.url, {
@@ -6379,10 +6388,63 @@ async function fetchOfficialLabelPdf(accessToken,shipmentId) {
       });
       const pdf = Buffer.from(response.data || []);
       if (pdf.subarray(0,5).toString('ascii') === '%PDF-') return { pdf, response };
-      lastError = Object.assign(new Error('美客多未返回有效的 PDF 面单'), { response: { status: 502, data: pdf } });
-    } catch (error) { lastError = error; }
+      errors.push(Object.assign(new Error('美客多未返回有效的 PDF 面单'), { response: { status: 502, data: pdf } }));
+    } catch (error) { errors.push(error); }
   }
-  throw lastError || new Error('美客多暂未生成该订单面单');
+  throw errors.find(error => decodeOfficialLabelError(error).message.includes('当前不允许授权店铺'))
+    || errors[errors.length-1]
+    || new Error('美客多暂未生成该订单面单');
+}
+
+async function resolveOfficialLabelStoreContext(authUser,orderRows,shipmentId) {
+  const authorizations = await listOrderStoreAuthorizations(authUser);
+  const candidates = orderLabelAuthorizationCandidates(orderRows,authorizations,shipmentId);
+  const orderIds = orderLabelOrderIds(orderRows,shipmentId);
+  const expectedStoreIds = orderLabelExpectedStoreIds(orderRows,shipmentId);
+  const available = [];
+  const probeErrors = [];
+  for (const authorization of candidates) {
+    let token;
+    try { token = await getStoreAuthorizationToken(authorization); }
+    catch (error) {
+      probeErrors.push({ storeUserId:String(authorization.ml_user_id || ''),status:error.response?.status || 0 });
+      continue;
+    }
+    if (!token) continue;
+    const context = {
+      authorization,
+      token,
+      sellerId:String(authorization.ml_user_id || ''),
+      verifiedOrderOwnership:false,
+      expectedStoreIds,
+      probedStoreUserIds:[]
+    };
+    available.push(context);
+    for (const orderId of orderIds) {
+      try {
+        const response = await axios.get(`https://api.mercadolibre.com/orders/${encodeURIComponent(orderId)}`, {
+          headers:{ Authorization:`Bearer ${token}` },timeout:15000
+        });
+        if (String(response.data?.id || '') === String(orderId)) {
+          context.verifiedOrderOwnership = true;
+          context.officialSellerId = String(response.data?.seller?.id || '');
+          context.verifiedOrderId = String(orderId);
+          context.probedStoreUserIds = available.map(item => item.sellerId);
+          return context;
+        }
+      } catch (error) {
+        probeErrors.push({ storeUserId:context.sellerId,orderId:String(orderId),status:error.response?.status || 0 });
+      }
+    }
+  }
+  const exactContext = available.find(context => expectedStoreIds.includes(context.sellerId));
+  if (exactContext) {
+    exactContext.probedStoreUserIds = available.map(item => item.sellerId);
+    return exactContext;
+  }
+  const error = new Error('无法确认该订单所属店铺的有效授权，请重新同步该订单所属店铺后再申请面单');
+  error.response = { status:403,data:{ message:error.message,expectedStoreIds,probeErrors } };
+  throw error;
 }
 
 function queueReadyToShipLabelCapture(authUser,storeUserId,accessToken,orders) {
@@ -6696,7 +6758,7 @@ app.get('/api/admin/orders/:orderId/logistics', requireOrderAccess, async (req, 
 app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res) => {
   let audit = { storeUserId: '', shipmentIds: [] };
   try {
-    const { rows } = await pool.query('SELECT shipping_id,store_user_id FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [req.params.orderId,req.authUser.username]);
+    const { rows } = await pool.query('SELECT ml_order_id,shipping_id,store_user_id,raw_data FROM ml_orders WHERE owner_username=$2 AND (ml_order_id=$1 OR pack_id=$1) ORDER BY date_created', [req.params.orderId,req.authUser.username]);
     if (!rows.length) return res.status(404).json({ code: 404, message: '订单不存在或不属于当前账号' });
     const shipmentIds = [...new Set(rows.map(row => row.shipping_id).filter(Boolean))];
     if (!shipmentIds.length) return res.status(404).json({ code: 404, message: '该订单暂无国际运单，无法下载面单' });
@@ -6717,59 +6779,35 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
       res.setHeader('X-Content-Type-Options', 'nosniff');
       return res.send(pdf);
     }
-    const authorizations = await listOrderStoreAuthorizations(req.authUser);
-    const orderedAuthorizations = [...authorizations].sort((left,right) => {
-      const expected = String(targetRow.store_user_id || '');
-      return Number(String(right.ml_user_id) === expected) - Number(String(left.ml_user_id) === expected);
-    });
-    const contexts = [];
-    for (const authorization of orderedAuthorizations) {
-      let token;
-      try { token = await getStoreAuthorizationToken(authorization); }
-      catch (error) {
-        console.warn('[Orders] 面单店铺授权刷新失败:', authorization.ml_user_id, error.response?.status || error.message);
-        continue;
-      }
-      if (!token) continue;
-      let callerId = String(authorization.ml_user_id || '');
-      try {
-        const account = await axios.get('https://api.mercadolibre.com/users/me', {
-          headers: { Authorization: `Bearer ${token}` }, timeout: 15000
-        });
-        callerId = String(account.data?.id || callerId);
-      } catch (_) { /* 面单接口会继续校验该 token，身份检查失败不提前终止 */ }
-      contexts.push({ authorization, token, sellerId: String(authorization.ml_user_id), callerId });
+    const context = await resolveOfficialLabelStoreContext(req.authUser,rows,targetShipmentId);
+    audit.resolvedStoreUserId = context.sellerId;
+    audit.probedStoreUserIds = context.probedStoreUserIds;
+    audit.verifiedOrderOwnership = context.verifiedOrderOwnership;
+    if (context.verifiedOrderOwnership && String(targetRow.store_user_id || '') !== context.sellerId) {
+      await pool.query('UPDATE ml_orders SET store_user_id=$1,updated_at=NOW() WHERE owner_username=$2 AND shipping_id=$3',
+        [context.sellerId,req.authUser.username,targetShipmentId]);
+      targetRow.store_user_id = context.sellerId;
     }
-    if (!contexts.length) return res.status(403).json({ code: 403, message: '当前账号的店铺授权均已失效，请重新授权后下载' });
     let pdfResponse;
-    let successfulContext;
     const officialErrors = [];
     const labelRequests = officialLabelRequests(targetShipmentId);
-    for (const context of contexts) {
-      for (const request of labelRequests) {
-        try {
-          pdfResponse = await axios.get(request.url, {
-            params: request.params,
-            headers: { Authorization: `Bearer ${context.token}`, Accept: 'application/pdf' },
-            responseType: 'arraybuffer', timeout: 30000
-          });
-          if (pdfResponse?.data) {
-            successfulContext = context;
-            break;
-          }
-        } catch (error) {
-          officialErrors.push({ error, sellerId: context.sellerId, callerId: context.callerId, url: request.url });
-          console.warn('[Orders] 面单授权/兼容路径失败:', context.sellerId, request.url, error.response?.status || error.message);
-        }
+    for (const request of labelRequests) {
+      try {
+        pdfResponse = await axios.get(request.url, {
+          params: request.params,
+          headers: { Authorization: `Bearer ${context.token}`, Accept: 'application/pdf' },
+          responseType: 'arraybuffer', timeout: 30000
+        });
+        if (pdfResponse?.data) break;
+      } catch (error) {
+        officialErrors.push({ error, sellerId: context.sellerId, url: request.url });
+        console.warn('[Orders] 订单所属店铺面单兼容路径失败:', context.sellerId, request.url, error.response?.status || error.message);
       }
-      if (pdfResponse?.data) break;
     }
     if (!pdfResponse?.data) {
       const preferredError = officialErrors.find(item => decodeOfficialLabelError(item.error).message.includes('当前不允许授权店铺')) || officialErrors[0];
       if (preferredError) {
-        audit.attemptedStoreUserIds = contexts.map(item => item.sellerId);
-        audit.attemptedCallerIds = contexts.map(item => item.callerId);
-        preferredError.error.labelAttemptCount = contexts.length;
+        audit.attemptedStoreUserIds = [context.sellerId];
         throw preferredError.error;
       }
       return res.status(404).json({ code: 404, message: '美客多暂未生成该订单面单' });
@@ -6780,16 +6818,13 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
       invalidPdfError.response = { status: 502, data: pdf };
       throw invalidPdfError;
     }
-    audit.storeUserId = successfulContext.sellerId;
-    audit.successfulCallerId = successfulContext.callerId;
-    audit.attemptedStoreUserIds = contexts.map(item => item.sellerId);
-    if (String(targetRow.store_user_id || '') !== successfulContext.sellerId) {
-      await pool.query('UPDATE ml_orders SET store_user_id=$1,updated_at=NOW() WHERE owner_username=$2 AND shipping_id=$3',
-        [successfulContext.sellerId,req.authUser.username,targetShipmentId]);
-    }
-    await saveOfficialShippingLabel(req.authUser.username,targetShipmentId,req.params.orderId,successfulContext.sellerId,pdf);
+    audit.storeUserId = context.sellerId;
+    audit.successfulCallerId = context.sellerId;
+    audit.attemptedStoreUserIds = [context.sellerId];
+    await saveOfficialShippingLabel(req.authUser.username,targetShipmentId,req.params.orderId,context.sellerId,pdf);
     await saveOrderApiAudit(req.authUser.username,audit.storeUserId,req.params.orderId,'shipment_label',req.params.orderId,
-      { success: true, shipmentIds, targetShipmentId, callerId: successfulContext.callerId, attemptedStoreUserIds: audit.attemptedStoreUserIds, contentType: pdfResponse.headers?.['content-type'] || 'application/pdf', size: pdf.length });
+      { success: true, shipmentIds, targetShipmentId, callerId: context.sellerId, verifiedOrderOwnership:context.verifiedOrderOwnership,
+        attemptedStoreUserIds: audit.attemptedStoreUserIds, contentType: pdfResponse.headers?.['content-type'] || 'application/pdf', size: pdf.length });
     res.setHeader('Content-Type', 'application/pdf');
     const safeOrderId = String(req.params.orderId).replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,80) || 'order';
     res.setHeader('Content-Disposition', `attachment; filename="mercado-label-${safeOrderId}.pdf"`);
@@ -6806,8 +6841,8 @@ app.get('/api/admin/orders/:orderId/label', requireOrderAccess, async (req, res)
     const official = decodeOfficialLabelError(error);
     await saveOrderApiAudit(req.authUser.username,audit.storeUserId,req.params.orderId,'shipment_label',req.params.orderId,
       { success: false, shipmentIds: audit.shipmentIds, targetShipmentId: audit.targetShipmentId, attemptedStoreUserIds: audit.attemptedStoreUserIds || [], attemptedCallerIds: audit.attemptedCallerIds || [], status: official.status, officialError: official.auditData }).catch(() => {});
-    const attemptedText = Number(error.labelAttemptCount || 0) > 1 ? `系统已使用当前账号的 ${error.labelAttemptCount} 个有效店铺授权逐一尝试。` : '';
-    res.status(official.status).json({ code: official.status, message: `${attemptedText}美客多官方返回：${official.message}` });
+    const scopedText = audit.resolvedStoreUserId ? `系统已按订单所属店铺 ${audit.resolvedStoreUserId} 使用对应授权。` : '';
+    res.status(official.status).json({ code: official.status, message: `${scopedText}美客多官方返回：${official.message}` });
   }
 });
 
@@ -7238,23 +7273,20 @@ async function resolveOfficialLabelPdfForPush(authUser, orderRows) {
   [authUser.username,shipmentIds]);
   if (cached.rows[0]?.pdf_data) return Buffer.from(cached.rows[0].pdf_data);
 
-  const authorizations = await listOrderStoreAuthorizations(authUser);
   let lastError = null;
   for (const shipmentId of shipmentIds) {
     const order = rows.find(row => String(row.shipping_id || '') === shipmentId) || rows[0];
-    const orderedAuthorizations = [...authorizations].sort((left,right) => {
-      const expected = String(order.store_user_id || '');
-      return Number(String(right.ml_user_id) === expected) - Number(String(left.ml_user_id) === expected);
-    });
-    for (const authorization of orderedAuthorizations) {
-      try {
-        const token = await getStoreAuthorizationToken(authorization);
-        if (!token) continue;
-        const { pdf } = await fetchOfficialLabelPdf(token,shipmentId);
-        await saveOfficialShippingLabel(authUser.username,shipmentId,String(order.ml_order_id || ''),String(authorization.ml_user_id || ''),pdf);
-        return pdf;
-      } catch (error) { lastError = error; }
-    }
+    try {
+      const context = await resolveOfficialLabelStoreContext(authUser,rows,shipmentId);
+      if (context.verifiedOrderOwnership && String(order.store_user_id || '') !== context.sellerId) {
+        await pool.query('UPDATE ml_orders SET store_user_id=$1,updated_at=NOW() WHERE owner_username=$2 AND shipping_id=$3',
+          [context.sellerId,authUser.username,shipmentId]);
+        order.store_user_id = context.sellerId;
+      }
+      const { pdf } = await fetchOfficialLabelPdf(context.token,shipmentId);
+      await saveOfficialShippingLabel(authUser.username,shipmentId,String(order.ml_order_id || ''),context.sellerId,pdf);
+      return pdf;
+    } catch (error) { lastError = error; }
   }
   if (lastError) throw new Error(`官方面单未申请成功，请先点击订单上的“申请面单”查看原因，面单成功后重新推送。美客多返回：${decodeOfficialLabelError(lastError).message}`);
   throw new Error('当前用户没有可用的店铺授权，无法申请官方面单；请先完成订单所属店铺授权，再点击“申请面单”并重新推送');
