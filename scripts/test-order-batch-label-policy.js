@@ -32,6 +32,7 @@ assert.ok(serverSource.includes('verifiedShipmentAccess') && serverSource.includ
 assert.ok(serverSource.includes('audit.attemptedStoreUserIds = [resolvedCallerId]'), 'only the resolved shipment caller may attempt official label printing');
 assert.ok(serverSource.includes("marketplace/orders/${encodeURIComponent(orderId)}"), 'CBT order ownership must use the marketplace order API');
 assert.ok(!serverSource.includes("marketplace/shipment_labels'"), 'CBT labels must not fall back to an unrelated compatibility endpoint');
+assert.ok(serverSource.includes('validating_receiver_documentation') && serverSource.includes('这不是店铺授权错误'), 'receiver documentation validation must be reported as the actual official label blocker');
 assert.ok(!serverSource.includes('labelAttemptCount'), 'the legacy all-store print loop must be removed');
 
 const currentBuiltSource = builtSources.find((source) => source.includes('批量打印面单')) || '';

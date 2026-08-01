@@ -3194,7 +3194,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-01.06',
+    version: '2026-08-01.07',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
     orderLabelOwnershipVerification: 'official-shipment-sender-api',
@@ -6336,13 +6336,16 @@ function decodeOfficialLabelError(error) {
   let message = reason
     ? `${officialCode ? `${officialCode}：` : ''}${reason}`
     : `美客多面单接口返回 HTTP ${status}`;
+  const receiverDocumentationPending = /cannot\s+print\s+label[\s\S]*receiver\s+documentation\s+is\s+pending\s+validation/i.test(String(reason));
   const notPrintable = String(reason).match(/Shipment\s+(\d+)\s+is not printable by Caller\s+(\d+)/i);
-  if (notPrintable) {
+  if (receiverDocumentationPending) {
+    message = '美客多正在审核收件人/买家的证件资料（validating_receiver_documentation），审核完成前官方不会生成面单。请稍后同步订单状态并重新申请面单；这不是店铺授权错误。';
+  } else if (notPrintable) {
     message = `运单 ${notPrintable[1]} 当前不允许授权店铺 ${notPrintable[2]} 通过官方接口打印。可能是运单所属店铺身份不一致，或当前运单状态/跨境权限不支持 API 打印；请重新同步该订单并确认所属店铺授权。`;
   }
   const labelContext = error?.labelContext || {};
   const shipment = labelContext.officialShipment || {};
-  if (notPrintable && Object.keys(shipment).length) {
+  if (!receiverDocumentationPending && notPrintable && Object.keys(shipment).length) {
     const shipmentStatus = String(shipment.status || 'unknown');
     const shipmentSubstatus = String(shipment.substatus || '');
     const logisticType = String(shipment.logistic?.type || shipment.logistic_type || '');
