@@ -17,6 +17,9 @@
 .picker-value,.form-input { height:78rpx; padding:0 22rpx; line-height:78rpx; }
 .form-textarea { min-height:150rpx; padding:20rpx 22rpx; line-height:1.6; }
 .form-hint { margin-top:8rpx; color:#8d99a7; font-size:21rpx; }
+.stock-mode-hint { margin-top:22rpx; padding:18rpx; color:#526170; background:#f1f7ff; border-radius:10rpx; font-size:23rpx; line-height:1.65; }
+.stock-loading,.stock-empty { margin-top:22rpx; padding:26rpx 18rpx; color:#8d99a7; background:#f7f9fb; border-radius:10rpx; font-size:23rpx; line-height:1.6; text-align:center; }
+.stock-line { margin-top:22rpx; padding:22rpx; background:#f7f9fb; border:1rpx solid #e1e7ed; border-radius:12rpx; }.stock-line-title { color:#263442; font-size:25rpx; font-weight:650; line-height:1.5; }.stock-line-meta { margin-top:8rpx; color:#7f8b97; font-size:21rpx; }.stock-picker-value { height:auto; min-height:78rpx; line-height:1.5; padding-top:18rpx; padding-bottom:18rpx; white-space:normal; }
 .fulfillment-submit { margin-top:30rpx; background:#1677ff; font-size:27rpx; }
 .fulfillment-resubmit-button { margin-top:24rpx; color:#1677ff; background:#edf5ff; font-size:25rpx; }
 .fulfillment-form-actions { display:flex; gap:18rpx; margin-top:30rpx; }.fulfillment-form-actions button { flex:1; margin:0; }.fulfillment-form-actions .fulfillment-submit { margin:0; }.fulfillment-cancel { color:#5e6c79; background:#f1f3f6; }

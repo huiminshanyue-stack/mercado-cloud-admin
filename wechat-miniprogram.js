@@ -27,6 +27,30 @@ function canTestOrders(user) {
   return user?.role === 'admin' || ORDER_TEST_USERNAMES.has(String(user?.username || '').toUpperCase());
 }
 
+function sanitizeMiniProgramProviderMessage(message) {
+  return String(message || '')
+    .replace(/Shopeex\s*\/\s*KJX|Shopeex|KJX|Yeeke|易可/gi,'仓库系统');
+}
+
+function sanitizeMiniProgramProviderPayload(value,key = '') {
+  if (Array.isArray(value)) return value.map(item => sanitizeMiniProgramProviderPayload(item,key));
+  if (!value || typeof value !== 'object') {
+    return typeof value === 'string' && ['message','failureReason','error'].includes(key)
+      ? sanitizeMiniProgramProviderMessage(value)
+      : value;
+  }
+  return Object.fromEntries(Object.entries(value).map(([childKey,childValue]) =>
+    [childKey,sanitizeMiniProgramProviderPayload(childValue,childKey)]));
+}
+
+function miniProgramSafeResponse(res) {
+  return {
+    get headersSent() { return res.headersSent; },
+    status(code) { res.status(code);return this; },
+    json(payload) { return res.json(sanitizeMiniProgramProviderPayload(payload)); }
+  };
+}
+
 async function initMiniProgramTables(pool) {
   await pool.query(`CREATE TABLE IF NOT EXISTS wechat_miniprogram_identities (
     id BIGSERIAL PRIMARY KEY,
@@ -60,6 +84,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     getMiniOrderWorkbenchSummaryData,
     getOrderStoresData,
     getFulfillmentOptionsData,
+    getFulfillableWarehouseStockData,
     submitFulfillmentRequest,
     updateFulfillmentExpressRequest,
     refreshOrderDimensionsData,
@@ -331,7 +356,7 @@ function registerMiniProgramRoutes(app, dependencies) {
   });
 
   app.get('/api/miniprogram/v1/orders',requireBoundOrderUser,async (req,res) => {
-    try { res.json({ code: 0, data: await getOrderListData(req.authUser,req.query || {}) }); }
+    try { res.json({ code: 0, data: sanitizeMiniProgramProviderPayload(await getOrderListData(req.authUser,req.query || {})) }); }
     catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单失败' }); }
   });
 
@@ -349,7 +374,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     try {
       const data = await getOrderListData(req.authUser,{ orderId: String(req.params.orderId),page:1,size:1 });
       if (!data.items.length) return res.status(404).json({ code: 404, message: '订单不存在或无权查看' });
-      res.json({ code: 0, data: data.items[0] });
+      res.json({ code: 0, data: sanitizeMiniProgramProviderPayload(data.items[0]) });
     } catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单详情失败' }); }
   });
 
@@ -374,19 +399,28 @@ function registerMiniProgramRoutes(app, dependencies) {
     }
   });
 
+  app.get('/api/miniprogram/v1/warehouse-inventory/fulfillable',requireBoundOrderUser,async (req,res) => {
+    try { res.json({ code:0,data:await getFulfillableWarehouseStockData(req.authUser,req.query || {}) }); }
+    catch (error) {
+      console.error('[MiniProgram] fulfillment stock failed:',error.response?.data || error.message);
+      const status=Number(error.status) || 502;
+      res.status(status).json({ code:status,message:status === 404 ? '当前仓库暂不支持库存发货' : '仓库库存读取失败，请稍后重试或联系管理员' });
+    }
+  });
+
   app.post('/api/miniprogram/v1/fulfillment/submit',requireBoundOrderUser,async (req,res) => {
-    try { await submitFulfillmentRequest(req,res); }
+    try { await submitFulfillmentRequest(req,miniProgramSafeResponse(res)); }
     catch (error) {
       console.error('[MiniProgram] fulfillment submission failed:',error.message);
-      if (!res.headersSent) res.status(500).json({ code:500,message:error.message || '代贴单提交失败' });
+      if (!res.headersSent) res.status(500).json({ code:500,message:sanitizeMiniProgramProviderMessage(error.message || '代贴单提交失败') });
     }
   });
 
   app.post('/api/miniprogram/v1/fulfillment/update-express',requireBoundOrderUser,async (req,res) => {
-    try { await updateFulfillmentExpressRequest(req,res); }
+    try { await updateFulfillmentExpressRequest(req,miniProgramSafeResponse(res)); }
     catch (error) {
       console.error('[MiniProgram] fulfillment express update failed:',error.message);
-      if (!res.headersSent) res.status(500).json({ code:500,message:error.message || '国内快递号修改失败' });
+      if (!res.headersSent) res.status(500).json({ code:500,message:sanitizeMiniProgramProviderMessage(error.message || '国内快递号修改失败') });
     }
   });
 
@@ -490,6 +524,7 @@ module.exports = {
   tokenHash,
   describeWechatLoginError,
   canTestOrders,
+  sanitizeMiniProgramProviderMessage,
   initMiniProgramTables,
   registerMiniProgramRoutes
 };

@@ -4,9 +4,10 @@ import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWei
 Page({
   data:{
     loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false,orderSyncing:false,
-    fulfillmentOptionsLoading:false,fulfillmentSubmitting:false,fulfillmentResubmit:false,fulfillmentExpressEditing:false,fulfillmentExpressUpdating:false,
+    fulfillmentOptionsLoading:false,fulfillmentStockLoading:false,fulfillmentSubmitting:false,fulfillmentResubmit:false,fulfillmentExpressEditing:false,fulfillmentExpressUpdating:false,
     warehouses:[] as any[],carriers:[] as any[],allCarriers:[] as any[],shopeexCarriers:[] as any[],warehouseNames:[] as string[],carrierNames:[] as string[],
-    warehouseIndex:0,carrierIndex:0,
+    warehouseIndex:0,carrierIndex:0,fulfillmentMode:'express',fulfillmentModeIndex:0,
+    fulfillmentModeNames:['国内快递发仓','仓库库存发货'],fulfillmentStockRecords:[] as any[],stockLines:[] as any[],
     fulfillmentForm:{ trackingNumber:'',quantity:'1',remark:'' }
   },
   async onLoad(options:Record<string,string>) {
@@ -62,6 +63,9 @@ Page({
         canResubmitFulfillment:raw.status !== 'cancelled'
           && Number(raw.refundAmount || 0) <= 0
           && ['success','failed'].includes(String(raw.fulfillmentSubmission?.status || '')),
+        canUpdateFulfillmentExpress:raw.fulfillmentSubmission?.fulfillmentMode !== 'stock'
+          && raw.fulfillmentSubmission?.status === 'success'
+          && raw.fulfillmentSubmission?.provider === 'yeeke',
         totalQuantity:products.reduce((total:number,item:any)=>total + Math.max(1,Number(item.quantity || 1)),0) || 1
       } });
       if (!raw.fulfillmentSubmission) {
@@ -90,7 +94,10 @@ Page({
   },
   onWarehouseChange(event:WechatMiniprogram.PickerChange) {
     const warehouseIndex=Number(event.detail.value || 0);
-    this.setData({ warehouseIndex },()=>this.refreshCarrierChoices(warehouseIndex));
+    this.setData({ warehouseIndex },()=>{
+      this.refreshCarrierChoices(warehouseIndex);
+      if (this.data.fulfillmentMode === 'stock') void this.loadFulfillmentStock();
+    });
   },
   refreshCarrierChoices(warehouseIndex:number,preferredCarrier='') {
     const warehouse=this.data.warehouses[warehouseIndex];
@@ -103,6 +110,87 @@ Page({
   },
   onCarrierChange(event:WechatMiniprogram.PickerChange) {
     this.setData({ carrierIndex:Number(event.detail.value || 0) });
+  },
+  onFulfillmentModeChange(event:WechatMiniprogram.PickerChange) {
+    const fulfillmentModeIndex=Number(event.detail.value || 0);
+    const fulfillmentMode=fulfillmentModeIndex === 1 ? 'stock' : 'express';
+    const warehouse=this.data.warehouses[this.data.warehouseIndex];
+    if (fulfillmentMode === 'stock' && !['yeeke','shopeex'].includes(String(warehouse?.provider || ''))) {
+      this.setData({ fulfillmentMode:'express',fulfillmentModeIndex:0,fulfillmentStockRecords:[],stockLines:[] });
+      wx.showToast({ title:'当前仓库暂不支持库存发货',icon:'none' });
+      return;
+    }
+    this.setData({ fulfillmentMode,fulfillmentModeIndex,fulfillmentStockRecords:[],stockLines:[] },()=>{
+      if (fulfillmentMode === 'stock') void this.loadFulfillmentStock();
+    });
+  },
+  async loadFulfillmentStock() {
+    const warehouse=this.data.warehouses[this.data.warehouseIndex];
+    if (!warehouse || this.data.fulfillmentMode !== 'stock' || this.data.fulfillmentStockLoading) return;
+    this.setData({ fulfillmentStockLoading:true,fulfillmentStockRecords:[],stockLines:[] });
+    try {
+      const data=await request<any>({
+        path:`/api/miniprogram/v1/warehouse-inventory/fulfillable?warehouseId=${encodeURIComponent(String(warehouse.id))}`,
+        timeout:60000
+      });
+      const records=(data.records || []).filter((item:any)=>Number(item.availableQuantity || 0) > 0);
+      const stockLines=records.length ? (this.data.order?.products || []).map((product:any,index:number) => {
+        const sku=String(product.sku === '-' ? '' : product.sku || '').trim();
+        const stockOptions=[...records].sort((left:any,right:any) => {
+          const leftExact=sku && String(left.sku || '').toUpperCase() === sku.toUpperCase() ? 1 : 0;
+          const rightExact=sku && String(right.sku || '').toUpperCase() === sku.toUpperCase() ? 1 : 0;
+          return rightExact-leftExact;
+        });
+        const exactIndex=stockOptions.findIndex((item:any)=>sku && String(item.sku || '').toUpperCase() === sku.toUpperCase());
+        return {
+          key:product.productKey || `${sku || 'line'}:${index}`,title:product.title,sku,
+          orderedQuantity:Math.max(1,Number(product.quantity || 1)),stockOptions,
+          stockNames:stockOptions.map((item:any)=>{
+            const exact=sku && String(item.sku || '').toUpperCase() === sku.toUpperCase();
+            return `${exact ? '同SKU' : '需确认'} · ${item.productName || item.sku || '库存商品'} · SKU ${item.sku || '-'} · 可发 ${item.availableQuantity}${item.warehouseLocation ? ` · 库位 ${item.warehouseLocation}` : ''}`;
+          }),
+          stockIndex:Math.max(0,exactIndex),quantity:String(Math.max(1,Number(product.quantity || 1)))
+        };
+      }) : [];
+      this.setData({ fulfillmentStockRecords:records,stockLines });
+    } catch (error) { showError(error); }
+    finally { this.setData({ fulfillmentStockLoading:false }); }
+  },
+  onStockSelectionChange(event:WechatMiniprogram.PickerChange) {
+    const lineIndex=Number(event.currentTarget.dataset.lineIndex || 0);
+    this.setData({ [`stockLines[${lineIndex}].stockIndex`]:Number(event.detail.value || 0) });
+  },
+  onStockQuantityInput(event:WechatMiniprogram.Input) {
+    const lineIndex=Number(event.currentTarget.dataset.lineIndex || 0);
+    this.setData({ [`stockLines[${lineIndex}].quantity`]:event.detail.value });
+  },
+  buildStockByOrder(orderId:string) {
+    const allocations:any[]=[];
+    const mismatches:string[]=[];
+    const used=new Map<string,number>();
+    for (const line of this.data.stockLines || []) {
+      const sku=String(line.sku || '').trim();
+      if (!sku) throw new Error('订单商品缺少 SKU，不能使用库存发货');
+      const stock=line.stockOptions?.[Number(line.stockIndex || 0)];
+      if (!stock) throw new Error(`SKU ${sku} 尚未选择可发库存`);
+      const quantity=Number(line.quantity);
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > Number(line.orderedQuantity || 1)) {
+        throw new Error(`SKU ${sku} 发货数量必须是 1 至 ${line.orderedQuantity}`);
+      }
+      const stockId=String(stock.remoteProductId || '');
+      const alreadyUsed=used.get(stockId) || 0;
+      if (!stockId || alreadyUsed+quantity > Number(stock.availableQuantity || 0)) {
+        throw new Error(`SKU ${sku} 所选库存不足`);
+      }
+      used.set(stockId,alreadyUsed+quantity);
+      const stockSku=String(stock.sku || '');
+      const skuMismatch=stockSku.toUpperCase() !== sku.toUpperCase();
+      if (skuMismatch) mismatches.push(`${sku} → ${stockSku || '未设置'}`);
+      allocations.push({ sku,stockSku,skuMismatchConfirmed:skuMismatch,remoteProductId:stockId,quantity });
+    }
+    if (!allocations.length) throw new Error('当前订单尚未选择可发库存');
+    return { stockByOrder:{ [orderId]:allocations },mismatches,
+      summary:allocations.map(item=>`${item.stockSku || item.sku} ×${item.quantity}`).join('；') };
   },
   onFulfillmentInput(event:WechatMiniprogram.Input) {
     const field=String(event.currentTarget.dataset.field || '');
@@ -118,33 +206,55 @@ Page({
     if (!canSubmit && !canResubmit) return;
     const warehouse=this.data.warehouses[this.data.warehouseIndex];
     const carrier=this.data.carriers[this.data.carrierIndex];
+    const stockMode=this.data.fulfillmentMode === 'stock';
     const trackingNumber=String(this.data.fulfillmentForm.trackingNumber || '').trim();
     const quantity=Number(this.data.fulfillmentForm.quantity);
     const remark=String(this.data.fulfillmentForm.remark || '').trim();
     if (!warehouse) return wx.showToast({ title:'请选择仓库',icon:'none' });
-    if (!carrier) return wx.showToast({ title:'请选择快递公司',icon:'none' });
-    if (!trackingNumber) return wx.showToast({ title:'请填写快递单号',icon:'none' });
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > Number(order.totalQuantity || 1)) {
+    if (stockMode && !['yeeke','shopeex'].includes(String(warehouse.provider || ''))) return wx.showToast({ title:'当前仓库暂不支持库存发货',icon:'none' });
+    if (!stockMode && !carrier) return wx.showToast({ title:'请选择快递公司',icon:'none' });
+    if (!stockMode && !trackingNumber) return wx.showToast({ title:'请填写快递单号',icon:'none' });
+    if (!stockMode && (!Number.isInteger(quantity) || quantity < 1 || quantity > Number(order.totalQuantity || 1))) {
       return wx.showToast({ title:`发货数量应为1至${order.totalQuantity}`,icon:'none' });
     }
     if (remark.length > 500) return wx.showToast({ title:'备注不能超过500字',icon:'none' });
+    const orderId=String(order.displayOrderId || order.orderId);
+    let stockByOrder:Record<string,any[]>={};
+    let stockSummary='';
+    if (stockMode) {
+      try {
+        const stockRequest=this.buildStockByOrder(orderId);
+        stockByOrder=stockRequest.stockByOrder;
+        stockSummary=stockRequest.summary;
+        if (stockRequest.mismatches.length) {
+          const mismatchConfirmed=await new Promise<boolean>(resolve=>wx.showModal({
+            title:'确认库存商品',
+            content:`以下库存 SKU 与订单 SKU 不一致：\n${stockRequest.mismatches.join('\n')}\n请确认它们确实是同一商品。`,
+            confirmText:'确认同一商品',success:result=>resolve(Boolean(result.confirm)),fail:()=>resolve(false)
+          }));
+          if (!mismatchConfirmed) return;
+        }
+      } catch (error) { showError(error);return; }
+    }
     const confirmation=await new Promise<boolean>(resolve=>wx.showModal({
       title:'确认提交代贴单',
-      content:`${warehouse.name} · ${carrier.name}\n快递单号：${trackingNumber}\n发货数量：${quantity}`,
+      content:stockMode
+        ? `${warehouse.name} · 仓库库存发货\n${stockSummary}`
+        : `${warehouse.name} · ${carrier.name}\n快递单号：${trackingNumber}\n发货数量：${quantity}`,
       success:result=>resolve(Boolean(result.confirm)),fail:()=>resolve(false)
     }));
     if (!confirmation) return;
-    const orderId=String(order.displayOrderId || order.orderId);
     this.setData({ fulfillmentSubmitting:true });
     wx.showLoading({ title:'正在提交',mask:true });
     try {
       await request<any>({
         path:'/api/miniprogram/v1/fulfillment/submit',method:'POST',timeout:60000,
         data:{
-          orderIds:[orderId],warehouseId:warehouse.id,carrier:carrier.name,
-          carrierCode:warehouse.provider === 'shopeex' ? String(carrier.code || '') : '',serviceIds:[],
-          trackingByOrder:{ [orderId]:trackingNumber },
-          quantityByOrder:{ [orderId]:quantity },
+          orderIds:[orderId],warehouseId:warehouse.id,fulfillmentMode:stockMode ? 'stock' : 'express',stockModeConfirmed:stockMode,
+          carrier:stockMode ? '' : carrier.name,
+          carrierCode:!stockMode && warehouse.provider === 'shopeex' ? String(carrier.code || '') : '',serviceIds:[],
+          trackingByOrder:stockMode ? {} : { [orderId]:trackingNumber },
+          quantityByOrder:stockMode ? {} : { [orderId]:quantity },stockByOrder,
           remarkByOrder:{ [orderId]:remark },
           resubmitOrderIds:resubmitting ? [orderId] : []
         }
@@ -162,9 +272,10 @@ Page({
     const warehouseIndex=Math.max(0,this.data.warehouses.findIndex((item:any)=>
       String(item.id) === String(submission.warehouseId || '') || item.name === submission.warehouseName));
     this.setData({
-      fulfillmentResubmit:true,fulfillmentExpressEditing:false,warehouseIndex,
+      fulfillmentResubmit:true,fulfillmentExpressEditing:false,warehouseIndex,fulfillmentMode:'express',fulfillmentModeIndex:0,
+      fulfillmentStockRecords:[],stockLines:[],
       fulfillmentForm:{
-        trackingNumber:String(submission.trackingNumber || ''),
+        trackingNumber:submission.fulfillmentMode === 'stock' ? '' : String(submission.trackingNumber || ''),
         quantity:String(submission.shippingQuantity || order.totalQuantity || 1),
         remark:String(submission.shippingRemark || '')
       }
@@ -190,7 +301,7 @@ Page({
   },
   startExpressUpdate() {
     const submission=this.data.order?.fulfillmentSubmission;
-    if (!submission || submission.status !== 'success' || submission.provider !== 'yeeke') return;
+    if (!submission || submission.fulfillmentMode === 'stock' || submission.status !== 'success' || submission.provider !== 'yeeke') return;
     const carrierIndex=Math.max(0,this.data.carriers.findIndex((item:any)=>item.name === submission.carrier));
     this.setData({
       fulfillmentExpressEditing:true,carrierIndex,
@@ -217,7 +328,7 @@ Page({
     }
     const confirmed=await new Promise<boolean>(resolve=>wx.showModal({
       title:'确认修改快递号',
-      content:'修改会同步到 Yeeke 原订单，不会创建新订单。',
+      content:'修改会同步到原仓库订单，不会创建新订单。',
       success:result=>resolve(Boolean(result.confirm)),fail:()=>resolve(false)
     }));
     if (!confirmed) return;

@@ -7499,23 +7499,31 @@ app.get('/api/admin/warehouse-inventory/options', requireOrderAccess, async (req
   }
 });
 
+async function getFulfillableWarehouseStockData(authUser,query = {}) {
+  const connector = await getSharedInventoryConnector(query.warehouseId);
+  if (!connector) {
+    const error = new Error('仓库不存在或未启用库存接口');
+    error.status = 404;
+    throw error;
+  }
+  const keyword = String(query.query || '').trim();
+  let records = await getFulfillableWarehouseStock(authUser.username,connector,{ includeExhausted:query.includeExhausted === '1' });
+  if (keyword) {
+    const normalized = keyword.toLowerCase();
+    records = records.filter(item => item.sku.toLowerCase().includes(normalized) || item.productName.toLowerCase().includes(normalized));
+  }
+  records = records.map(item => ({ ...item,remoteId:item.remoteProductId,name:item.productName,
+    remainingQuantity:item.receivedQuantity,frozenQuantity:item.allocatedQuantity,onTheWayQuantity:0 }));
+  return { provider:connector.provider,warehouseId:connector.id,warehouseName:connector.name,
+    page:1,size:records.length,records };
+}
+
 async function handleFulfillableWarehouseStock(req,res) {
-  try {
-    const connector = await getSharedInventoryConnector(req.query.warehouseId);
-    if (!connector) return res.status(404).json({ code:404,message:'仓库不存在或未启用库存接口' });
-    const query = String(req.query.query || '').trim();
-    let records = await getFulfillableWarehouseStock(req.authUser.username,connector,{ includeExhausted:req.query.includeExhausted === '1' });
-    if (query) {
-      const normalized = query.toLowerCase();
-      records = records.filter(item => item.sku.toLowerCase().includes(normalized) || item.productName.toLowerCase().includes(normalized));
-    }
-    records = records.map(item => ({ ...item,remoteId:item.remoteProductId,name:item.productName,
-      remainingQuantity:item.receivedQuantity,frozenQuantity:item.allocatedQuantity,onTheWayQuantity:0 }));
-    res.json({ code:0,data:{ provider:connector.provider,warehouseId:connector.id,warehouseName:connector.name,
-      page:1,size:records.length,records } });
-  } catch (error) {
+  try { res.json({ code:0,data:await getFulfillableWarehouseStockData(req.authUser,req.query || {}) }); }
+  catch (error) {
     console.error('[WarehouseInventory] stock query failed:',error.response?.data || error.message);
-    res.status(502).json({ code:502,message:`仓库库存查询失败：${error.response?.data?.message || error.message}` });
+    const status=Number(error.status) || 502;
+    res.status(status).json({ code:status,message:status === 404 ? error.message : `仓库库存查询失败：${error.response?.data?.message || error.message}` });
   }
 }
 
@@ -9176,7 +9184,7 @@ async function start() {
   await mercadoLibreWebhookService.init();
   mercadoLibreWebhookService.registerRoutes(app);
   registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,syncOrdersForUser,getMiniOrderWorkbenchSummaryData,getOrderStoresData,refreshOrderDimensionsData,
-    getFulfillmentOptionsData,submitFulfillmentRequest:handleFulfillmentSubmit,
+    getFulfillmentOptionsData,getFulfillableWarehouseStockData,submitFulfillmentRequest:handleFulfillmentSubmit,
     updateFulfillmentExpressRequest:handleFulfillmentExpressUpdate,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,
     getOrderClaimMessagesData,sendOrderClaimMessageData,translateOrderTextData,translateOrderMessageData,getOrderRealtimeStateData,

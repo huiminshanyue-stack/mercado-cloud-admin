@@ -68,15 +68,21 @@
     <view wx:if="{{order.fulfillmentSubmission}}" class="card section fulfillment-submitted">
       <view class="section-title">代贴单提交信息</view>
       <view class="row"><text>仓库</text><text>{{order.fulfillmentSubmission.warehouseName || '-'}}</text></view>
-      <view class="row"><text>快递公司</text><text>{{order.fulfillmentSubmission.carrier || '-'}}</text></view>
-      <view class="row"><text>国内快递单号</text><text user-select="true">{{order.fulfillmentSubmission.trackingNumber || '-'}}</text></view>
+      <view class="row"><text>发货方式</text><text>{{order.fulfillmentSubmission.fulfillmentMode === 'stock' ? '仓库库存发货' : '国内快递发仓'}}</text></view>
+      <block wx:if="{{order.fulfillmentSubmission.fulfillmentMode === 'stock'}}">
+        <view wx:for="{{order.fulfillmentSubmission.stockAllocations}}" wx:key="remoteProductId" class="row"><text>库存商品</text><text>{{item.stockSku || item.sku || '-'}} ×{{item.quantity}}</text></view>
+      </block>
+      <block wx:else>
+        <view class="row"><text>快递公司</text><text>{{order.fulfillmentSubmission.carrier || '-'}}</text></view>
+        <view class="row"><text>国内快递单号</text><text user-select="true">{{order.fulfillmentSubmission.trackingNumber || '-'}}</text></view>
+      </block>
       <view class="row"><text>发货数量</text><text>{{order.fulfillmentSubmission.shippingQuantity || order.totalQuantity}}</text></view>
       <view wx:if="{{order.fulfillmentSubmission.shippingRemark}}" class="row"><text>备注</text><text>{{order.fulfillmentSubmission.shippingRemark}}</text></view>
       <view wx:if="{{order.fulfillmentSubmission.status === 'failed'}}" class="fulfillment-error">{{order.fulfillmentSubmission.failureReason || '提交失败，请在订单工作台重新推送'}}</view>
       <button wx:if="{{order.canResubmitFulfillment && !fulfillmentResubmit && !fulfillmentExpressEditing}}" class="fulfillment-resubmit-button" bindtap="startFulfillmentResubmit">{{order.fulfillmentSubmission.status === 'failed' ? '重新提交代贴单' : '重新提交或更换仓库'}}</button>
-      <button wx:if="{{order.fulfillmentSubmission.status === 'success' && order.fulfillmentSubmission.provider === 'yeeke' && !fulfillmentExpressEditing}}" class="express-update-button" bindtap="startExpressUpdate">修改国内快递号</button>
+      <button wx:if="{{order.canUpdateFulfillmentExpress && !fulfillmentExpressEditing}}" class="express-update-button" bindtap="startExpressUpdate">修改国内快递号</button>
       <view wx:if="{{fulfillmentExpressEditing}}" class="express-update-form">
-        <view class="form-hint">只修改 Yeeke 原订单的快递记录，不会创建新订单或改变仓库。</view>
+        <view class="form-hint">只修改原仓库订单的快递记录，不会创建新订单或改变仓库。</view>
         <view class="form-label">快递公司</view>
         <picker mode="selector" range="{{carrierNames}}" value="{{carrierIndex}}" bindchange="onCarrierChange">
           <view class="picker-value">{{carrierNames[carrierIndex] || '请选择快递公司'}}</view>
@@ -84,7 +90,7 @@
         <view class="form-label">新国内快递单号</view>
         <input class="form-input" data-field="trackingNumber" value="{{fulfillmentForm.trackingNumber}}" placeholder="请输入正确的国内快递单号" bindinput="onFulfillmentInput" />
         <view class="form-label">备注</view>
-        <textarea class="form-textarea" data-field="remark" value="{{fulfillmentForm.remark}}" maxlength="500" placeholder="备注会随新快递记录同步到 Yeeke" bindinput="onFulfillmentInput" />
+        <textarea class="form-textarea" data-field="remark" value="{{fulfillmentForm.remark}}" maxlength="500" placeholder="备注会随新快递记录同步到仓库系统" bindinput="onFulfillmentInput" />
         <view class="express-update-actions"><button size="mini" bindtap="cancelExpressUpdate">取消</button><button size="mini" type="primary" loading="{{fulfillmentExpressUpdating}}" disabled="{{fulfillmentExpressUpdating}}" bindtap="submitExpressUpdate">同步修改</button></view>
       </view>
     </view>
@@ -95,17 +101,38 @@
       <picker mode="selector" range="{{warehouseNames}}" value="{{warehouseIndex}}" bindchange="onWarehouseChange">
         <view class="picker-value">{{warehouseNames[warehouseIndex] || '请选择管理员配置的仓库'}}</view>
       </picker>
-      <view class="form-label">快递公司</view>
-      <picker mode="selector" range="{{carrierNames}}" value="{{carrierIndex}}" bindchange="onCarrierChange">
-        <view class="picker-value">{{carrierNames[carrierIndex] || '请选择快递公司'}}</view>
+      <view class="form-label">发货方式</view>
+      <picker mode="selector" range="{{fulfillmentModeNames}}" value="{{fulfillmentModeIndex}}" bindchange="onFulfillmentModeChange">
+        <view class="picker-value">{{fulfillmentModeNames[fulfillmentModeIndex]}}</view>
       </picker>
-      <view class="form-label">国内快递单号</view>
-      <input class="form-input" data-field="trackingNumber" value="{{fulfillmentForm.trackingNumber}}" placeholder="请输入国内快递单号" bindinput="onFulfillmentInput" />
-      <view class="form-label">发货数量</view>
-      <input class="form-input" type="number" data-field="quantity" value="{{fulfillmentForm.quantity}}" placeholder="1" bindinput="onFulfillmentInput" />
-      <view class="form-hint">当前订单最多可填写 {{order.totalQuantity}} 件</view>
+      <block wx:if="{{fulfillmentMode === 'express'}}">
+        <view class="form-label">快递公司</view>
+        <picker mode="selector" range="{{carrierNames}}" value="{{carrierIndex}}" bindchange="onCarrierChange">
+          <view class="picker-value">{{carrierNames[carrierIndex] || '请选择快递公司'}}</view>
+        </picker>
+        <view class="form-label">国内快递单号</view>
+        <input class="form-input" data-field="trackingNumber" value="{{fulfillmentForm.trackingNumber}}" placeholder="请输入国内快递单号" bindinput="onFulfillmentInput" />
+        <view class="form-label">发货数量</view>
+        <input class="form-input" type="number" data-field="quantity" value="{{fulfillmentForm.quantity}}" placeholder="1" bindinput="onFulfillmentInput" />
+        <view class="form-hint">当前订单最多可填写 {{order.totalQuantity}} 件</view>
+      </block>
+      <block wx:else>
+        <view class="stock-mode-hint">库存发货只使用当前账号已成功入库、且仓库仍有可用数量的商品，不需要填写国内快递单号。</view>
+        <view wx:if="{{fulfillmentStockLoading}}" class="stock-loading">正在读取可发库存…</view>
+        <view wx:elif="{{!stockLines.length}}" class="stock-empty">当前仓库没有可发库存，请更换仓库或使用国内快递发仓。</view>
+        <view wx:for="{{stockLines}}" wx:for-item="line" wx:for-index="lineIndex" wx:key="key" class="stock-line">
+          <view class="stock-line-title">{{line.title}}</view>
+          <view class="stock-line-meta">订单 SKU：{{line.sku || '未设置'}}　订单数量：{{line.orderedQuantity}}</view>
+          <view class="form-label">选择已入库库存</view>
+          <picker mode="selector" range="{{line.stockNames}}" value="{{line.stockIndex}}" data-line-index="{{lineIndex}}" bindchange="onStockSelectionChange">
+            <view class="picker-value stock-picker-value">{{line.stockNames[line.stockIndex] || '当前没有可选择的库存'}}</view>
+          </picker>
+          <view class="form-label">库存发货数量</view>
+          <input class="form-input" type="number" value="{{line.quantity}}" data-line-index="{{lineIndex}}" bindinput="onStockQuantityInput" />
+        </view>
+      </block>
       <view class="form-label">备注</view>
-      <textarea class="form-textarea" data-field="remark" value="{{fulfillmentForm.remark}}" maxlength="500" placeholder="备注会随国内快递一起推送到仓库" bindinput="onFulfillmentInput" />
+      <textarea class="form-textarea" data-field="remark" value="{{fulfillmentForm.remark}}" maxlength="500" placeholder="备注会随发货信息一起推送到仓库系统" bindinput="onFulfillmentInput" />
       <view class="fulfillment-form-actions"><button wx:if="{{fulfillmentResubmit}}" class="fulfillment-cancel" bindtap="cancelFulfillmentResubmit">取消</button><button class="fulfillment-submit" type="primary" loading="{{fulfillmentSubmitting}}" disabled="{{fulfillmentSubmitting || fulfillmentOptionsLoading}}" bindtap="submitFulfillment">{{fulfillmentResubmit ? '确认重新提交' : '提交代贴单'}}</button></view>
     </view>
     <view wx:if="{{!order.canSubmitFulfillment && !order.fulfillmentSubmission}}" class="readonly">仅待发货订单可以提交代贴单。</view>

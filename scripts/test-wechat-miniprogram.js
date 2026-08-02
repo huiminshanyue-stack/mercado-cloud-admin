@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { DEFAULT_APP_ID,tokenHash,canTestOrders,describeWechatLoginError,registerMiniProgramRoutes } = require('../wechat-miniprogram');
+const { DEFAULT_APP_ID,tokenHash,canTestOrders,describeWechatLoginError,sanitizeMiniProgramProviderMessage,registerMiniProgramRoutes } = require('../wechat-miniprogram');
 
 assert.equal(DEFAULT_APP_ID,'wx0f97428df87ee76e');
 assert.equal(tokenHash('山月助手').length,64);
@@ -13,13 +13,19 @@ assert.equal(canTestOrders({ role:'user',username:'cntoro' }),true);
 assert.equal(canTestOrders({ role:'user',username:'other' }),false);
 assert.match(describeWechatLoginError({ errcode:40164,errmsg:'invalid ip 152.55.177.79' }),/API IP 白名单/);
 assert.equal(describeWechatLoginError({ errcode:40029,errmsg:'invalid code' }),'微信登录凭证已失效，请重新点击微信登录');
+assert.equal(sanitizeMiniProgramProviderMessage('Yeeke 接口授权失败'),'仓库系统 接口授权失败');
+assert.equal(sanitizeMiniProgramProviderMessage('Shopeex/KJX 库存读取失败'),'仓库系统 库存读取失败');
 const orderDetailScript=fs.readFileSync(require.resolve('../order-miniprogram/miniprogram/pages/order-detail/index.ts'),'utf8');
 const orderDetailMarkup=fs.readFileSync(require.resolve('../order-miniprogram/miniprogram/pages/order-detail/index.wxml'),'utf8');
 assert.match(orderDetailScript,/path:`\/api\/miniprogram\/v1\/orders\/\$\{encodeURIComponent\(orderId\)\}\/sync`/);
 assert.match(orderDetailScript,/resubmitOrderIds:resubmitting \? \[orderId\] : \[\]/);
 assert.match(orderDetailScript,/canResubmitFulfillment/);
+assert.match(orderDetailScript,/fulfillmentMode:stockMode \? 'stock' : 'express'/);
+assert.match(orderDetailScript,/stockByOrder/);
 assert.match(orderDetailMarkup,/bindtap="syncOrder"/);
 assert.match(orderDetailMarkup,/fulfillmentResubmit && order\.canResubmitFulfillment/);
+assert.match(orderDetailMarkup,/仓库库存发货/);
+assert.doesNotMatch(orderDetailMarkup,/Yeeke|Shopeex|KJX/i);
 
 function responseRecorder() {
   return {
@@ -47,7 +53,7 @@ async function runHandlers(handlers,req,res) {
 
 async function testRoutes() {
   process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
-  const routes=new Map(),listCalls=[],syncCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],fulfillmentOptionCalls=[],fulfillmentSubmitCalls=[],fulfillmentExpressUpdateCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
+  const routes=new Map(),listCalls=[],syncCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],fulfillmentOptionCalls=[],fulfillmentStockCalls=[],fulfillmentSubmitCalls=[],fulfillmentExpressUpdateCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -88,7 +94,7 @@ async function testRoutes() {
     getOrderStoresData:async user=>[{ id:'store-1',owner:user.username }],
     getOrderListData:async (user,query) => {
       listCalls.push({ user,query });
-      return { items:[{ orderId:'order-1' }],total:1,page:1,size:20 };
+      return { items:[{ orderId:'order-1',fulfillmentSubmission:{ failureReason:'Yeeke 接口失败' } }],total:1,page:1,size:20 };
     },
     syncOrdersForUser:async (user,body) => {
       syncCalls.push({ user,body });
@@ -102,9 +108,13 @@ async function testRoutes() {
       fulfillmentOptionCalls.push(true);
       return { connectors:[{ id:4,name:'东莞仓',provider:'yeeke' }],services:[],carriers:[{ id:1,name:'中通快递' }] };
     },
+    getFulfillableWarehouseStockData:async (user,query)=>{
+      fulfillmentStockCalls.push({ user,query });
+      return { warehouseId:4,warehouseName:'东莞仓',records:[{ remoteProductId:'stock-1',sku:'SKU-1',productName:'库存商品',availableQuantity:2 }] };
+    },
     submitFulfillmentRequest:async (req,res)=>{
       fulfillmentSubmitCalls.push({ user:req.authUser,body:req.body });
-      res.json({ code:0,data:{ success:1,failed:0,results:[{ orderId:req.body.orderIds[0],success:true }] },message:'代贴单已提交' });
+      res.json({ code:0,data:{ success:1,failed:0,results:[{ orderId:req.body.orderIds[0],success:true,message:'Yeeke 已接收' }] },message:'Yeeke 代贴单已提交' });
     },
     updateFulfillmentExpressRequest:async (req,res)=>{
       fulfillmentExpressUpdateCalls.push({ user:req.authUser,body:req.body });
@@ -171,6 +181,7 @@ async function testRoutes() {
   },allowedRes);
   assert.equal(allowedRes.statusCode,200);
   assert.equal(allowedRes.body.code,0);
+  assert.equal(allowedRes.body.data.items[0].fulfillmentSubmission.failureReason,'仓库系统 接口失败');
   assert.equal(listCalls.length,1);
   assert.equal(listCalls[0].user.username,'CNTORO');
   assert.deepEqual(listCalls[0].query,{ page:'2',storeId:'store-1' });
@@ -220,6 +231,15 @@ async function testRoutes() {
   assert.equal(fulfillmentOptionsRes.body.data.connectors[0].name,'东莞仓');
   assert.equal(fulfillmentOptionCalls.length,1);
 
+  const fulfillmentStockRes=responseRecorder();
+  await runHandlers(routes.get('GET /api/miniprogram/v1/warehouse-inventory/fulfillable'),{
+    headers:{ authorization:'Bearer cntoro-token' },query:{ warehouseId:'4' }
+  },fulfillmentStockRes);
+  assert.equal(fulfillmentStockRes.statusCode,200);
+  assert.equal(fulfillmentStockRes.body.data.records[0].availableQuantity,2);
+  assert.equal(fulfillmentStockCalls[0].user.username,'CNTORO');
+  assert.deepEqual(fulfillmentStockCalls[0].query,{ warehouseId:'4' });
+
   const fulfillmentBody={
     orderIds:['order-1'],warehouseId:4,carrier:'中通快递',serviceIds:[],
     trackingByOrder:{ 'order-1':'ZT123' },quantityByOrder:{ 'order-1':2 },remarkByOrder:{ 'order-1':'易碎' }
@@ -230,6 +250,8 @@ async function testRoutes() {
   },fulfillmentSubmitRes);
   assert.equal(fulfillmentSubmitRes.statusCode,200);
   assert.equal(fulfillmentSubmitRes.body.data.success,1);
+  assert.equal(fulfillmentSubmitRes.body.message,'仓库系统 代贴单已提交');
+  assert.equal(fulfillmentSubmitRes.body.data.results[0].message,'仓库系统 已接收');
   assert.equal(fulfillmentSubmitCalls[0].user.username,'CNTORO');
   assert.deepEqual(fulfillmentSubmitCalls[0].body,fulfillmentBody);
 
