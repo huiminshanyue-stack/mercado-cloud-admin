@@ -40,6 +40,26 @@ assert.deepEqual(resolve({ orderStatus: 'cancelled', shipmentStatus: 'shipped' }
 assert.equal(resolve({ orderStatus: 'cancelled', shipmentStatus: 'shipped', officialLedgerDelta: -21.4 }).amount, -21.4);
 assert.equal(resolve({ orderStatus: 'cancelled', explicitOfficialNet: 4.22 }).amount, 4.22);
 
+assert.deepEqual(resolve({
+  orderStatus: 'cancelled',
+  shipmentStatus: 'ready_to_ship',
+  grossAmount: 11.25,
+  explicitOfficialNet: 4.51,
+  hasOfficialLedger: true,
+  officialLedgerDelta: -11.25
+}), {
+  amount: 0,
+  source: 'cancelled_official_zero_settlement'
+});
+assert.equal(resolve({
+  orderStatus: 'cancelled',
+  shipmentStatus: 'shipped',
+  grossAmount: 11.25,
+  explicitOfficialNet: 4.51,
+  hasOfficialLedger: true,
+  officialLedgerDelta: -11.25
+}).amount, 4.51);
+
 // LOCKED CANCELLED-AFTER-DISPATCH REGRESSIONS — official credits reverse
 // official fees; the cancelled sale principal must not be added back.
 for (const sample of [

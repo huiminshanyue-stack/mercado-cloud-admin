@@ -653,7 +653,7 @@ async function initOrderManagementTables() {
   // debit and its cancellation credit cancelled each other out. Recalculate each
   // cancelled-before-dispatch order from its cached official ledger so real
   // cancellation charges remain negative instead of being flattened to zero.
-  const payoutRepairVersion = '2026-07-25-cancelled-before-dispatch-v2';
+  const payoutRepairVersion = '2026-08-02-cancelled-final-zero-v3';
   const payoutRepairSetting = await pool.query("SELECT value FROM settings WHERE key='order_payout_repair_version'");
   if (payoutRepairSetting.rows[0]?.value !== payoutRepairVersion) {
     const { rows: cancelledRows } = await pool.query(`SELECT ml_order_id,status,shipment_status,paid_amount,

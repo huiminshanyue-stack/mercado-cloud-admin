@@ -38,14 +38,32 @@ function resolveOfficialOrderPayout({
   officialLedgerDelta,
   paymentOfficialNet
 }) {
+  const gross = finiteNumber(grossAmount) ?? 0;
+  const refunded = finiteNumber(refundAmount) ?? 0;
+  const cancelled = String(orderStatus || '').trim().toLowerCase() === 'cancelled';
+  const shipment = String(shipmentStatus || '').trim().toLowerCase();
+  const dispatched = ['shipped', 'delivered', 'not_delivered', 'returned'].includes(shipment);
+  const ledgerDelta = finiteNumber(officialLedgerDelta);
+
+  // Some cancelled-before-dispatch orders expose a stale detail-level net amount
+  // even though the complete official ledger has already reversed the full sale.
+  // In that exact state, the reconciled official result is zero.
+  if (
+    cancelled
+    && !dispatched
+    && hasOfficialLedger
+    && gross > 0
+    && ledgerDelta !== null
+    && Math.abs(gross + ledgerDelta) <= 0.01
+  ) {
+    return { amount: 0, source: 'cancelled_official_zero_settlement' };
+  }
+
   const explicitNet = finiteNumber(explicitOfficialNet);
   if (explicitNet !== null) {
     return { amount: Number(explicitNet.toFixed(2)), source: 'official_explicit_net' };
   }
 
-  const gross = finiteNumber(grossAmount) ?? 0;
-  const refunded = finiteNumber(refundAmount) ?? 0;
-  const cancelled = String(orderStatus || '').trim().toLowerCase() === 'cancelled';
   const fullyRefunded = gross > 0 && refunded >= gross - 0.01;
 
   // A cancelled order has no remaining sale principal. Its payout is the balance
