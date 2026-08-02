@@ -110,7 +110,7 @@ async function testRoutes() {
     },
     getFulfillableWarehouseStockData:async (user,query)=>{
       fulfillmentStockCalls.push({ user,query });
-      return { warehouseId:4,warehouseName:'东莞仓',records:[{ remoteProductId:'stock-1',sku:'SKU-1',productName:'库存商品',availableQuantity:2 }] };
+      return { provider:'yeeke',warehouseId:4,warehouseName:'东莞仓',records:[{ provider:'yeeke',remoteProductId:'stock-1',sku:'SKU-1',productName:'库存商品',availableQuantity:2 }] };
     },
     submitFulfillmentRequest:async (req,res)=>{
       fulfillmentSubmitCalls.push({ user:req.authUser,body:req.body });
@@ -237,6 +237,9 @@ async function testRoutes() {
   },fulfillmentStockRes);
   assert.equal(fulfillmentStockRes.statusCode,200);
   assert.equal(fulfillmentStockRes.body.data.records[0].availableQuantity,2);
+  assert.equal(fulfillmentStockRes.body.data.provider,undefined);
+  assert.equal(fulfillmentStockRes.body.data.records[0].provider,undefined);
+  assert.doesNotMatch(JSON.stringify(fulfillmentStockRes.body),/Yeeke|Shopeex|KJX/i);
   assert.equal(fulfillmentStockCalls[0].user.username,'CNTORO');
   assert.deepEqual(fulfillmentStockCalls[0].query,{ warehouseId:'4' });
 

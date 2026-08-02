@@ -400,7 +400,10 @@ function registerMiniProgramRoutes(app, dependencies) {
   });
 
   app.get('/api/miniprogram/v1/warehouse-inventory/fulfillable',requireBoundOrderUser,async (req,res) => {
-    try { res.json({ code:0,data:await getFulfillableWarehouseStockData(req.authUser,req.query || {}) }); }
+    try {
+      const { provider:_provider,records = [],...data } = await getFulfillableWarehouseStockData(req.authUser,req.query || {});
+      res.json({ code:0,data:{ ...data,records:records.map(({ provider:_recordProvider,...record })=>record) } });
+    }
     catch (error) {
       console.error('[MiniProgram] fulfillment stock failed:',error.response?.data || error.message);
       const status=Number(error.status) || 502;
