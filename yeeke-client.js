@@ -25,8 +25,10 @@ function createYeekeClient(config, request = axios) {
   const appId = String(config.appId || '').trim();
   const appSecret = String(config.appSecret || '').trim();
   let accessToken = String(config.accessToken || '').trim();
+  let authorizedUserName = '';
+  let authorizedPassword = '';
 
-  async function call(path, data) {
+  async function callOnce(path, data) {
     const response = await request.post(`${baseURL}${YEEKE_API_PREFIX}${path}`, buildYeekeEnvelope(appId, appSecret, data), {
       timeout: 30000,
       headers: { 'Content-Type': 'application/json' }
@@ -38,6 +40,30 @@ function createYeekeClient(config, request = axios) {
       throw error;
     }
     return body.data;
+  }
+
+  async function refreshAccessToken() {
+    if (!authorizedUserName || !authorizedPassword) throw new Error('Yeeke authorization expired; please configure the warehouse credentials again');
+    const data = await callOnce('/auth', { timestamp:Date.now(),userName:authorizedUserName,password:authorizedPassword });
+    accessToken = String(data?.accessToken || '');
+    if (!accessToken) throw new Error('Yeeke reauthorization did not return an accessToken');
+    return data;
+  }
+
+  async function call(path, data, retryExpiredAuthorization = true) {
+    if (path === '/auth') {
+      authorizedUserName = String(data?.userName || '');
+      authorizedPassword = String(data?.password || '');
+    }
+    try {
+      return await callOnce(path,data);
+    } catch (error) {
+      if (retryExpiredAuthorization && path !== '/auth' && String(error.response?.data?.code || '') === '10') {
+        await refreshAccessToken();
+        return call(path,{ ...data,accessToken,timestamp:Date.now() },false);
+      }
+      throw error;
+    }
   }
 
   return {

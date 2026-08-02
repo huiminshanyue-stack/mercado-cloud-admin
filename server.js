@@ -3242,7 +3242,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.10',
+    version: '2026-08-02.11',
     deployedCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || '',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
@@ -3270,6 +3270,7 @@ app.get('/api/health/order-management', (req, res) => {
     warehouseInboundReturnsRemoteNumberAndQuantities: true,
     warehouseInventoryQueryAutoSyncsPendingInbound: true,
     yeekeOfficialInboundOrder: true,
+    yeekeExpiredAuthorizationAutoRetry: true,
     shopeexInventoryReviewInbound: true,
     fulfillmentShippingModes: ['express','warehouse_stock'],
     fulfillmentDefaultShippingMode: 'express',

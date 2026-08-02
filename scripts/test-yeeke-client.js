@@ -79,6 +79,32 @@ async function run() {
   assert.strictEqual(inbounds.records[0].id, 'S1');
   assert.strictEqual(calls[12].body.storageType, '0');
 
+  let retryAuthCount = 0;
+  let retryOrderCount = 0;
+  const retryCalls = [];
+  const retryClient = createYeekeClient({ appId:'app',appSecret:'secret' },{
+    async post(url,envelope) {
+      const body = JSON.parse(envelope.data);
+      retryCalls.push({ url,body });
+      if (url.endsWith('/auth')) {
+        retryAuthCount += 1;
+        return { status:200,data:{ code:'0',data:{ accessToken:`token-${retryAuthCount}` } } };
+      }
+      if (url.endsWith('/order/create/v2')) {
+        retryOrderCount += 1;
+        if (retryOrderCount === 1) return { status:200,data:{ code:'10',message:'authorization expired' } };
+        return { status:200,data:{ code:'0',data:{ id:'ORDER-RETRIED' } } };
+      }
+      throw new Error(`unexpected retry URL ${url}`);
+    }
+  });
+  await retryClient.authorize('seller','password.');
+  const retriedOrder = await retryClient.createOrderV2({ ordersn:'RETRY-1',wareHouse:'th',orderItems:[] });
+  assert.strictEqual(retriedOrder.id,'ORDER-RETRIED');
+  assert.strictEqual(retryAuthCount,2);
+  assert.strictEqual(retryOrderCount,2);
+  assert.strictEqual(retryCalls[retryCalls.length - 1].body.accessToken,'token-2');
+
   const expressUpdate = await replaceYeekeDomesticExpress(client,{
     ordersn:'ORIGINAL-1',warehouseCode:'th',previousTrackingNo:'OLD123',trackingNo:'NEW456',
     carrier:'中通快递',remark:'更正快递号',previousCarrier:'圆通快递',previousRemark:'原备注'
