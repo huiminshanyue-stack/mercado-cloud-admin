@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   LOCKED_PAYOUT_EXAMPLE,
   assertLockedPayoutInvariant,
+  parseCancelledOfficialFinalNet,
   resolveOfficialOrderPayout
 } = require('../order-payout');
 const { LOCKED_MIXED_CURRENCY_PAYOUT_EXAMPLE,normalizeOfficialMoneyAmount,
@@ -18,6 +19,7 @@ const resolve = overrides => resolveOfficialOrderPayout({
   hasOfficialLedger: true,
   officialLedgerDelta: 0,
   paymentOfficialNet: null,
+  cancelledFinalOfficialNet: null,
   ...overrides
 });
 
@@ -39,6 +41,55 @@ assert.deepEqual(resolve({ orderStatus: 'cancelled', shipmentStatus: 'shipped' }
 });
 assert.equal(resolve({ orderStatus: 'cancelled', shipmentStatus: 'shipped', officialLedgerDelta: -21.4 }).amount, -21.4);
 assert.equal(resolve({ orderStatus: 'cancelled', explicitOfficialNet: 4.22 }).amount, 4.22);
+
+const cancelledFinalZero = parseCancelledOfficialFinalNet({
+  payment_info: [{ status: 'refunded' }],
+  details: [
+    { charge_info: { detail_amount: 0.2, detail_type: 'CHARGE' } },
+    { charge_info: { detail_amount: 1.01, detail_type: 'CHARGE' } },
+    { charge_info: { detail_amount: 6.09, detail_type: 'CHARGE' } },
+    { charge_info: { detail_amount: 1.01, detail_type: 'BONUS' } },
+    { charge_info: { detail_amount: 0.2, detail_type: 'BONUS' } },
+    { charge_info: { detail_amount: 6.09, detail_type: 'BONUS' } }
+  ]
+});
+assert.equal(cancelledFinalZero, 0);
+assert.deepEqual(resolve({
+  orderStatus: 'cancelled',
+  officialLedgerDelta: 4.51,
+  cancelledFinalOfficialNet: cancelledFinalZero
+}), {
+  amount: 0,
+  source: 'cancelled_official_final_net'
+});
+
+// Missing final cancellation status keeps the existing cancelled-order fallback.
+assert.equal(parseCancelledOfficialFinalNet({
+  payment_info: [{ status: 'refunded' }],
+  details: []
+}), null);
+assert.equal(resolve({
+  orderStatus: 'cancelled',
+  officialLedgerDelta: 4.51,
+  cancelledFinalOfficialNet: null
+}).amount, 4.51);
+
+// A final-cancellation value is ignored for normal orders; their locked ledger
+// calculation and priority remain unchanged.
+assert.equal(resolve({
+  orderStatus: 'paid',
+  officialLedgerDelta: -7.53,
+  cancelledFinalOfficialNet: 0
+}).amount, 33.33);
+
+// A refunded payment with a retained official charge is not a zero settlement.
+assert.equal(parseCancelledOfficialFinalNet({
+  payment_info: [{ status: 'refunded' }],
+  details: [
+    { charge_info: { detail_amount: 6.09, detail_type: 'CHARGE' } },
+    { charge_info: { detail_amount: 1.01, detail_type: 'BONUS' } }
+  ]
+}), null);
 
 assert.deepEqual(resolve({
   orderStatus: 'cancelled',

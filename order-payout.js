@@ -10,6 +10,32 @@ function isDispatchedShipment(status) {
   return ['shipped', 'delivered'].includes(String(status || '').trim().toLowerCase());
 }
 
+function parseCancelledOfficialFinalNet(detail) {
+  if (!detail || typeof detail !== 'object') return null;
+  const payments = Array.isArray(detail.payment_info) ? detail.payment_info : [];
+  if (!payments.length || !payments.every(payment =>
+    ['refunded', 'cancelled'].includes(String(payment?.status || '').trim().toLowerCase())
+  )) return null;
+
+  const balances = new Map();
+  for (const row of Array.isArray(detail.details) ? detail.details : []) {
+    const charge = row?.charge_info;
+    const amount = finiteNumber(charge?.detail_amount);
+    const type = String(charge?.detail_type || '').trim().toUpperCase();
+    if (amount === null || !['CHARGE', 'BONUS', 'CREDIT'].includes(type)) continue;
+    const currency = String(row?.currency_info?.currency_id || row?.currency_info?.id ||
+      charge?.currency_id || detail?.currency_info?.currency_id || detail?.currency_info?.id || '').toUpperCase();
+    const balance = balances.get(currency) || 0;
+    balances.set(currency, balance + (type === 'CHARGE' ? -Math.abs(amount) : Math.abs(amount)));
+  }
+
+  // The official response has reached a terminal refund state and every billed
+  // charge has been reversed. Keep the resulting numeric zero; presentation-only
+  // buyer shipping data must not replace this final cancelled-order settlement.
+  if (balances.size && [...balances.values()].every(balance => Math.abs(balance) <= 0.01)) return 0;
+  return null;
+}
+
 // LOCKED BUSINESS INVARIANT — 2026-07-25, confirmed by the product owner.
 // Do not change these numbers or the payout rule without the owner's explicit
 // approval. This exact official-billing example must always resolve to USD 7.83:
@@ -36,7 +62,8 @@ function resolveOfficialOrderPayout({
   explicitOfficialNet,
   hasOfficialLedger,
   officialLedgerDelta,
-  paymentOfficialNet
+  paymentOfficialNet,
+  cancelledFinalOfficialNet
 }) {
   const gross = finiteNumber(grossAmount) ?? 0;
   const refunded = finiteNumber(refundAmount) ?? 0;
@@ -44,6 +71,11 @@ function resolveOfficialOrderPayout({
   const shipment = String(shipmentStatus || '').trim().toLowerCase();
   const dispatched = ['shipped', 'delivered', 'not_delivered', 'returned'].includes(shipment);
   const ledgerDelta = finiteNumber(officialLedgerDelta);
+  const cancelledFinalNet = finiteNumber(cancelledFinalOfficialNet);
+
+  if (cancelled && cancelledFinalNet !== null) {
+    return { amount: Number(cancelledFinalNet.toFixed(2)), source: 'cancelled_official_final_net' };
+  }
 
   // Some cancelled-before-dispatch orders expose a stale detail-level net amount
   // even though the complete official ledger has already reversed the full sale.
@@ -130,5 +162,6 @@ module.exports = {
   LOCKED_PAYOUT_EXAMPLE,
   assertLockedPayoutInvariant,
   isDispatchedShipment,
+  parseCancelledOfficialFinalNet,
   resolveOfficialOrderPayout
 };

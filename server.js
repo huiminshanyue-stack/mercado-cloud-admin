@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const path = require('path');
 const { Pool } = require('pg');
-const { resolveOfficialOrderPayout } = require('./order-payout');
+const { parseCancelledOfficialFinalNet,resolveOfficialOrderPayout } = require('./order-payout');
 const { normalizeOfficialMoneyAmount,normalizeParsedOrderBilling } = require('./order-billing-normalization');
 const { normalizeOfficialTrackingNumber,buildExternalTrackingUrl,collectTrackingNumberCandidates,
   isMelDistribution,chooseOfficialTrackingNumber,extractMelTrackingNumberFromPdf,
@@ -626,7 +626,7 @@ async function initOrderManagementTables() {
   // debit and its cancellation credit cancelled each other out. Recalculate each
   // cancelled-before-dispatch order from its cached official ledger so real
   // cancellation charges remain negative instead of being flattened to zero.
-  const payoutRepairVersion = '2026-08-02-cancelled-final-zero-v3';
+  const payoutRepairVersion = '2026-08-02-cancelled-final-zero-v4';
   const payoutRepairSetting = await pool.query("SELECT value FROM settings WHERE key='order_payout_repair_version'");
   if (payoutRepairSetting.rows[0]?.value !== payoutRepairVersion) {
     const { rows: cancelledRows } = await pool.query(`SELECT ml_order_id,status,shipment_status,paid_amount,
@@ -643,6 +643,7 @@ async function initOrderManagementTables() {
         shipmentStatus: row.shipment_status,
         grossAmount: row.paid_amount,
         refundAmount: row.refund_amount,
+        cancelledFinalOfficialNet: parsed?.cancelledFinalNet,
         explicitOfficialNet: parsed?.netAmount,
         hasOfficialLedger: parsed?.hasOfficialLedger,
         officialLedgerDelta: parsed?.ledgerDelta,
@@ -679,7 +680,8 @@ async function initOrderManagementTables() {
           Number(row.paid_amount || 0),normalized);
         const paymentResolution=resolveOfficialOrderPayout({ orderStatus:row.status,shipmentStatus:row.shipment_status,
           grossAmount:row.paid_amount,refundAmount:row.refund_amount,explicitOfficialNet:null,
-          hasOfficialLedger:false,officialLedgerDelta:null,paymentOfficialNet:paymentNet });
+          hasOfficialLedger:false,officialLedgerDelta:null,paymentOfficialNet:paymentNet,
+          cancelledFinalOfficialNet:normalized?.cancelledFinalNet });
         if (paymentResolution.amount!==null) {
           const usdRate=await getBillingFxRate(row.currency,'USD');
           const repairedUsd=usdRate===null ? null : Number((paymentResolution.amount*usdRate).toFixed(2));
@@ -695,7 +697,8 @@ async function initOrderManagementTables() {
         Number(row.paid_amount || 0),normalized);
       const resolved=resolveOfficialOrderPayout({
         orderStatus:row.status,shipmentStatus:row.shipment_status,grossAmount:row.paid_amount,
-        refundAmount:row.refund_amount,explicitOfficialNet:normalized.netAmount,
+        refundAmount:row.refund_amount,cancelledFinalOfficialNet:normalized.cancelledFinalNet,
+        explicitOfficialNet:normalized.netAmount,
         hasOfficialLedger:normalized.hasOfficialLedger,officialLedgerDelta:normalized.ledgerDelta,
         paymentOfficialNet:normalizedPaymentNet
       });
@@ -2950,6 +2953,7 @@ function parseOrderBilling(detail, grossAmount) {
   const officialNetValue=officialNet?.value;
   const hasOfficialLedger = entries.length > 0 || explicitSaleFee !== 0 || explicitShipping !== 0 || officialNetValue !== undefined;
   return { saleFee, shippingFee, otherFee, totalCharges, totalBonuses, ledgerDelta, hasOfficialLedger,
+    cancelledFinalNet:parseCancelledOfficialFinalNet(detail),
     netAmount: officialNetValue === undefined ? null : Number(officialNetValue),
     netAmountCurrency:String(officialNet?.currency || ''),netAmountCurrencyUnknown:Boolean(officialNet && !officialNet.currency),
     ledgerCurrency:rootCurrency,localToUsdRate,receiverCurrency,grossAmount:Number(grossAmount || 0),entries };
@@ -3958,6 +3962,7 @@ async function syncOrdersForUser(authUser, body = {}) {
         shipmentStatus: shipment.status,
         grossAmount,
         refundAmount,
+        cancelledFinalOfficialNet: officialFinance?.cancelledFinalNet,
         explicitOfficialNet: officialFinance?.netAmount,
         hasOfficialLedger: officialFinance?.hasOfficialLedger,
         officialLedgerDelta: officialFinance?.ledgerDelta,
@@ -6776,6 +6781,7 @@ function queuePendingOfficialPayoutBackfill(authUser,storeUserId,accessToken) {
                 shipmentStatus: order.shipment_status,
                 grossAmount,
                 refundAmount,
+                cancelledFinalOfficialNet: officialFinance.cancelledFinalNet,
                 explicitOfficialNet: officialFinance.netAmount,
                 hasOfficialLedger: officialFinance.hasOfficialLedger,
                 officialLedgerDelta: officialFinance.ledgerDelta,
