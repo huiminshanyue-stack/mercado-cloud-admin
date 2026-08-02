@@ -97,6 +97,37 @@ function createShopeexClient(config = {}, request = axios) {
   };
 }
 
+async function cancelShopeexOrder(client, { remoteOrderId,remark = '' } = {}) {
+  const orderId = String(remoteOrderId || '').trim();
+  if (!orderId) throw new Error('旧 Shopeex/KJX 订单缺少 kjxOrderIds，无法自动撤单');
+  let remarkWarning = '';
+  if (remark) {
+    try { await client.addPackageRemark(orderId,String(remark).slice(0,500)); }
+    catch (error) { remarkWarning = String(error.response?.data?.message || error.message || error); }
+  }
+  let details = [];
+  try { details = await client.getPackagedOrderDetails([orderId]); }
+  catch (_) { details = []; }
+  const detail = Array.isArray(details) ? details[0] : null;
+  const packageId = String(detail?.kjxPackageId || detail?.kjxOrderPackage?.kjxPackageId || '');
+  let packageCancelError = '';
+  if (packageId) {
+    try {
+      await client.cancelPackage(packageId);
+      return { remoteOrderId:orderId,packageId,cancelMethod:'package_cancel',remarkWarning };
+    } catch (error) {
+      packageCancelError = String(error.response?.data?.message || error.message || error);
+    }
+  }
+  try {
+    await client.updateOrderStatus(orderId,7);
+    return { remoteOrderId:orderId,packageId,cancelMethod:'order_status_7',remarkWarning,packageCancelError };
+  } catch (error) {
+    const statusError = String(error.response?.data?.message || error.message || error);
+    throw new Error(`旧 Shopeex/KJX 订单撤销失败：${[packageCancelError,statusError].filter(Boolean).join('；')}`);
+  }
+}
+
 function timestamp(value) {
   const parsed = value ? new Date(value).getTime() : 0;
   return Number.isFinite(parsed) ? parsed : 0;
@@ -228,5 +259,6 @@ module.exports = {
   selectShopeexWarehouseAddress,
   buildShopeexEnvelope,
   createShopeexClient,
+  cancelShopeexOrder,
   buildShopeexOrderPayload
 };

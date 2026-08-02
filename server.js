@@ -41,6 +41,7 @@ const {
 const {
   DEFAULT_SHOPEEX_BASE_URL,
   createShopeexClient,
+  cancelShopeexOrder,
   buildShopeexOrderPayload,
   normalizeShopeexAccessUrl,
   selectShopeexWarehouseAddress
@@ -3268,7 +3269,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.05',
+    version: '2026-08-02.06',
     deployedCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || '',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
@@ -3356,6 +3357,7 @@ app.get('/api/health/order-management', (req, res) => {
     yeekeOriginalOrderExpressUpdate: true,
     yeekeOriginalOrderExpressUpdateFlow: ['order/list','deliveryinfo/delete','express/add'],
     shopeexKjxOrderCreateAndPackage: true,
+    shopeexKjxUnpackagedOrderCancellationFallback: true,
     shopeexKjxApiBaseUrl: DEFAULT_SHOPEEX_BASE_URL,
     shopeexKjxAuth: 'appKey+md5-base64-sign+openId',
     shopeexKjxMercadoPlatformId: 48,
@@ -7674,20 +7676,7 @@ async function cancelShopeexSubmission(connector, responseText, remark = '') {
   if (!remoteOrderId) throw new Error('旧 Shopeex/KJX 订单缺少 kjxOrderIds，无法自动撤单');
   const config = getShopeexConnectorConfig(connector);
   const client = createShopeexClient(config);
-  let remarkWarning = '';
-  if (remark) {
-    try { await client.addPackageRemark(remoteOrderId,String(remark).slice(0,500)); }
-    catch (error) { remarkWarning = String(error.response?.data?.message || error.message || error); }
-  }
-  let details = [];
-  try { details = await client.getPackagedOrderDetails([remoteOrderId]); }
-  catch (_) { details = []; }
-  if (!Array.isArray(details) || !details.length) details = await client.getOrderDetails([remoteOrderId]);
-  const detail = Array.isArray(details) ? details[0] : null;
-  const packageId = String(detail?.kjxPackageId || detail?.kjxOrderPackage?.kjxPackageId || '');
-  if (packageId) await client.cancelPackage(packageId);
-  else await client.updateOrderStatus(remoteOrderId,7);
-  return { remoteOrderId,packageId,cancelMethod:packageId ? 'package_cancel' : 'order_status_7',remarkWarning };
+  return cancelShopeexOrder(client,{ remoteOrderId,remark });
 }
 
 async function getOrderExternalUserId(username) {

@@ -116,6 +116,8 @@ assert.ok(serverSource.includes('官方面单未申请成功，请先点击订�
 assert.ok(serverSource.includes('const requestedResubmits = new Set'), 'resubmission must require an explicit order id list');
 assert.ok(!serverSource.includes('requestedResubmit && Number(existing.warehouse_id) === warehouseId'), 'resubmission must allow the current warehouse to be selected again');
 assert.ok(serverSource.includes('oldClient.cancelOrder(existing.provider_order_number || displayOrderId)'), 'a warehouse switch must cancel the previous Yeeke order with the official cancellation endpoint');
+const shopeexCancellationSource = shopeexSource.slice(shopeexSource.indexOf('async function cancelShopeexOrder'),shopeexSource.indexOf('function timestamp'));
+assert.ok(shopeexCancellationSource.includes("cancelMethod:'order_status_7'") && !shopeexCancellationSource.includes('getOrderDetails'), 'Shopeex stock orders without package data must fall back directly to order-status cancellation');
 const submitHandlerSource = serverSource.slice(serverSource.indexOf('async function handleFulfillmentSubmit'),serverSource.indexOf("app.post('/api/admin/fulfillment/submit'"));
 assert.ok(submitHandlerSource.indexOf('await oldClient.cancelOrder') < submitHandlerSource.indexOf('const pushed = await sendOrderToConnector'), 'the old warehouse must be cancelled before creating the replacement order');
 assert.ok(serverSource.includes("['success','failed'].includes(existing.status)"), 'a failed first submission must allow a different warehouse to be selected without charging');

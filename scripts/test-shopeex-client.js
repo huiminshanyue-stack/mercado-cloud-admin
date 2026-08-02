@@ -4,6 +4,7 @@ const {
   SHOPEEX_COUNTRY_IDS,
   buildShopeexEnvelope,
   createShopeexClient,
+  cancelShopeexOrder,
   buildShopeexOrderPayload,
   selectShopeexWarehouseAddress
 } = require('../shopeex-client');
@@ -46,6 +47,27 @@ async function run() {
   assert.strictEqual(calls[6].body.requestBody.kjxOrderStatusId,7);
   await client.addPackageRemark('KJX-1','山月ERP换仓');
   assert.ok(calls[7].url.endsWith('/packaged/addPackageDesp'));
+
+  const unpackagedCalls = [];
+  const unpackagedCancellation = await cancelShopeexOrder({
+    addPackageRemark:async()=>unpackagedCalls.push('remark'),
+    getPackagedOrderDetails:async()=>{ throw new Error('查找不到打包信息!'); },
+    cancelPackage:async()=>unpackagedCalls.push('package'),
+    updateOrderStatus:async(id,status)=>unpackagedCalls.push(`status:${id}:${status}`)
+  },{ remoteOrderId:'KJX-STOCK-1',remark:'换仓' });
+  assert.strictEqual(unpackagedCancellation.cancelMethod,'order_status_7');
+  assert.deepStrictEqual(unpackagedCalls,['remark','status:KJX-STOCK-1:7']);
+
+  const packageFallbackCalls = [];
+  const packageFallbackCancellation = await cancelShopeexOrder({
+    addPackageRemark:async()=>{},
+    getPackagedOrderDetails:async()=>[{ kjxPackageId:'PACKAGE-1' }],
+    cancelPackage:async()=>{ packageFallbackCalls.push('package'); throw new Error('包裹已失效'); },
+    updateOrderStatus:async(id,status)=>packageFallbackCalls.push(`status:${id}:${status}`)
+  },{ remoteOrderId:'KJX-2' });
+  assert.strictEqual(packageFallbackCancellation.cancelMethod,'order_status_7');
+  assert.strictEqual(packageFallbackCancellation.packageCancelError,'包裹已失效');
+  assert.deepStrictEqual(packageFallbackCalls,['package','status:KJX-2:7']);
   const addresses = [
     { storeAddressId: 180, storeName: '浙江 义乌仓', status: 1 },
     { storeAddressId: 1396, storeName: '广东 东莞仓', status: 1 }
