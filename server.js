@@ -59,6 +59,7 @@ const {
   buildYeekeInboundPayload,
   buildShopeexStockPayload,
   normalizeYeekeInbound,
+  selectYeekeInboundRecord,
   normalizeShopeexStock
 } = require('./warehouse-inventory');
 const { initMiniProgramTables, registerMiniProgramRoutes } = require('./wechat-miniprogram');
@@ -3241,7 +3242,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.09',
+    version: '2026-08-02.10',
     deployedCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || '',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
@@ -3267,6 +3268,7 @@ app.get('/api/health/order-management', (req, res) => {
     warehouseInventoryProviders: ['yeeke','shopeex'],
     warehouseInboundUserIsolation: true,
     warehouseInboundReturnsRemoteNumberAndQuantities: true,
+    warehouseInventoryQueryAutoSyncsPendingInbound: true,
     yeekeOfficialInboundOrder: true,
     shopeexInventoryReviewInbound: true,
     fulfillmentShippingModes: ['express','warehouse_stock'],
@@ -7323,14 +7325,77 @@ async function createInventoryProviderClient(connector) {
   throw new Error('当前仓库不支持库存管理接口');
 }
 
+async function refreshYeekePendingInbounds(ownerUsername, connector, client) {
+  const pendingResult = await pool.query(`SELECT id FROM warehouse_inbounds
+    WHERE owner_username=$1 AND warehouse_id=$2
+      AND status=ANY($3::varchar[]) ORDER BY created_at DESC LIMIT 50`,
+  [ownerUsername,connector.id,['submitted','approved','partially_received']]);
+  if (!pendingResult.rows.length) return 0;
+
+  let recentRecords = extractWarehouseRecords(await client.listInbounds({ pageNo:1,pageSize:20,storeStatus:'9' }));
+  let refreshed = 0;
+  for (const pending of pendingResult.rows) {
+    const inbound = await warehouseInboundWithItems(ownerUsername,pending.id);
+    if (!inbound) continue;
+    let record = selectYeekeInboundRecord(recentRecords,inbound);
+    if (!record) {
+      const targetedRecords = extractWarehouseRecords(await client.listInbounds({
+        pageNo:1,pageSize:20,storeStatus:'9',
+        storageBillCode:inbound.remoteInboundNo || undefined,
+        trackingNo:inbound.trackingNumber || undefined
+      }));
+      record = selectYeekeInboundRecord(targetedRecords,inbound) || targetedRecords[0] || null;
+      if (record) recentRecords = recentRecords.concat(record);
+    }
+    if (!record) continue;
+
+    const normalized = normalizeYeekeInbound(record);
+    for (const item of inbound.items) {
+      const remoteItem = (Array.isArray(record.skuItems) ? record.skuItems : []).find(entry =>
+        String(entry.sysCode || '') === String(item.remoteProductId || '')
+        || String(entry.variationSku || '').trim() === String(item.sku || '').trim());
+      const receivedQuantity = Number(remoteItem?.abroadReceiveNum ?? remoteItem?.domesticReceiveNum ?? 0) || 0;
+      await pool.query(`UPDATE warehouse_inbound_items SET received_quantity=$1,remote_status=$2,
+        response_data=$3::jsonb,updated_at=NOW() WHERE id=$4`,
+      [receivedQuantity,String(remoteItem?.status ?? ''),JSON.stringify(remoteItem || {}),item.id]);
+    }
+    const status = normalizedInboundStatus('yeeke',normalized.remoteStatus,normalized.receivedQuantity,Number(inbound.requestedQuantity));
+    await pool.query(`UPDATE warehouse_inbounds SET remote_id=COALESCE(NULLIF($1,''),remote_id),
+      remote_inbound_no=COALESCE(NULLIF($2,''),remote_inbound_no),status=$3,remote_status=$4,
+      received_quantity=$5,response_data=$6::jsonb,error_message=NULL,last_synced_at=NOW(),updated_at=NOW()
+      WHERE id=$7 AND owner_username=$8`,
+    [normalized.remoteId,normalized.remoteInboundNo,status,normalized.remoteStatus,normalized.receivedQuantity,
+      JSON.stringify(normalized.raw),inbound.id,ownerUsername]);
+    refreshed += 1;
+  }
+  return refreshed;
+}
+
 async function getFulfillableWarehouseStock(ownerUsername, connector, { includeExhausted = false } = {}) {
-  const localResult = await pool.query(`SELECT i.remote_product_id AS "remoteProductId",i.sku,
+  let localResult = await pool.query(`SELECT i.remote_product_id AS "remoteProductId",i.sku,
     MAX(i.product_name) AS "productName",MAX(i.image) AS image,
     SUM(i.received_quantity)::int AS "receivedQuantity"
     FROM warehouse_inbound_items i JOIN warehouse_inbounds w ON w.id=i.inbound_id
     WHERE w.owner_username=$1 AND w.warehouse_id=$2 AND w.status='received'
       AND i.received_quantity>0 AND NULLIF(i.remote_product_id,'') IS NOT NULL
     GROUP BY i.remote_product_id,i.sku`,[ownerUsername,connector.id]);
+  const pendingYeekeResult = connector.provider === 'yeeke'
+    ? await pool.query(`SELECT 1 FROM warehouse_inbounds WHERE owner_username=$1 AND warehouse_id=$2
+        AND status=ANY($3::varchar[]) LIMIT 1`,[ownerUsername,connector.id,['submitted','approved','partially_received']])
+    : { rows:[] };
+  if (!localResult.rows.length && !pendingYeekeResult.rows.length) return [];
+
+  const { client,config } = await createInventoryProviderClient(connector);
+  if (pendingYeekeResult.rows.length) {
+    await refreshYeekePendingInbounds(ownerUsername,connector,client);
+    localResult = await pool.query(`SELECT i.remote_product_id AS "remoteProductId",i.sku,
+      MAX(i.product_name) AS "productName",MAX(i.image) AS image,
+      SUM(i.received_quantity)::int AS "receivedQuantity"
+      FROM warehouse_inbound_items i JOIN warehouse_inbounds w ON w.id=i.inbound_id
+      WHERE w.owner_username=$1 AND w.warehouse_id=$2 AND w.status='received'
+        AND i.received_quantity>0 AND NULLIF(i.remote_product_id,'') IS NOT NULL
+      GROUP BY i.remote_product_id,i.sku`,[ownerUsername,connector.id]);
+  }
   if (!localResult.rows.length) return [];
 
   const usedResult = await pool.query(`SELECT stock_allocations FROM fulfillment_submissions
@@ -7343,7 +7408,6 @@ async function getFulfillableWarehouseStock(ownerUsername, connector, { includeE
     }
   }
 
-  const { client,config } = await createInventoryProviderClient(connector);
   const remote = connector.provider === 'yeeke'
     ? await client.listStock({ pageNo:1,pageSize:100,wareHouse:config.warehouseCode })
     : await client.listStock({ pageNumber:1,pageSize:20,stockPlusDeliveryId:Number(config.storeAddressId),status:2,arrivedStore:1 });

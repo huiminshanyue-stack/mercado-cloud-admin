@@ -14,6 +14,8 @@ assert.ok(server.includes("app.post('/api/admin/warehouse-inbounds/:id/sync', re
 assert.ok(server.includes('w.owner_username=$1 AND w.id=$2'), 'inbound detail must be isolated by owner');
 assert.ok(server.includes("['yeeke','shopeex']"), 'only supported official warehouse providers may be used');
 assert.ok(server.includes('client.createOrUpdateInbound(payload)'), 'Yeeke official inbound endpoint must be called');
+assert.ok(server.includes('refreshYeekePendingInbounds(ownerUsername,connector,client)'), 'inventory query must automatically refresh current-user pending Yeeke inbounds');
+assert.ok(server.includes("warehouseInventoryQueryAutoSyncsPendingInbound: true"), 'health metadata must expose automatic pending inbound synchronization');
 assert.ok(server.includes('client.addOrUpdateStock(payload)'), 'Shopeex official stock creation endpoint must be called');
 assert.ok(server.includes("fulfillment_mode VARCHAR(20) NOT NULL DEFAULT 'express'"), 'fulfillment mode must be persisted');
 assert.ok(server.includes("stock_allocations JSONB NOT NULL DEFAULT '[]'::jsonb"), 'stock allocations must be persisted');

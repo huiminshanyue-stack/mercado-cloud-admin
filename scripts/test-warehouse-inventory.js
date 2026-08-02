@@ -7,6 +7,7 @@ const {
   takeStockAllocations,
   validateFulfillmentStockAllocations,
   normalizeYeekeInbound,
+  selectYeekeInboundRecord,
   normalizeShopeexStock
 } = require('../warehouse-inventory');
 
@@ -80,6 +81,13 @@ const yi = normalizeYeekeInbound({ id: 5, storageBillCode: 'RK100', status: 4, c
 assert.strictEqual(yi.remoteInboundNo, 'RK100');
 assert.strictEqual(yi.requestedQuantity, 5);
 assert.strictEqual(yi.receivedQuantity, 4);
+const matchedYeekeInbound = selectYeekeInboundRecord([
+  { id:'REMOTE-1',storageBillCode:'S1',trackingNo:'YT1' },
+  { id:'REMOTE-2',storageBillCode:'S2',trackingNo:'YT2' }
+],{ remoteId:'',remoteInboundNo:'',trackingNumber:'YT2' });
+assert.strictEqual(matchedYeekeInbound.id,'REMOTE-2');
+assert.strictEqual(selectYeekeInboundRecord([{ id:'REMOTE-1' }],{ remoteId:'REMOTE-1' }).id,'REMOTE-1');
+assert.strictEqual(selectYeekeInboundRecord([{ storageBillCode:'S1' }],{ remoteInboundNo:'S1' }).storageBillCode,'S1');
 
 const si = normalizeShopeexStock({ stockPlusId: 8, trackingNumber: 'KC100', status: 2,
   arrivedStore: 1, skuNum: 6, trackingAmount: 5, itemNo: 'SKU-3',

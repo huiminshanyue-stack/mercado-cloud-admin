@@ -199,6 +199,17 @@ function normalizeYeekeInbound(record = {}) {
   };
 }
 
+function selectYeekeInboundRecord(records, inbound = {}) {
+  const list = Array.isArray(records) ? records : [];
+  const remoteId = String(inbound.remoteId || '').trim();
+  const remoteInboundNo = String(inbound.remoteInboundNo || '').trim();
+  const trackingNumber = String(inbound.trackingNumber || '').trim();
+  return list.find(record => remoteId && String(record?.id || '').trim() === remoteId)
+    || list.find(record => remoteInboundNo && String(record?.storageBillCode || record?.sotrageBillCode || '').trim() === remoteInboundNo)
+    || list.find(record => trackingNumber && String(record?.trackingNo || '').trim() === trackingNumber)
+    || null;
+}
+
 function normalizeShopeexStock(record = {}) {
   const warehouseLocation = String(record.stockLocation || '').trim()
     || [record.stockAreaCodeTitle,record.stockGoodsCodeTitle,record.locationNo]
@@ -230,5 +241,6 @@ module.exports = {
   buildYeekeInboundPayload,
   buildShopeexStockPayload,
   normalizeYeekeInbound,
+  selectYeekeInboundRecord,
   normalizeShopeexStock
 };
