@@ -56,6 +56,7 @@ function registerMiniProgramRoutes(app, dependencies) {
     isUserExpired,
     loginRateLimit,
     getOrderListData,
+    syncOrdersForUser,
     getMiniOrderWorkbenchSummaryData,
     getOrderStoresData,
     getFulfillmentOptionsData,
@@ -158,7 +159,7 @@ function registerMiniProgramRoutes(app, dependencies) {
       wechatLoginEnabled: Boolean(appSecret),
       erpTestLoginEnabled: true,
       writeOperationsEnabled: true,
-      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit','fulfillment_express_update'],
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','order_sync','fulfillment_submit','fulfillment_express_update'],
       environment: process.env.NODE_ENV || 'production'
     } });
   });
@@ -233,7 +234,7 @@ function registerMiniProgramRoutes(app, dependencies) {
       authSource: req.miniAuth.source,
       user: req.authUser || null,
       writeOperationsEnabled: true,
-      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit','fulfillment_express_update']
+      allowedWrites: ['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','order_sync','fulfillment_submit','fulfillment_express_update']
     } });
   });
 
@@ -350,6 +351,19 @@ function registerMiniProgramRoutes(app, dependencies) {
       if (!data.items.length) return res.status(404).json({ code: 404, message: '订单不存在或无权查看' });
       res.json({ code: 0, data: data.items[0] });
     } catch (error) { res.status(500).json({ code: 500, message: error.message || '读取订单详情失败' }); }
+  });
+
+  app.post('/api/miniprogram/v1/orders/:orderId/sync',requireBoundOrderUser,async (req,res) => {
+    try {
+      const orderId = String(req.params.orderId || '').trim();
+      const storeId = String(req.body?.storeId || '').trim();
+      if (!orderId || !storeId) return res.status(400).json({ code:400,message:'同步订单需要订单号和所属店铺' });
+      const data = await syncOrdersForUser(req.authUser,{ storeId,orderId,limit:1,strictSingle:true });
+      res.json({ code:0,data });
+    } catch (error) {
+      const status = Number(error.status) || Number(error.response?.status) || 502;
+      res.status(status).json({ code:status,message:error.response?.data?.message || error.message || '同步订单失败' });
+    }
   });
 
   app.get('/api/miniprogram/v1/fulfillment-options',requireBoundOrderUser,async (req,res) => {

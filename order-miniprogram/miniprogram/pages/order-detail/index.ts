@@ -3,8 +3,8 @@ import { cancellationText,countryInfo,deadlineText,dimensionSummary,dimensionWei
 
 Page({
   data:{
-    loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false,
-    fulfillmentOptionsLoading:false,fulfillmentSubmitting:false,fulfillmentExpressEditing:false,fulfillmentExpressUpdating:false,
+    loading:true,dimensionRefreshing:false,order:null as any,displayOrderId:'',loadedOnce:false,orderSyncing:false,
+    fulfillmentOptionsLoading:false,fulfillmentSubmitting:false,fulfillmentResubmit:false,fulfillmentExpressEditing:false,fulfillmentExpressUpdating:false,
     warehouses:[] as any[],carriers:[] as any[],allCarriers:[] as any[],shopeexCarriers:[] as any[],warehouseNames:[] as string[],carrierNames:[] as string[],
     warehouseIndex:0,carrierIndex:0,
     fulfillmentForm:{ trackingNumber:'',quantity:'1',remark:'' }
@@ -59,6 +59,9 @@ Page({
         canSubmitFulfillment:raw.status !== 'cancelled'
           && Number(raw.refundAmount || 0) <= 0
           && raw.shipmentStatus === 'ready_to_ship',
+        canResubmitFulfillment:raw.status !== 'cancelled'
+          && Number(raw.refundAmount || 0) <= 0
+          && ['success','failed'].includes(String(raw.fulfillmentSubmission?.status || '')),
         totalQuantity:products.reduce((total:number,item:any)=>total + Math.max(1,Number(item.quantity || 1)),0) || 1
       } });
       if (!raw.fulfillmentSubmission) {
@@ -89,13 +92,13 @@ Page({
     const warehouseIndex=Number(event.detail.value || 0);
     this.setData({ warehouseIndex },()=>this.refreshCarrierChoices(warehouseIndex));
   },
-  refreshCarrierChoices(warehouseIndex:number) {
+  refreshCarrierChoices(warehouseIndex:number,preferredCarrier='') {
     const warehouse=this.data.warehouses[warehouseIndex];
     const carriers=warehouse?.provider === 'shopeex' ? this.data.shopeexCarriers : this.data.allCarriers;
     this.setData({
       carriers,
       carrierNames:carriers.map((item:any)=>warehouse?.provider === 'shopeex' ? `${item.name}（${item.code}）` : item.name),
-      carrierIndex:0
+      carrierIndex:Math.max(0,carriers.findIndex((item:any)=>item.name === preferredCarrier))
     });
   },
   onCarrierChange(event:WechatMiniprogram.PickerChange) {
@@ -108,7 +111,11 @@ Page({
   },
   async submitFulfillment() {
     const order=this.data.order;
-    if (!order?.canSubmitFulfillment || order.fulfillmentSubmission) return;
+    const resubmitting=Boolean(this.data.fulfillmentResubmit);
+    const existingStatus=String(order?.fulfillmentSubmission?.status || '');
+    const canSubmit=Boolean(order?.canSubmitFulfillment && !order.fulfillmentSubmission);
+    const canResubmit=Boolean(resubmitting && order?.canResubmitFulfillment && ['success','failed'].includes(existingStatus));
+    if (!canSubmit && !canResubmit) return;
     const warehouse=this.data.warehouses[this.data.warehouseIndex];
     const carrier=this.data.carriers[this.data.carrierIndex];
     const trackingNumber=String(this.data.fulfillmentForm.trackingNumber || '').trim();
@@ -138,13 +145,48 @@ Page({
           carrierCode:warehouse.provider === 'shopeex' ? String(carrier.code || '') : '',serviceIds:[],
           trackingByOrder:{ [orderId]:trackingNumber },
           quantityByOrder:{ [orderId]:quantity },
-          remarkByOrder:{ [orderId]:remark }
+          remarkByOrder:{ [orderId]:remark },
+          resubmitOrderIds:resubmitting ? [orderId] : []
         }
       });
+      this.setData({ fulfillmentResubmit:false });
       await this.loadOrder();
       wx.showToast({ title:'代贴单已提交',icon:'success' });
     } catch (error) { showError(error); }
     finally { wx.hideLoading();this.setData({ fulfillmentSubmitting:false }); }
+  },
+  startFulfillmentResubmit() {
+    const order=this.data.order;
+    const submission=order?.fulfillmentSubmission;
+    if (!order?.canResubmitFulfillment || !submission || !['success','failed'].includes(String(submission.status || ''))) return;
+    const warehouseIndex=Math.max(0,this.data.warehouses.findIndex((item:any)=>
+      String(item.id) === String(submission.warehouseId || '') || item.name === submission.warehouseName));
+    this.setData({
+      fulfillmentResubmit:true,fulfillmentExpressEditing:false,warehouseIndex,
+      fulfillmentForm:{
+        trackingNumber:String(submission.trackingNumber || ''),
+        quantity:String(submission.shippingQuantity || order.totalQuantity || 1),
+        remark:String(submission.shippingRemark || '')
+      }
+    },()=>this.refreshCarrierChoices(warehouseIndex,String(submission.carrier || '')));
+  },
+  cancelFulfillmentResubmit() { this.setData({ fulfillmentResubmit:false }); },
+  async syncOrder() {
+    const order=this.data.order;
+    const orderId=String(order?.displayOrderId || order?.orderId || '');
+    const storeId=String(order?.storeId || '');
+    if (this.data.orderSyncing || !orderId || !storeId) return wx.showToast({ title:'未找到订单所属店铺',icon:'none' });
+    this.setData({ orderSyncing:true });
+    wx.showLoading({ title:'正在同步',mask:true });
+    try {
+      await request<any>({
+        path:`/api/miniprogram/v1/orders/${encodeURIComponent(orderId)}/sync`,method:'POST',timeout:60000,
+        data:{ storeId }
+      });
+      await this.loadOrder();
+      wx.showToast({ title:'订单已同步',icon:'success' });
+    } catch (error) { showError(error); }
+    finally { wx.hideLoading();this.setData({ orderSyncing:false }); }
   },
   startExpressUpdate() {
     const submission=this.data.order?.fulfillmentSubmission;

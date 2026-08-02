@@ -9175,7 +9175,7 @@ async function start() {
   });
   await mercadoLibreWebhookService.init();
   mercadoLibreWebhookService.registerRoutes(app);
-  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,getMiniOrderWorkbenchSummaryData,getOrderStoresData,refreshOrderDimensionsData,
+  registerMiniProgramRoutes(app,{ pool,isUserExpired,loginRateLimit,getOrderListData,syncOrdersForUser,getMiniOrderWorkbenchSummaryData,getOrderStoresData,refreshOrderDimensionsData,
     getFulfillmentOptionsData,submitFulfillmentRequest:handleFulfillmentSubmit,
     updateFulfillmentExpressRequest:handleFulfillmentExpressUpdate,
     updateOrderCostData,getOrderInquiriesData,getOrderAfterSalesData,getOrderMessagesData,sendOrderMessageData,

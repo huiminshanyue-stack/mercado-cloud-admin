@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const { DEFAULT_APP_ID,tokenHash,canTestOrders,describeWechatLoginError,registerMiniProgramRoutes } = require('../wechat-miniprogram');
 
 assert.equal(DEFAULT_APP_ID,'wx0f97428df87ee76e');
@@ -12,6 +13,13 @@ assert.equal(canTestOrders({ role:'user',username:'cntoro' }),true);
 assert.equal(canTestOrders({ role:'user',username:'other' }),false);
 assert.match(describeWechatLoginError({ errcode:40164,errmsg:'invalid ip 152.55.177.79' }),/API IP 白名单/);
 assert.equal(describeWechatLoginError({ errcode:40029,errmsg:'invalid code' }),'微信登录凭证已失效，请重新点击微信登录');
+const orderDetailScript=fs.readFileSync(require.resolve('../order-miniprogram/miniprogram/pages/order-detail/index.ts'),'utf8');
+const orderDetailMarkup=fs.readFileSync(require.resolve('../order-miniprogram/miniprogram/pages/order-detail/index.wxml'),'utf8');
+assert.match(orderDetailScript,/path:`\/api\/miniprogram\/v1\/orders\/\$\{encodeURIComponent\(orderId\)\}\/sync`/);
+assert.match(orderDetailScript,/resubmitOrderIds:resubmitting \? \[orderId\] : \[\]/);
+assert.match(orderDetailScript,/canResubmitFulfillment/);
+assert.match(orderDetailMarkup,/bindtap="syncOrder"/);
+assert.match(orderDetailMarkup,/fulfillmentResubmit && order\.canResubmitFulfillment/);
 
 function responseRecorder() {
   return {
@@ -39,7 +47,7 @@ async function runHandlers(handlers,req,res) {
 
 async function testRoutes() {
   process.env.WECHAT_MINIPROGRAM_SECRET='test-mini-secret';
-  const routes=new Map(),listCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],fulfillmentOptionCalls=[],fulfillmentSubmitCalls=[],fulfillmentExpressUpdateCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
+  const routes=new Map(),listCalls=[],syncCalls=[],summaryCalls=[],dimensionCalls=[],costCalls=[],fulfillmentOptionCalls=[],fulfillmentSubmitCalls=[],fulfillmentExpressUpdateCalls=[],inquirySendCalls=[],claimSendCalls=[],messageTranslationCalls=[],followerSyncCalls=[],bindingNotifications=[];
   const app={
     get(path,...handlers) { routes.set(`GET ${path}`,handlers); },
     post(path,...handlers) { routes.set(`POST ${path}`,handlers); },
@@ -81,6 +89,10 @@ async function testRoutes() {
     getOrderListData:async (user,query) => {
       listCalls.push({ user,query });
       return { items:[{ orderId:'order-1' }],total:1,page:1,size:20 };
+    },
+    syncOrdersForUser:async (user,body) => {
+      syncCalls.push({ user,body });
+      return { matched:1,updated:1,orderId:body.orderId };
     },
     getMiniOrderWorkbenchSummaryData:async (user,query) => {
       summaryCalls.push({ user,query });
@@ -141,7 +153,7 @@ async function testRoutes() {
   assert.equal(configRes.statusCode,200);
   assert.equal(configRes.body.data.appId,DEFAULT_APP_ID);
   assert.equal(configRes.body.data.writeOperationsEnabled,true);
-  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','fulfillment_submit','fulfillment_express_update']);
+  assert.deepEqual(configRes.body.data.allowedWrites,['order_cost','inquiry_reply','after_sales_reply','dimension_refresh','order_sync','fulfillment_submit','fulfillment_express_update']);
 
   const anonymousRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/orders'),{ headers:{},query:{} },anonymousRes);
@@ -162,6 +174,23 @@ async function testRoutes() {
   assert.equal(listCalls.length,1);
   assert.equal(listCalls[0].user.username,'CNTORO');
   assert.deepEqual(listCalls[0].query,{ page:'2',storeId:'store-1' });
+
+  const syncRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/orders/:orderId/sync'),{
+    headers:{ authorization:'Bearer cntoro-token' },params:{ orderId:'order-1' },body:{ storeId:'store-1' }
+  },syncRes);
+  assert.equal(syncRes.statusCode,200);
+  assert.equal(syncRes.body.data.updated,1);
+  assert.equal(syncCalls.length,1);
+  assert.equal(syncCalls[0].user.username,'CNTORO');
+  assert.deepEqual(syncCalls[0].body,{ storeId:'store-1',orderId:'order-1',limit:1,strictSingle:true });
+
+  const invalidSyncRes=responseRecorder();
+  await runHandlers(routes.get('POST /api/miniprogram/v1/orders/:orderId/sync'),{
+    headers:{ authorization:'Bearer cntoro-token' },params:{ orderId:'order-1' },body:{}
+  },invalidSyncRes);
+  assert.equal(invalidSyncRes.statusCode,400);
+  assert.equal(syncCalls.length,1);
 
   const summaryRes=responseRecorder();
   await runHandlers(routes.get('GET /api/miniprogram/v1/order-workbench-summary'),{
