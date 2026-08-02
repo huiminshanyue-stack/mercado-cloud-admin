@@ -2,6 +2,7 @@ const assert = require('assert');
 const {
   buildYeekeEnvelope,
   createYeekeClient,
+  YEEKE_SWITCH_CANCELLATION_NOTICE,
   buildYeekeErpOrderNumber,
   buildYeekeResubmitOrderNumber,
   buildYeekeOrderPayload,
@@ -155,7 +156,9 @@ async function run() {
   assert.strictEqual(payload.erpOrderSn, 'SY12345');
   assert.strictEqual(payload.sysUserNote, 'SY12345');
   assert.strictEqual(payload.goodsType, undefined);
-  assert.strictEqual(payload.note, '山月ERP SY12345');
+  assert.strictEqual(payload.note, `山月ERP SY12345；${YEEKE_SWITCH_CANCELLATION_NOTICE}`);
+  assert.match(payload.note, /取消或取消中/);
+  assert.match(payload.note, /立即停止处理旧单/);
   assert.strictEqual(payload.pdfString, 'JVBERi0xLjQ=');
   assert.strictEqual(payload.trackingNo, 'INTL-ML-9988');
   assert.strictEqual(payload.shippingCarrier, 'MEL Distribution');

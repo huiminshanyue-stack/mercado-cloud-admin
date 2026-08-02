@@ -4,6 +4,11 @@ const { createStockAllocationPool,takeStockAllocations } = require('./warehouse-
 
 const YEEKE_API_PREFIX = '/agent-foreign/erp/api';
 const DEFAULT_YEEKE_BASE_URL = 'https://mi.yeeke.com';
+// Yeeke's public cancellation endpoint only accepts ordersn + status=7 and
+// cannot append a remark to an existing order. Put this standing instruction
+// on creation so warehouse operators know that a later cancellation means the
+// order has been switched away and must no longer be processed.
+const YEEKE_SWITCH_CANCELLATION_NOTICE = '订单若变为取消或取消中，表示已换仓，请立即停止处理旧单';
 
 function buildYeekeEnvelope(appId, appSecret, data) {
   if (!appId || !appSecret) throw new Error('Yeeke appId/appSecret 未配置');
@@ -356,7 +361,7 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
     // Keep the camel-case spelling accepted by newer Yeeke deployments for the
     // third-party order number; older deployments continue to read erpOrdersn.
     erpOrderSn: identity,
-    note: externalUserId ? `山月ERP ${identity}` : '山月ERP',
+    note: `${externalUserId ? `山月ERP ${identity}` : '山月ERP'}；${YEEKE_SWITCH_CANCELLATION_NOTICE}`,
     // Yeeke renders sysUserNote in the order metadata area beneath the goods
     // status. Keep goodsType numeric (1 = 普货) and use this text field for
     // the stable Shanyue user identity instead.
@@ -385,6 +390,7 @@ function buildYeekeOrderPayload({ row, rows, warehouseCode, carrier, trackingNum
 module.exports = {
   DEFAULT_YEEKE_BASE_URL,
   YEEKE_API_PREFIX,
+  YEEKE_SWITCH_CANCELLATION_NOTICE,
   buildYeekeEnvelope,
   createYeekeClient,
   buildYeekeErpOrderNumber,
