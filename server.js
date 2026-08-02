@@ -3241,7 +3241,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.08',
+    version: '2026-08-02.09',
     deployedCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || '',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
@@ -3298,6 +3298,7 @@ app.get('/api/health/order-management', (req, res) => {
     batchLabelPrintScope: 'current-user-ready-to-ship-orders',
     batchLabelPrintOutput: 'single-merged-pdf',
     fulfillmentFailureActionFeedback: true,
+    orderOperationNotifications: 'viewport-top-right',
     fulfillmentFailedSubmissionCanChangeWarehouse: true,
     fulfillmentSubmissionAllowedShipmentStatus: 'ready_to_ship',
     fulfillmentSubmissionTerminalStatusBlocked: true,
