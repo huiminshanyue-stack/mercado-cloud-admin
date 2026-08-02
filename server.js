@@ -2,6 +2,7 @@ const express = require('express');
 const { canAccessOrderManagement, formatWarehouseAddressForUser } = require('./order-warehouse-policy');
 const { fulfillmentSubmissionEligibility } = require('./order-fulfillment-policy');
 const { calculateFulfillmentBillingTransition } = require('./fulfillment-billing');
+const { resolveFulfillmentModeRequest } = require('./fulfillment-mode-policy');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -3267,7 +3268,7 @@ function extractReputationInfo(rawData) {
 
 app.get('/api/health/order-management', (req, res) => {
   res.json({ code: 0, data: {
-    version: '2026-08-02.04',
+    version: '2026-08-02.05',
     deployedCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || '',
     multiStoreLabelOperations: true,
     orderLabelAuthorizationScope: 'per-order-store',
@@ -3296,6 +3297,9 @@ app.get('/api/health/order-management', (req, res) => {
     yeekeOfficialInboundOrder: true,
     shopeexInventoryReviewInbound: true,
     fulfillmentShippingModes: ['express','warehouse_stock'],
+    fulfillmentDefaultShippingMode: 'express',
+    fulfillmentStockModeRequiresCurrentDialogConfirmation: true,
+    fulfillmentExpressRejectsStockAllocations: true,
     fulfillmentStockOnlyReceivedInventory: true,
     fulfillmentStockUserOwnedOnly: true,
     fulfillmentStockAvailabilityLimit: 'min(user_received_minus_allocated,remote_available)',
@@ -8105,12 +8109,16 @@ app.post('/api/admin/fulfillment-agent-rebates/:id/settle', requireAdmin, async 
 async function handleFulfillmentSubmit(req, res) {
   const orderIds = [...new Set((Array.isArray(req.body?.orderIds) ? req.body.orderIds : []).map(String).filter(Boolean))];
   const requestedResubmits = new Set((Array.isArray(req.body?.resubmitOrderIds) ? req.body.resubmitOrderIds : []).map(String).filter(Boolean));
-  const fulfillmentMode = req.body?.fulfillmentMode === 'stock' ? 'stock' : 'express';
+  let fulfillmentMode,stockByOrder;
+  try {
+    ({ fulfillmentMode,stockByOrder } = resolveFulfillmentModeRequest(req.body || {}));
+  } catch (error) {
+    return res.status(400).json({ code:400,message:error.message });
+  }
   const warehouseId = Number(req.body?.warehouseId);
   const carrier = fulfillmentMode === 'stock' ? '仓库库存发货' : String(req.body?.carrier || '').trim();
   const trackingByOrder = req.body?.trackingByOrder || {};
   const quantityByOrder = req.body?.quantityByOrder || {};
-  const stockByOrder = req.body?.stockByOrder || {};
   const remarkByOrder = req.body?.remarkByOrder || {};
   const serviceIds = (req.body?.serviceIds || []).map(Number).filter(Number.isFinite);
   if (!orderIds.length) return res.status(400).json({ code: 400, message: '请先选择需要提交代贴单的订单' });
@@ -8176,6 +8184,16 @@ async function handleFulfillmentSubmit(req, res) {
     if (!eligibility.allowed) { results.push({ orderId:displayOrderId,success:false,message:eligibility.message }); continue; }
     const trackingNumber = fulfillmentMode === 'stock' ? '' : String(trackingByOrder[displayOrderId] || '').trim();
     if (fulfillmentMode === 'express' && !trackingNumber) { results.push({ orderId: displayOrderId, success: false, message: '缺少国内快递单号，请填写后重新推送' }); continue; }
+    const internationalTrackingNumbers = new Set(orderResult.rows.flatMap(row => {
+      const raw = row.raw_data && typeof row.raw_data === 'object' ? row.raw_data : {};
+      return [row.tracking_number,raw?._shipment_detail?.tracking_number,raw?.shipping?.tracking_number,raw?.shipping?.tracking_no]
+        .map(value => String(value || '').trim()).filter(Boolean);
+    }));
+    if (fulfillmentMode === 'express' && internationalTrackingNumbers.has(trackingNumber)) {
+      results.push({ orderId:displayOrderId,success:false,
+        message:`${trackingNumber} 是美客多国际物流单号，不是发往仓库的国内快递单号；请填写国内快递公司实际揽收的快递号` });
+      continue;
+    }
     const maximumShippingQuantity = fulfillmentOrderQuantity(orderResult.rows);
     let stockAllocations = [];
     try {

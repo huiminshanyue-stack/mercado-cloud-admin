@@ -91,6 +91,8 @@ assert.ok((serverSource.match(/fulfillmentSubmissionEligibility\(orderResult\.ro
 assert.ok(serverSource.includes('请先选择需要提交代贴单的订单') && serverSource.includes('请选择要提交的仓库') && serverSource.includes('请选择国内物流公司'), 'missing submit parameters must return field-specific feedback');
 assert.ok(serverSource.includes('国内物流公司“${carrier}”缺少 Shopeex/KJX 快递代码') && serverSource.includes('国内物流公司“${submission.carrier}”缺少 Shopeex/KJX 快递代码'), 'new and retry submissions must identify the carrier whose Shopeex code is missing');
 assert.ok(serverSource.includes('quantityByOrder') && serverSource.includes('remarkByOrder'), 'shipping quantity and courier remarks must be accepted per order');
+assert.ok(serverSource.includes('resolveFulfillmentModeRequest(req.body || {})'), 'the backend must normalize and validate the requested fulfillment mode');
+assert.ok(serverSource.includes('是美客多国际物流单号，不是发往仓库的国内快递单号'), 'international tracking numbers must never be reused as domestic warehouse courier numbers');
 assert.ok(serverSource.includes('发货数量必须是 1 至') && serverSource.includes('快递备注不能超过 500 个字'), 'shipping quantity and remark validation must be actionable');
 assert.ok(yeekeSource.includes('erpOrdersn: identity') && yeekeSource.includes('erpOrderSn: identity') && yeekeSource.includes('shopID: identity') && yeekeSource.includes('sysUserNote: externalUserId ? identity') && !yeekeSource.includes('shopId: identity') && yeekeSource.includes('`山月ERP ${identity}`'), 'Yeeke identity must use third-party, system-note, and shopID fields without populating shopName');
 assert.ok(yeekeSource.includes('trackingNo: officialTrackingNumber') && yeekeSource.includes('domesticTrackingNumber && sendQuantity'), 'international and domestic tracking numbers must use separate Yeeke fields');
@@ -156,6 +158,7 @@ assert.ok(!orderFrontendSource.includes(':disabled="fulfillmentResubmitMode && S
 assert.ok(orderFrontendSource.includes('fulfillmentReturn') && orderFrontendSource.includes('仓库退单'), 'returned warehouse orders must render a visible return marker');
 assert.ok(orderFrontendSource.includes('发货数量') && orderFrontendSource.includes('随国内快递一起推送'), 'the web fulfillment dialog must collect shipping quantity and courier remarks');
 assert.ok(orderFrontendSource.includes('quantityByOrder') && orderFrontendSource.includes('remarkByOrder'), 'the web fulfillment request must send quantity and remark maps');
+assert.ok(orderFrontendSource.includes('stockModeConfirmed') && orderFrontendSource.includes('当前窗口主动选择'), 'stock fulfillment must require an explicit current-dialog selection');
 assert.ok(orderFrontendSource.includes('修改原订单国内快递号') && orderFrontendSource.includes('/api/admin/fulfillment/update-express'), 'the web workbench must expose original-order courier correction');
 assert.ok(orderFrontendSource.includes('www.kuaidi100.com/chaxun'), 'domestic tracking must open a prefilled Kuaidi100 web query');
 assert.ok(orderFrontendSource.includes('zhongtong') && orderFrontendSource.includes('shunfeng') && orderFrontendSource.includes('jtexpress'), 'common domestic carriers must be mapped for automatic query filling');
