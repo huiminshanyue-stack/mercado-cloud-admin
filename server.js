@@ -4384,6 +4384,160 @@ app.get('/api/admin/order-stores', requireOrderAccess, async (req, res) => {
   catch (error) { res.status(500).json({ code: 500, message: error.message || '读取授权店铺失败' }); }
 });
 
+// Temporary read-only bridge for one-time capture of the exact Mercado Libre
+// response body. It bypasses all application normalizers and audit/read flags.
+const OFFICIAL_RAW_CAPTURE_KINDS = new Set([
+  'orders_search', 'order_detail', 'shipment', 'shipment_tracking',
+  'order_messages', 'questions_search', 'question_detail',
+  'claims_search', 'claim_detail', 'claim_messages', 'missed_feeds'
+]);
+
+function officialRawCaptureId(value, name, { allowEmpty = false } = {}) {
+  const normalized = String(value || '').trim();
+  if (!normalized && allowEmpty) return '';
+  if (!normalized || !/^[A-Za-z0-9][A-Za-z0-9:_-]{0,159}$/.test(normalized)) {
+    const error = new Error(`invalid ${name}`);
+    error.status = 400;
+    throw error;
+  }
+  return normalized;
+}
+
+function officialRawCaptureInt(value, name, fallback, minimum, maximum) {
+  const normalized = String(value ?? '').trim();
+  if (!normalized) return fallback;
+  if (!/^\d+$/.test(normalized)) {
+    const error = new Error(`invalid ${name}`);
+    error.status = 400;
+    throw error;
+  }
+  const number = Number(normalized);
+  if (!Number.isSafeInteger(number) || number < minimum || number > maximum) {
+    const error = new Error(`invalid ${name}`);
+    error.status = 400;
+    throw error;
+  }
+  return number;
+}
+
+function officialRawCaptureTopic(value) {
+  const topic = String(value || '').trim();
+  if (!topic) return '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9_/-]{0,79}$/.test(topic)) {
+    const error = new Error('invalid topic');
+    error.status = 400;
+    throw error;
+  }
+  return topic;
+}
+
+async function sendOfficialRawCaptureResponse(res, url, token, requestHeaders, params) {
+  try {
+    const response = await axios.get(url, {
+      params,
+      headers: { Authorization: `Bearer ${token}`, ...(requestHeaders || {}) },
+      responseType: 'arraybuffer',
+      transformResponse: [data => data],
+      validateStatus: () => true,
+      timeout: 30000
+    });
+    const body = Buffer.isBuffer(response.data)
+      ? response.data
+      : Buffer.from(response.data == null ? '' : String(response.data));
+    const contentType = response.headers?.['content-type'];
+    if (contentType) res.set('Content-Type', contentType);
+    res.set('Cache-Control', 'private, no-store');
+    res.set('X-Official-Response-Status', String(response.status));
+    return res.status(response.status).send(body);
+  } catch (error) {
+    res.set('Content-Type', 'text/plain; charset=utf-8');
+    res.set('X-Official-Proxy-Error', 'transport');
+    return res.status(502).send(`OFFICIAL_PROXY_TRANSPORT_ERROR: ${String(error.code || error.message || error).slice(0, 300)}`);
+  }
+}
+
+app.get('/api/admin/official-raw', requireAdmin, async (req, res) => {
+  try {
+    const kind = String(req.query.kind || '').trim();
+    if (!OFFICIAL_RAW_CAPTURE_KINDS.has(kind)) return res.status(400).json({ code: 400, message: 'invalid kind' });
+    const storeId = officialRawCaptureId(req.query.storeId, 'storeId');
+    const context = await getOrderStoreContext(req.authUser, storeId);
+    if (!context) return res.status(404).json({ code: 404, message: 'store authorization unavailable' });
+    const authorization = context.authorization || {};
+    const globalSelling = isGlobalSellingAuthorization(authorization);
+    const base = 'https://api.mercadolibre.com';
+    const id = () => officialRawCaptureId(req.query.id, 'id');
+    const limit = officialRawCaptureInt(req.query.limit, 'limit', 50, 1, 50);
+    const offset = officialRawCaptureInt(req.query.offset, 'offset', 0, 0, 1000000);
+    const sellerCandidates = await getOrderMarketplaceSellerIds(req.authUser.username, storeId);
+    const requestedSellerId = String(req.query.sellerId || '').trim();
+    const sellerId = requestedSellerId && sellerCandidates.includes(requestedSellerId)
+      ? requestedSellerId : String(context.sellerId);
+    let url = '';
+    let params = {};
+    let headers = {};
+    switch (kind) {
+      case 'orders_search':
+        url = `${base}/${globalSelling ? 'marketplace/orders/search' : 'orders/search'}`;
+        params = { sort: 'date_desc', limit, offset, ...(globalSelling ? {} : { seller: sellerId }) };
+        break;
+      case 'order_detail':
+        url = `${base}/${globalSelling ? 'marketplace/orders' : 'orders'}/${encodeURIComponent(id())}`;
+        break;
+      case 'shipment':
+        url = `${base}/${globalSelling ? 'marketplace/shipments' : 'shipments'}/${encodeURIComponent(id())}`;
+        headers = { 'x-format-new': 'true' };
+        break;
+      case 'shipment_tracking':
+        url = `${base}/${globalSelling ? 'marketplace/shipments' : 'shipments'}/${encodeURIComponent(id())}/tracking`;
+        break;
+      case 'order_messages':
+        url = globalSelling
+          ? `${base}/marketplace/messages/packs/${encodeURIComponent(id())}`
+          : `${base}/messages/packs/${encodeURIComponent(id())}/sellers/${encodeURIComponent(sellerId)}`;
+        params = orderPackMessagesParams(authorization, { markAsRead: false, limit, offset });
+        break;
+      case 'questions_search': {
+        url = productQuestionSearchEndpoint(authorization);
+        const status = String(req.query.status || 'UNANSWERED').trim().toUpperCase();
+        if (!['UNANSWERED', 'ANSWERED'].includes(status)) return res.status(400).json({ code: 400, message: 'invalid question status' });
+        params = { seller_id: sellerId, status, sort_fields: 'date_created', sort_types: 'DESC', limit, offset,
+          ...(globalSelling ? {} : { api_version: 4 }) };
+        break;
+      }
+      case 'question_detail':
+        url = productQuestionDetailEndpoint(authorization, id());
+        break;
+      case 'claims_search': {
+        url = marketplaceClaimSearchEndpoint();
+        const status = String(req.query.status || 'opened').trim().toLowerCase();
+        if (!/^[a-z_]+$/.test(status)) return res.status(400).json({ code: 400, message: 'invalid claim status' });
+        params = { status, user_id: sellerId, player_role: 'respondent', limit, offset };
+        break;
+      }
+      case 'claim_detail':
+        url = marketplaceClaimEndpoint(id());
+        break;
+      case 'claim_messages':
+        url = marketplaceClaimEndpoint(id(), 'messages');
+        break;
+      case 'missed_feeds': {
+        if (!ML_CLIENT_ID) return res.status(503).json({ code: 503, message: 'ML_CLIENT_ID unavailable' });
+        url = `${base}/missed_feeds`;
+        const topic = officialRawCaptureTopic(req.query.topic);
+        params = { app_id: ML_CLIENT_ID, limit, offset, ...(topic ? { topic } : {}) };
+        break;
+      }
+      default:
+        return res.status(400).json({ code: 400, message: 'invalid kind' });
+    }
+    return sendOfficialRawCaptureResponse(res, url, context.token, headers, params);
+  } catch (error) {
+    const status = Number(error.status || error.response?.status) || 500;
+    return res.status(status).json({ code: status, message: String(error.message || error).slice(0, 300) });
+  }
+});
+
 async function ensureLegacyStoreAuthorization(authUser) {
   const existing = await pool.query('SELECT * FROM ml_store_authorizations WHERE owner_username=$1 AND enabled=TRUE ORDER BY updated_at DESC LIMIT 1', [authUser.username]);
   if (existing.rows[0] || authUser.role !== 'admin') return existing.rows[0] || null;
