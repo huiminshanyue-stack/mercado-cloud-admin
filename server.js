@@ -4512,7 +4512,9 @@ app.get('/api/admin/official-raw', requireAdmin, async (req, res) => {
         url = marketplaceClaimSearchEndpoint();
         const status = String(req.query.status || 'opened').trim().toLowerCase();
         if (!/^[a-z_]+$/.test(status)) return res.status(400).json({ code: 400, message: 'invalid claim status' });
-        params = { status, user_id: sellerId, player_role: 'respondent', limit, offset };
+        // Current marketplace claims search expects the player identity under
+        // player_user_id; the older app wrapper used user_id.
+        params = { status, player_user_id: sellerId, player_role: 'respondent', limit, offset };
         break;
       }
       case 'claim_detail':
